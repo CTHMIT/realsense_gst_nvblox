@@ -464,29 +464,31 @@ def find_best_mode(
     Find best matching mode for requested size and stream type.
 
     Tries exact match first, then finds closest resolution.
+    Returns None if the stream_type is unknown or no candidate matches.
     """
-    w, h = target_size
-    target_pixels = w * h
+    key = (stream_type or "").strip().lower()
+    if key in {"infrared"}:
+        key = "ir"
 
-    # Filter by stream type
-    if stream_type == "depth":
+    if key == "depth":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_DEPTH]
-    elif stream_type == "color":
+    elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
-    elif stream_type == "ir":
+    elif key == "ir":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
     else:
-        candidates = device.modes
+        return None
 
     if not candidates:
         return None
 
-    # Exact match
+    w, h = target_size
+    target_pixels = w * h
+
     for mode in candidates:
         if mode.size == target_size:
             return mode
 
-    # Closest match
     return min(candidates, key=lambda m: abs(m.size[0] * m.size[1] - target_pixels))
 
 
