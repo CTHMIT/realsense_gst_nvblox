@@ -1,0 +1,55 @@
+image_width: 424
+image_height: 240
+camera_name: realsense_depth_424x240
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+    - 213.433166503906
+    - 0.0
+    - 214.549880981445
+    - 0.0
+    - 213.433166503906
+    - 122.443710327148
+    - 0.0
+    - 0.0
+    - 1.0
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data:
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+    - 213.433166503906
+    - 0.0
+    - 214.549880981445
+    - 0.0
+    - 0.0
+    - 213.433166503906
+    - 122.443710327148
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    - 0.0

@@ -1,0 +1,46 @@
+# System-Wide Port Allocation Reference
+
+# UDP Port Allocations
+udp:
+  # ROS2 FastDDS communication (domain 0 for default)
+  ros2_fastdds:
+    domain_0:
+      multicast: [7400, 7401]
+      unicast_range: [7410, 7649]
+    domain_161:
+      multicast: [47650, 47651]
+      unicast_range: [47660, 47899]
+
+  # FastDDS discovery server
+  fastdds_discovery_server: 11811
+
+  # Zenoh communication
+  zenoh:
+    scouting: 7446
+    quic: 7447
+
+  # GStreamer video streaming
+  # Note: Actual port assignments moved to config.yaml for gst_sender/receiver
+  gstreamer:
+    reserved_range: [5000, 5099]  # Reserved block for RealSense streams
+
+# TCP Port Allocations
+tcp:
+  # FastDDS discovery server
+  fastdds_discovery_server: 42100
+
+  # ROS2 FastDDS TCP mode
+  ros2_fastdds:
+    domain_0:
+      range: [7410, 7649]
+    domain_161:
+      range: [47660, 47899]
+
+  # Zenoh router and REST API
+  zenoh:
+    router_range: [7445, 7447]
+    rest_api: 8000
+
+  # GStreamer RTSP server (if used)
+  gstreamer:
+    rtsp: 8554
