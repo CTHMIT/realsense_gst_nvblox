@@ -310,30 +310,23 @@ class ConfigLoader:
 
 
 def parse_resolution(resolution_str: str) -> tuple[int, int]:
-    """Parse resolution string to (width, height) tuple.
+    """Parse resolution string to (width, height)."""
+    parts = resolution_str.lower().split("x")
+    if len(parts) != 2:
+        raise ValueError("Invalid resolution format")
 
-    Args:
-        resolution_str: Resolution in format "WIDTHxHEIGHT" (e.g., "640x480")
-
-    Returns:
-        Tuple of (width, height)
-
-    Raises:
-        ValueError: If format is invalid
-    """
     try:
-        parts = resolution_str.lower().split("x")
-        if len(parts) != 2:
-            raise ValueError("Invalid format")
         width, height = int(parts[0]), int(parts[1])
-        if width <= 0 or height <= 0:
-            raise ValueError("Dimensions must be positive")
-        return (width, height)
     except (ValueError, TypeError) as e:
         raise ValueError(
             f"Invalid resolution format: '{resolution_str}'. "
             "Expected format: WIDTHxHEIGHT (e.g., 640x480)"
         ) from e
+
+    if width <= 0 or height <= 0:
+        raise ValueError("Dimensions must be positive")
+
+    return (width, height)
 
 
 def validate_network_config(config: dict) -> None:
