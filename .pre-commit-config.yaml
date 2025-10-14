@@ -133,7 +133,7 @@ repos:
       - id: pytest
         name: Run pytest tests
         language: python
-        additional_dependencies: [pyyaml, pytest>=8.4.2, pytest-cov>=7.0.0]
+        additional_dependencies: [pyyaml, lark, pytest>=8.4.2, pytest-cov>=7.0.0]
         entry: pytest -q
         types: [python]
         pass_filenames: false
