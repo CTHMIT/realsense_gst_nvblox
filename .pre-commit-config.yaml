@@ -127,21 +127,22 @@ repos:
         args: [-c=.yamllint.yml]
         exclude: ^\.pre-commit-config\.yaml$
 
-  # ===== Local hooks =====
+# ===== Local hooks =====
   - repo: local
     hooks:
       - id: pytest
         name: Run pytest tests
-        entry: pdm run pytest
-        language: system
+        language: python
+        additional_dependencies: [pytest>=8.4.2, pytest-cov>=7.0.0]
+        entry: pytest -q
         types: [python]
         pass_filenames: false
         stages: [pre-push]
 
       - id: check-package-xml
         name: Check ROS 2 package.xml
-        entry: bash
-        args: ['-c', 'xmllint --noout package.xml 2>/dev/null || echo "✓ package.xml check skipped"']
         language: system
-        files: ^package\.xml$
+        entry: bash
+        args: ['-c', 'xmllint --noout src/package.xml 2>/dev/null || echo "✓ package.xml check skipped"']
+        files: ^(package\.xml|src/package\.xml)$
         pass_filenames: false
