@@ -54,8 +54,8 @@ parser = {call = "gst_realsense_launch.rs_camera_info_parser:main"}
 lint = "pre-commit run --all-files"
 format = {composite = ["black .", "isort ."]}
 type-check = "mypy gst_realsense_launch/ scripts/"
-test = "pytest test/ -v"
-test-cov = "pytest test/ --cov=gst_realsense_launch --cov-report=html"
+test = "pytest tests/ -v"
+test-cov = "pytest tests/ --cov=gst_realsense_launch --cov-report=html"
 
 # Installation
 install-deps = "bash scripts/apt_install.sh"
@@ -157,6 +157,7 @@ exclude = [
 minversion = "7.0"
 addopts = "-ra -q --strict-markers"
 testpaths = ["tests"]
+pythonpath = ["src"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
