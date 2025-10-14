@@ -13,20 +13,21 @@
 **Tested On**:
 - Ubuntu 22.04 LTS
 - ROS 2 Humble
-- RealSense D435i, D455, D415, L515
+- RealSense D435i
 
 
 <p align="center">
-  <strong>High-performance RealSense camera streaming for ROS 2 using GStreamer</strong>
+  <strong>High-performance, low-latency RealSense camera streaming for ROS 2 using GStreamer.</strong>
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> •
-  <a href="#requirements">Requirements</a> •
-  <a href="#installation">Installation</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#configuration">Configuration</a> •
-  <a href="#development">Development</a>
+  <a href="#-overview">Overview</a> •
+  <a href="#-features">Features</a> •
+  <a href="#-requirements">Requirements</a> •
+  <a href="#-installation">Installation</a> •
+  <a href="#-usage">Usage</a> •
+  <a href="#-ros-2-integration">ROS 2 Integration</a> •
+  <a href="#-configuration">Configuration</a>
 </p>
 
 ---
@@ -72,19 +73,15 @@
 - Ubuntu 22.04 (Jammy) or later
 - ROS 2 Humble or later
 - Python 3.10+
-- Intel RealSense D435i/D455/D415/L515 camera
+- Intel RealSense D435i camera
 
 ### Dependencies
 
-**System packages** (install via `apt_install_list.sh`):
+**System packages** (install via `apt_install.sh`):
 - GStreamer 1.0 with plugins (base, good, bad, ugly, libav)
 - ROS 2 packages: `gscam`, `depth_image_proc`
 - Intel RealSense SDK 2.0
 - V4L2 utilities
-
-**Python packages** (managed by PDM):
-- requests
-- pyyaml
 
 ---
 
@@ -93,13 +90,13 @@
 ### 1. Clone the Repository
 ```bash
 cd ~/ros2_ws/src
-git clone https://github.com/yourusername/gst_realsense_launch.git
+git clone https://github.com/CTHMIT/realsense_gst_nvblox.git
 cd gst_realsense_launch
 ```
 ### 2. Install System Dependencies
 ```bash
 # Run the installation script
-bash apt_install_list.sh
+bash src/scripts/apt_install.sh
 
 # Or install manually:
 sudo apt update
@@ -208,8 +205,8 @@ Typical performance metrics on Intel i7 + NVIDIA GPU:
 **Chun-Tse Hsu (cthsu)**
 
 - 📧 Email: [chuntsehus@gmail.com](mailto:chuntsehus@gmail.com)
-- 🐙 GitHub: [@cthsu](https://github.com/cthsu)
-- 💼 Project: [gst_realsense_launch](https://github.com/cthsu/gst_realsense_launch)
+- 🐙 GitHub: [@C.T.Hsu](https://github.com/CTHMIT)
+- 💼 Project: [realsense_gst_nvblox](https://github.com/CTHMIT/realsense_gst_nvblox)
 
 ---
 
