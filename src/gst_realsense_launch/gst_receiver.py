@@ -684,7 +684,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="RealSense Virtual Camera Receiver for isaac_ros_nvblox"
     )
-    parser.add_argument("--config", default="config/config.yaml", help="Configuration file")
+    parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
     parser.add_argument(
         "--preset",
         choices=["d435i", "d455", "d415", "l515"],
