@@ -122,15 +122,15 @@ class ConfigLoader:
         return {
             "color": base_port,
             "depth": base_port + 2,
-            "ir_left": base_port + 4,
-            "ir_right": base_port + 6,
+            "infra1": base_port + 4,
+            "infra2": base_port + 6,
         }
 
     def get_port_for_stream(self, stream_type: str, fallback_port: int) -> int:
         """Get the designated port for a specific stream type.
 
         Args:
-            stream_type: Type of stream (depth, color, ir, etc.)
+            stream_type: Type of stream (depth, color, infra, etc.)
             fallback_port: Port to use if no mapping exists
 
         Returns:
@@ -355,13 +355,13 @@ def get_stream_type_from_fourcc(fourcc: str) -> str:
         fourcc: Four character code (e.g., "Z16", "YUYV")
 
     Returns:
-        Stream type: "depth", "color", "ir", or "unknown"
+        Stream type: "depth", "color", "infra", or "unknown"
     """
     fourcc_upper = fourcc.strip().upper()
     if fourcc_upper in FOURCC_DEPTH:
         return "depth"
     elif fourcc_upper in FOURCC_IR:
-        return "ir"
+        return "infra"
     elif fourcc_upper in FOURCC_COLOR:
         return "color"
     return "unknown"
@@ -371,11 +371,11 @@ def format_stream_label(stream_type: str, subtype: str | None = None) -> str:
     """Format stream label with subtype information.
 
     Args:
-        stream_type: Main stream type (depth, color, ir)
-        subtype: Stream subtype (left, right for IR streams)
+        stream_type: Main stream type (depth, color, infra)
+        subtype: Stream subtype (left, right for infra streams)
 
     Returns:
-        Formatted label (e.g., "IR (LEFT)", "DEPTH")
+        Formatted label (e.g., "infra (LEFT)", "DEPTH")
     """
     label = stream_type.upper()
     if subtype:

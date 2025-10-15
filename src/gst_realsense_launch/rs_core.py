@@ -232,7 +232,7 @@ class DepthStreamStrategy(StreamPipelineStrategy):
         # Use v4l2-ctl to capture raw 16-bit depth data
         v4l2_cmd = (
             f"v4l2-ctl -d {shlex.quote(device)} "
-            f"--set-fmt-video=width={width},height={height},pixelformat={fourcc_clean} "
+            f"--set-fmt-video=width={width},height={height}"
             f"-p {fps} --stream-mmap --stream-to=- 2>/dev/null"
         )
 

@@ -84,6 +84,9 @@ class RealSenseDetector:
         r"SR300": "SR300",
     }
 
+    # Cache for RealSense SDK serial numbers
+    _rs_serial_cache = None
+
     @staticmethod
     def list_video_nodes() -> list[str]:
         """List all /dev/videoX nodes."""
@@ -97,6 +100,43 @@ class RealSenseDetector:
     def run_cmd(cmd: list[str]) -> subprocess.CompletedProcess:
         """Run shell command and return result."""
         return subprocess.run(cmd, capture_output=True, text=True)
+
+    @classmethod
+    def _get_rs_serial_mapping(cls) -> dict[str, str]:
+        """Get mapping of device paths to RealSense serial numbers using SDK.
+
+        Returns:
+            Dictionary mapping USB device paths to actual RealSense serials
+        """
+        if cls._rs_serial_cache is not None:
+            return cls._rs_serial_cache
+
+        mapping: dict = {}
+
+        if not rs:
+            cls._rs_serial_cache = mapping
+            return mapping
+
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+
+            for dev in devices:
+                serial = dev.get_info(rs.camera_info.serial_number)
+                usb_info = dev.get_info(rs.camera_info.usb_type_descriptor)
+
+                # Store mapping using USB port info as key
+                mapping[serial] = serial  # Direct mapping
+
+                # Also try to match by device name/model
+                name = dev.get_info(rs.camera_info.name)
+                mapping[name] = serial
+
+        except Exception as e:
+            print(f"Warning: Could not query RealSense devices via SDK: {e}")
+
+        cls._rs_serial_cache = mapping
+        return mapping
 
     @classmethod
     def extract_model(cls, card_name: str, dev: str | None = None) -> str:
@@ -119,8 +159,55 @@ class RealSenseDetector:
         return "Unknown"
 
     @classmethod
-    def extract_serial(cls, dev: str) -> str | None:
-        """Extract serial number from device using udev."""
+    def extract_serial(cls, dev: str, card_name: str = "") -> str | None:
+        """Extract serial number from device using RealSense SDK.
+
+        Falls back to udev if SDK is not available, but SDK is more reliable.
+        """
+        # If we have RealSense SDK, use it to get the true serial
+        if rs:
+            try:
+                ctx = rs.context()
+                devices = ctx.query_devices()
+
+                # For a D435i, there are typically 3 video devices per camera
+                # We need to match by checking if any of the video devices
+                # belong to the same physical RealSense unit
+
+                # Get the USB device path for this video device
+                try:
+                    result = cls.run_cmd(["udevadm", "info", "--query=property", f"--name={dev}"])
+                    usb_path = None
+                    id_path = None
+
+                    for line in result.stdout.splitlines():
+                        if line.startswith("ID_PATH="):
+                            id_path = line.split("=", 1)[1].strip()
+                        elif line.startswith("DEVPATH="):
+                            usb_path = line.split("=", 1)[1].strip()
+
+                    # Extract USB port/bus info from the path
+                    # This helps identify which RealSense device this video node belongs to
+                    if id_path or usb_path:
+                        # For now, if we only have one RealSense device, return its serial
+                        if len(devices) == 1:
+                            return devices[0].get_info(rs.camera_info.serial_number)
+
+                        # If multiple devices, we need more sophisticated matching
+                        # For now, warn the user
+                        print(
+                            f"Warning: Multiple RealSense devices detected. Using first device serial."
+                        )
+                        print(f"  This may cause issues. Please report this scenario.")
+                        return devices[0].get_info(rs.camera_info.serial_number)
+
+                except Exception as e:
+                    print(f"Warning: Could not get USB path for {dev}: {e}")
+
+            except Exception as e:
+                print(f"Warning: Could not query RealSense SDK for serial: {e}")
+
+        # Fallback to udev (less reliable)
         try:
             result = cls.run_cmd(["udevadm", "info", "--query=property", f"--name={dev}"])
             for line in result.stdout.splitlines():
@@ -128,6 +215,7 @@ class RealSenseDetector:
                     return line.split("=", 1)[1].strip()
         except Exception:
             pass
+
         return None
 
     @classmethod
@@ -149,7 +237,7 @@ class RealSenseDetector:
                 return None
 
             model = cls.extract_model(card, dev)
-            serial = cls.extract_serial(dev)
+            serial = cls.extract_serial(dev, card)
 
             # Parse formats
             fmts = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"]).stdout
@@ -273,51 +361,64 @@ class IMUSender:
 
     def _stream_loop(self):
         """Main loop for streaming IMU data."""
-        pipeline_started = False  # Track if pipeline actually started
+        pipeline_started = False
         try:
+            # Verify device exists before starting
+            ctx = rs.context()
+            devices = ctx.query_devices()
+
+            device_found = False
+            for dev in devices:
+                if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                    device_found = True
+                    print(f"  Found IMU device: {dev.get_info(rs.camera_info.name)}")
+                    break
+
+            if not device_found:
+                raise RuntimeError(f"Device {self.serial} not connected")
+
+            # Start pipeline
             self.pipeline.start(self.config)
-            pipeline_started = True  # Only set to True after successful start
+            pipeline_started = True
 
             while self.running:
-                frames = self.pipeline.wait_for_frames()
+                try:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=1000)
 
-                accel_frame = frames.first_or_default(rs.stream.accel)
-                gyro_frame = frames.first_or_default(rs.stream.gyro)
+                    accel_frame = frames.first_or_default(rs.stream.accel)
+                    gyro_frame = frames.first_or_default(rs.stream.gyro)
 
-                if accel_frame and gyro_frame:
-                    accel = accel_frame.as_motion_frame().get_motion_data()
-                    gyro = gyro_frame.as_motion_frame().get_motion_data()
+                    if accel_frame and gyro_frame:
+                        accel = accel_frame.as_motion_frame().get_motion_data()
+                        gyro = gyro_frame.as_motion_frame().get_motion_data()
 
-                    # Create JSON packet
-                    imu_data = {
-                        "type": "imu",
-                        "timestamp": time.time(),
-                        "serial": self.serial,
-                        "accel": {
-                            "x": accel.x,
-                            "y": accel.y,
-                            "z": accel.z,
-                        },
-                        "gyro": {
-                            "x": gyro.x,
-                            "y": gyro.y,
-                            "z": gyro.z,
-                        },
-                    }
+                        imu_data = {
+                            "type": "imu",
+                            "timestamp": time.time(),
+                            "serial": self.serial,
+                            "accel": {"x": accel.x, "y": accel.y, "z": accel.z},
+                            "gyro": {"x": gyro.x, "y": gyro.y, "z": gyro.z},
+                        }
 
-                    # Send over UDP
-                    data = json.dumps(imu_data).encode("utf-8")
-                    self.sock.sendto(data, (self.host, self.port))
+                        data = json.dumps(imu_data).encode("utf-8")
+                        self.sock.sendto(data, (self.host, self.port))
+
+                except RuntimeError as e:
+                    if "didn't arrive" in str(e):
+                        continue
+                    raise
 
         except Exception as e:
-            print(f"IMU streaming error: {e}")
+            print(f"IMU error: {e}")
+            import traceback
+
+            traceback.print_exc()
         finally:
-            # Only stop if pipeline was successfully started
             if pipeline_started:
                 try:
                     self.pipeline.stop()
-                except Exception as e:
-                    print(f"Warning: Error stopping IMU pipeline: {e}")
+                except Exception:
+                    pass
             self.sock.close()
 
     def stop(self):
@@ -472,7 +573,7 @@ def find_best_mode(
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_DEPTH]
     elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
-    elif key == "infrared":
+    elif key == "infra":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
     else:
         return None
@@ -577,6 +678,14 @@ def main():
 
     # Track which stream types we've seen to properly handle multiple IR sensors
     stream_type_counts: dict = {}
+    for serial, serial_cameras in camera_groups.items():
+        # Start IMU first (before video streams)
+        if imu_cfg["enabled"] and serial != "unknown":
+            manager.add_imu_sender(
+                serial,
+                network_cfg["server_ip"],
+                network_cfg["imu_port"],
+            )
 
     for serial, serial_cameras in camera_groups.items():
         stream_type_counts = {}  # Reset for each camera
@@ -596,14 +705,11 @@ def main():
             stream_type_counts[stream_type] = stream_count + 1
 
             # Map stream type to port key used in config.yaml
-            if stream_type == "ir":
-                # First IR is infra1, second is infra2
+            if stream_type == "infra":
                 port_stream_type = f"infra{stream_count + 1}"
             else:
                 port_stream_type = stream_type
 
-            # Get the port directly from config.yaml's network.stream_ports section
-            # No more base_port calculation - each stream has an explicit port
             port = config_loader.get_port_for_stream(port_stream_type, 5000)
 
             stream_cfg = StreamConfig(
@@ -619,14 +725,6 @@ def main():
 
             manager.add_stream(
                 stream_cfg, stream_type, encoding_cfg["encoder"], encoding_cfg["bitrate"]
-            )
-
-        # Start IMU streaming for this camera (one IMU per camera physical unit)
-        if imu_cfg["enabled"] and serial != "unknown":
-            manager.add_imu_sender(
-                serial,
-                network_cfg["server_ip"],
-                network_cfg["imu_port"],  # Changed from metadata_port to imu_port
             )
 
     print(f"\n{'='*70}")
