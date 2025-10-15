@@ -559,13 +559,15 @@ class StreamManager:
 
 
 def find_best_mode(
-    device: DeviceInfo, target_size: tuple[int, int], stream_type: str
+    device: DeviceInfo,
+    target_size: tuple[int, int],
+    stream_type: str,
+    target_format: str | None = None,  # Add new argument for desired format
 ) -> Mode | None:
     """
     Find best matching mode for requested size and stream type.
-
     Tries exact match first, then finds closest resolution.
-    Returns None if the stream_type is unknown or no candidate matches.
+    Optionally filters by a specific FourCC format.
     """
     key = (stream_type or "").strip().lower()
 
@@ -577,6 +579,17 @@ def find_best_mode(
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
     else:
         return None
+
+    if target_format and target_format.lower() != "auto":
+        filtered_candidates = [
+            m for m in candidates if m.fourcc.strip().upper() == target_format.strip().upper()
+        ]
+        if not filtered_candidates:
+            print(
+                f"⚠️  Warning: Format '{target_format}' not found for {stream_type} on {device.dev}. Ignoring format constraint."
+            )
+        else:
+            candidates = filtered_candidates
 
     if not candidates:
         return None
@@ -690,9 +703,18 @@ def main():
         for cam in serial_cameras:
             stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
 
-            mode = find_best_mode(cam, target_size, stream_type)
+            target_format = None
+            if stream_type == "color":
+                target_format = camera_cfg.get("color_format")
+            elif stream_type == "depth":
+                target_format = camera_cfg.get("depth_format")
+            elif stream_type == "infra":
+                target_format = camera_cfg.get("infra_format")
+
+            mode = find_best_mode(cam, target_size, stream_type, target_format)
+
             if not mode:
-                print(f"⚠  No suitable mode for {cam.dev}")
+                print(f"No suitable mode for {stream_type} on {cam.dev}")
                 continue
 
             fps = get_best_fps(mode, camera_cfg["fps"])

@@ -2,7 +2,7 @@
 # This file contains all parameters needed by gst_sender.py and gst_receiver.py
 
 network:
-  server_ip: "10.28.33.15"  # IP address of the sender
+  server_ip: "10.28.132.110" # "10.28.33.15"  # IP address of the sender
   base_port: 5000  # Base port for video streams
 
   # Stream port configuration
@@ -27,6 +27,9 @@ camera:
   fps: 30
   name: "camera0"  # Unified: camera name for all components
   stream_preference: "auto"
+  color_format: "YUYV"
+  depth_format: "Z16"
+  infra_format: "Y8"
 
 encoding:
   encoder: "auto"  # "auto", "nvh264enc", or "x264enc"
