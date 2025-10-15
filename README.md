@@ -119,16 +119,16 @@ sudo apt install -y \
 #### On the Camera Host (Sender)
 ```bash
 # Auto-detect all cameras and stream at 424x240
-pdm run sender --host <receiver-ip> --size 424x240 --run
+pdm run src/gst_realsense_launch/gst_sender.py --host <receiver-ip> --size 424x240 --run
 
 # Stream with preset for D435i camera
-pdm run sender --host 192.168.1.100 --preset d435i --run
+pdm run src/gst_realsense_launch/gst_sender.py --host 192.168.1.100 --preset d435i --run
 
 # Stream specific device
-pdm run sender --host 192.168.1.100 --device /dev/video6 --run
+pdm run src/gst_realsense_launch/gst_sender.py --host 192.168.1.100 --device /dev/video6 --run
 
 # List detected cameras without streaming
-pdm run sender --list-only
+pdm run src/gst_realsense_launch/gst_sender.py --list-only
 ```
 
 #### On the Receiver (Display)

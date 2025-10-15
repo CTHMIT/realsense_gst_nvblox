@@ -29,7 +29,7 @@ except ImportError:
     print("Warning: pyrealsense2 not available. Hardware IMU streaming disabled.")
 
 
-from .rs_common import (
+from gst_realsense_launch.rs_common import (
     FOURCC_COLOR,
     FOURCC_DEPTH,
     FOURCC_IR,
@@ -40,7 +40,7 @@ from .rs_common import (
     parse_resolution,
     validate_network_config,
 )
-from .rs_core import EncoderFactory, StreamStrategyFactory
+from gst_realsense_launch.rs_core import EncoderFactory, StreamStrategyFactory
 
 
 @dataclass
@@ -188,7 +188,7 @@ class RealSenseDetector:
             m_fmt = fmt_re.search(line)
             if m_fmt:
                 flush_pending()
-                current_fourcc = m_fmt.group(1)
+                current_fourcc = m_fmt.group(1).strip()
                 continue
 
             m_size = size_re.search(line)
@@ -467,14 +467,12 @@ def find_best_mode(
     Returns None if the stream_type is unknown or no candidate matches.
     """
     key = (stream_type or "").strip().lower()
-    if key in {"infrared"}:
-        key = "ir"
 
     if key == "depth":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_DEPTH]
     elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
-    elif key == "ir":
+    elif key == "infrared":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
     else:
         return None
@@ -581,6 +579,8 @@ def main():
     stream_type_counts: dict = {}
 
     for serial, serial_cameras in camera_groups.items():
+        stream_type_counts = {}  # Reset for each camera
+
         for cam in serial_cameras:
             stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
 
@@ -596,7 +596,8 @@ def main():
             stream_type_counts[stream_type] = stream_count + 1
 
             # Map stream type to port key used in config.yaml
-            if stream_type == "ir" and stream_count > 0:
+            if stream_type == "ir":
+                # First IR is infra1, second is infra2
                 port_stream_type = f"infra{stream_count + 1}"
             else:
                 port_stream_type = stream_type

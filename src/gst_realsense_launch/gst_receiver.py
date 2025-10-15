@@ -45,8 +45,8 @@ except ImportError:
     print("  source /opt/ros/humble/setup.bash")
     sys.exit(1)
 
-from .rs_common import CameraIntrinsics, ConfigLoader
-from .rs_core import StreamStrategyFactory
+from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
+from gst_realsense_launch.rs_core import StreamStrategyFactory
 
 
 class VirtualRealSenseNode(Node):

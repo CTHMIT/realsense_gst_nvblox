@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
+from typing import Optional
 
 
 class EncoderStrategy(ABC):
@@ -24,7 +25,7 @@ class EncoderStrategy(ABC):
         pass
 
     @abstractmethod
-    def get_pipeline_element(self, bitrate: int) -> str:
+    def get_pipeline_element(self, bitrate: int | None) -> str:
         """Get GStreamer pipeline element string for this encoder."""
         pass
 
@@ -100,8 +101,8 @@ class JPEG2000EncoderStrategy(EncoderStrategy):
         )
         return result.returncode == 0
 
-    def get_pipeline_element(self, _bitrate: int = 0) -> str:
-        """Get JPEG2000 encoder pipeline.
+    def get_pipeline_element(self, bitrate: int | None = None) -> str:
+        """Get JPEG2000 encoder pipeline.]
 
         JPEG2000 is lossless/near-lossless, preserving 16-bit depth data.
         """
@@ -225,10 +226,13 @@ class DepthStreamStrategy(StreamPipelineStrategy):
         Depth data is 16-bit, so we use v4l2-ctl to capture raw data
         and pipe it to GStreamer with proper format parsing.
         """
+        # Clean fourcc to remove any trailing spaces
+        fourcc_clean = fourcc.strip()
+
         # Use v4l2-ctl to capture raw 16-bit depth data
         v4l2_cmd = (
             f"v4l2-ctl -d {shlex.quote(device)} "
-            f"--set-fmt-video=width={width},height={height},pixelformat='{fourcc} ' "
+            f"--set-fmt-video=width={width},height={height},pixelformat={fourcc_clean} "
             f"-p {fps} --stream-mmap --stream-to=- 2>/dev/null"
         )
 
