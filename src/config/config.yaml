@@ -4,12 +4,28 @@
 network:
   server_ip: "10.28.33.15"  # IP address of the sender
   base_port: 5000  # Base port for video streams
-  metadata_port: 5050  # Port for IMU metadata and calibration data
+
+  # Stream port configuration
+  stream_ports:
+    color:
+      rtp: 5000
+      rtcp: 5001
+    depth:
+      rtp: 5002
+      rtcp: 5003
+    infra1:
+      rtp: 5004
+      rtcp: 5005
+    infra2:
+      rtp: 5006
+      rtcp: 5007
+    imu:
+      udp: 5050  # IMU uses simple UDP (not RTP)
 
 camera:
   resolution: "640x480"
   fps: 30
-  camera_name: "camera0"
+  name: "camera0"  # Unified: camera name for all components
   stream_preference: "auto"
 
 encoding:

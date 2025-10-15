@@ -60,7 +60,7 @@ class VirtualRealSenseNode(Node):
     def __init__(
         self,
         camera_name: str,
-        metadata_port: int,
+        imu_port: int,
         config_loader: ConfigLoader,
         receiver_config: dict,
     ):
@@ -68,14 +68,14 @@ class VirtualRealSenseNode(Node):
 
         Args:
             camera_name: The name of the camera.
-            metadata_port: The port to listen for metadata on.
+            imu_port: The port to listen for IMU data on.
             config_loader: The configuration loader.
             receiver_config: The receiver configuration.
         """
         super().__init__("virtual_realsense_camera")
 
         self.camera_name = camera_name
-        self.metadata_port = metadata_port
+        self.imu_port = imu_port
         self.config_loader = config_loader
         self.receiver_config = receiver_config
 
@@ -94,12 +94,12 @@ class VirtualRealSenseNode(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
 
-        # UDP socket for metadata/IMU
+        # UDP socket for IMU data
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Bind to localhost by default for security, allow override via environment variable
         bind_address = os.getenv("BIND_ADDRESS", "127.0.0.1")
-        self.socket.bind((bind_address, metadata_port))
+        self.socket.bind((bind_address, imu_port))
         self.socket.settimeout(1.0)
 
         # Calibration data
@@ -127,7 +127,7 @@ class VirtualRealSenseNode(Node):
         self._publish_static_transforms()
 
         self.get_logger().info(f'Virtual RealSense camera "{camera_name}" initialized')
-        self.get_logger().info(f"Listening for metadata on {bind_address}:{metadata_port}")
+        self.get_logger().info(f"Listening for IMU data on {bind_address}:{imu_port}")
 
     def _create_publishers(self):
         """Create all ROS2 publishers for camera streams and IMU."""
@@ -691,7 +691,7 @@ def main():
         help="Use camera preset",
     )
     parser.add_argument("--base-port", type=int, help="Override base port")
-    parser.add_argument("--metadata-port", type=int, help="Override metadata port")
+    parser.add_argument("--imu-port", type=int, help="Override IMU port")
     parser.add_argument("--camera-name", help="Override camera name")
     parser.add_argument("--show-views", action="store_true", help="Display received video streams")
     parser.add_argument("--view-scale", type=float, help="Display window scale factor")
@@ -735,7 +735,7 @@ def main():
     print("VIRTUAL REALSENSE CAMERA RECEIVER")
     print(f"{'='*70}")
     print(f"Camera Name: {camera_cfg['camera_name']}")
-    print(f"Metadata Port: {network_cfg['metadata_port']}")
+    print(f"IMU Port: {network_cfg['imu_port']}")
     print("\nVideo Streams:")
     for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
         print(f"  {stream:10s} - Port {port} ({enc.upper()})")
@@ -747,7 +747,7 @@ def main():
     # Create virtual camera node
     virtual_camera = VirtualRealSenseNode(
         camera_name=camera_cfg["camera_name"],
-        metadata_port=network_cfg["metadata_port"],
+        imu_port=network_cfg["imu_port"],
         config_loader=config_loader,
         receiver_config=receiver_cfg,
     )

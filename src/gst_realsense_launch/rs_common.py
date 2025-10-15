@@ -63,95 +63,19 @@ class ConfigLoader:
 
     This class implements a hierarchical configuration system:
     1. Default values from config.yaml
-    2. Port allocations from ports.yaml
+    2. Port allocations from ports.yaml (optional)
     3. Override with command-line arguments
     4. Validate and provide easy access to all settings
     """
 
-    def __init__(
-        self, config_file: str = "config/config.yaml", ports_file: str = "config/ports.yaml"
-    ) -> None:
+    def __init__(self, config_file: str = "config/config.yaml") -> None:
         """Load configuration from YAML files.
 
         Args:
             config_file: Path to main YAML configuration file
-            ports_file: Path to ports allocation file
         """
         self.config: dict = self._load_config_file(config_file)
         self.config_file = config_file
-
-        # Load ports configuration - this is the new addition
-        self.ports_config: dict = self._load_config_file(ports_file)
-        self.ports_file = ports_file
-
-    def get_stream_ports(self) -> dict:
-        """Get RealSense stream port allocations from ports.yaml.
-
-        Returns a dictionary mapping stream names to their assigned ports.
-        This ensures your streams use the designated ports and don't
-        conflict with ROS2 or other services.
-        """
-        try:
-            # Navigate to the gstreamer.realsense_streams section
-            gstreamer = self.ports_config.get("udp", {}).get("gstreamer", {})
-            realsense_streams = gstreamer.get("realsense_streams", {})
-
-            if not realsense_streams:
-                print("Warning: No realsense_streams defined in ports.yaml")
-                return self._get_default_ports()
-
-            # Extract RTP ports from the configuration
-            # Each stream has an rtp and rtcp port, we use the rtp port
-            ports = {}
-            for stream_name, port_config in realsense_streams.items():
-                if isinstance(port_config, dict) and "rtp" in port_config:
-                    ports[stream_name] = port_config["rtp"]
-
-            return ports
-
-        except Exception as e:
-            print(f"Warning: Failed to load ports from {self.ports_file}: {e}")
-            return self._get_default_ports()
-
-    def _get_default_ports(self) -> dict:
-        """Fallback port allocation if ports.yaml is not available.
-
-        These match your current config.yaml settings.
-        """
-        base_port = self.config.get("network", {}).get("base_port", 5000)
-        return {
-            "color": base_port,
-            "depth": base_port + 2,
-            "infra1": base_port + 4,
-            "infra2": base_port + 6,
-        }
-
-    def get_port_for_stream(self, stream_type: str, fallback_port: int) -> int:
-        """Get the designated port for a specific stream type.
-
-        Args:
-            stream_type: Type of stream (depth, color, infra, etc.)
-            fallback_port: Port to use if no mapping exists
-
-        Returns:
-            The assigned port number for this stream type
-        """
-        stream_ports = self.get("network.stream_ports")
-
-        if not stream_ports:
-            return fallback_port
-
-        stream_key = stream_type.lower()
-
-        if stream_key in stream_ports:
-            stream_config = stream_ports[stream_key]
-
-            if stream_key == "imu":
-                return cast(int, stream_config.get("udp", fallback_port))
-
-            return cast(int, stream_config.get("rtp", fallback_port))
-
-        return fallback_port
 
     def _load_config_file(self, config_file: str) -> dict:
         """Load YAML configuration file from multiple possible locations.
@@ -213,6 +137,35 @@ class ConfigLoader:
         presets = self.config.get("presets", {})
         return cast(dict | None, presets.get(preset_name))
 
+    def get_port_for_stream(self, stream_type: str, fallback_port: int) -> int:
+        """Get the designated port for a specific stream type.
+
+        Args:
+            stream_type: Type of stream (depth, color, infra1, infra2, imu, etc.)
+            fallback_port: Port to use if no mapping exists
+
+        Returns:
+            The assigned port number for this stream type
+        """
+        stream_ports = self.get("network.stream_ports")
+
+        if not stream_ports:
+            return fallback_port
+
+        stream_key = stream_type.lower()
+
+        if stream_key in stream_ports:
+            stream_config = stream_ports[stream_key]
+
+            # IMU uses simple UDP
+            if stream_key == "imu":
+                return cast(int, stream_config.get("udp", fallback_port))
+
+            # Video streams use RTP
+            return cast(int, stream_config.get("rtp", fallback_port))
+
+        return fallback_port
+
     def get_imu_port(self) -> int:
         """Get IMU UDP port from config.yaml.
 
@@ -222,24 +175,32 @@ class ConfigLoader:
         Returns:
             Port number for IMU data transmission
         """
-        # Get directly from network.stream_ports.imu.udp
+        # Try to get from network.stream_ports.imu.udp first
         stream_ports = self.get("network.stream_ports")
 
         if stream_ports and "imu" in stream_ports:
             imu_config = stream_ports["imu"]
-            if "udp" in imu_config:
+            if isinstance(imu_config, dict) and "udp" in imu_config:
                 return cast(int, imu_config["udp"])
 
-        # Fallback to a reasonable default
-        print("Warning: network.stream_ports.imu.udp not found, using default port 5050")
+        # Fallback to direct network.imu_port if it exists
+        imu_port = self.get("network.imu_port")
+        if imu_port is not None:
+            return cast(int, imu_port)
+
+        # Final fallback to default
+        print("Warning: IMU port not configured, using default port 5050")
         return 5050
 
     def get_network_config(self, args) -> dict:
         """Get complete network configuration with overrides."""
+        # Handle both --imu-port and --metadata-port for backwards compatibility
+        imu_port_override = getattr(args, "imu_port", None) or getattr(args, "metadata_port", None)
+
         return {
             "server_ip": self.get("network.server_ip", None, getattr(args, "host", None)),
             "base_port": self.get("network.base_port", 5000, getattr(args, "base_port", None)),
-            "imu_port": self.get_imu_port(),
+            "imu_port": self.get("network.stream_ports.imu.udp", 5050, imu_port_override),
             "info_url": self.get("network.info_url", None, getattr(args, "info_url", None)),
         }
 
@@ -250,7 +211,7 @@ class ConfigLoader:
                 "camera.resolution", "640x480", getattr(args, "resolution", None)
             ),
             "fps": self.get("camera.fps", None, getattr(args, "fps", None)),
-            "camera_name": self.get("camera.name", "camera", getattr(args, "camera_name", None)),
+            "camera_name": self.get("camera.name", "camera0", getattr(args, "camera_name", None)),
             "stream_preference": self.get(
                 "camera.stream_preference", "auto", getattr(args, "stream", None)
             ),

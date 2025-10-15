@@ -608,9 +608,6 @@ def main():
         description="RealSense Multi-Stream Sender with Strategy Pattern"
     )
     parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
-    parser.add_argument(
-        "--ports-config", default="src/config/ports.yaml", help="Ports allocation file"
-    )
     parser.add_argument("--host", help="Override server IP from config")
     parser.add_argument("--resolution", help="Override resolution (WIDTHxHEIGHT)")
     parser.add_argument("--fps", type=int, help="Override target FPS")
@@ -624,8 +621,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration
-    config_loader = ConfigLoader(args.config, args.ports_config)
+    # Load configuration (no ports_config needed anymore)
+    config_loader = ConfigLoader(args.config)
 
     # Get configurations with overrides
     network_cfg = config_loader.get_network_config(args)
@@ -676,19 +673,19 @@ def main():
     manager = StreamManager(config_loader)
     camera_groups = RealSenseDetector.group_by_serial(cameras)
 
-    # Track which stream types we've seen to properly handle multiple IR sensors
-    stream_type_counts: dict = {}
+    # Start IMU senders first (before video streams)
     for serial, serial_cameras in camera_groups.items():
-        # Start IMU first (before video streams)
         if imu_cfg["enabled"] and serial != "unknown":
+            print(f"\nStarting IMU for camera {serial}")
             manager.add_imu_sender(
                 serial,
                 network_cfg["server_ip"],
                 network_cfg["imu_port"],
             )
 
+    # Start video streams
     for serial, serial_cameras in camera_groups.items():
-        stream_type_counts = {}  # Reset for each camera
+        stream_type_counts: dict = {}  # Reset for each camera
 
         for cam in serial_cameras:
             stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
