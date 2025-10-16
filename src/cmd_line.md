@@ -76,7 +76,8 @@ HEIGHT=480
 FPS=30
 HOST=10.28.132.110
 PORT=5000
-BITRATE=8000  # From config.yaml: encoding.depth_h264.bitrate
+BITRATE=8000
+BUFFER=2000000
 
 v4l2-ctl -d "$DEV" \
     --set-fmt-video=width=$WIDTH,height=$HEIGHT,pixelformat='Z16 ' \
@@ -85,12 +86,15 @@ v4l2-ctl -d "$DEV" \
     --stream-to=- | \
 gst-launch-1.0 -e -v fdsrc fd=0 \
     ! videoparse format=gray16-le width=$WIDTH height=$HEIGHT framerate=$FPS/1 \
+    ! queue max-size-buffers=2 leaky=downstream \
     ! videoconvert \
     ! video/x-raw,format=I420 \
-    ! x264enc tune=zerolatency speed-preset=ultrafast bitrate=$BITRATE key-int-max=$FPS \
+    ! nvh264enc preset=hq rc-mode=cbr-ld-hq bitrate=$BITRATE gop-size=$FPS zerolatency=true qp-min=10 qp-max=25 \
+    ! video/x-h264,profile=high \
     ! h264parse config-interval=1 \
-    ! rtph264pay pt=96 \
-    ! udpsink host="$HOST" port=$PORT sync=false async=false
+    ! rtph264pay pt=96 mtu=1400 \
+    ! udpsink host="$HOST" port=$PORT sync=false async=false buffer-size=$BUFFER
+
 ```
 
 #### Receiver
