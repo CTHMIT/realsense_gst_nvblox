@@ -36,8 +36,17 @@ camera:
   fps: 30
 encoding:
   encoder: "auto"
-  bitrate: 4000
-  jpeg2000_quality: 100
+  h264:
+    bitrate: 4000
+    tune: "zerolatency"
+    speed_preset: "ultrafast"
+    key_int_max: 30
+  depth_h264:
+    bitrate: 8000
+    use_h264: true
+  jpeg2000:
+    quality: 100
+    num_threads: 8
 imu:
   enabled: true
   publish_rate: 200.0
@@ -156,9 +165,25 @@ def test_get_encoding_config(mock_config_loader):
 
     encoding_cfg = mock_config_loader.get_encoding_config(mock_args)
 
+    # Test top-level encoder setting
     assert encoding_cfg["encoder"] == "auto"
-    assert encoding_cfg["bitrate"] == 4000
-    assert encoding_cfg["jpeg2000_quality"] == 100
+
+    # Test H.264 configuration
+    assert "h264" in encoding_cfg
+    assert encoding_cfg["h264"]["bitrate"] == 4000
+    assert encoding_cfg["h264"]["tune"] == "zerolatency"
+    assert encoding_cfg["h264"]["speed_preset"] == "ultrafast"
+    assert encoding_cfg["h264"]["key_int_max"] == 30
+
+    # Test depth H.264 configuration
+    assert "depth_h264" in encoding_cfg
+    assert encoding_cfg["depth_h264"]["bitrate"] == 8000
+    assert encoding_cfg["depth_h264"]["use_h264"] is True
+
+    # Test JPEG2000 configuration
+    assert "jpeg2000" in encoding_cfg
+    assert encoding_cfg["jpeg2000"]["quality"] == 100
+    assert encoding_cfg["jpeg2000"]["num_threads"] == 8
 
 
 def test_get_imu_config(mock_config_loader):
