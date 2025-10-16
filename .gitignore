@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.venv/
+.logs/
+.pdm-build/
 
 # PDM
 .pdm.toml

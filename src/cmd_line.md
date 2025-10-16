@@ -1,19 +1,19 @@
 # RealSense Streaming Commands
 
-## 🎯 配置說明
+## Configuration Guide
 
-所有參數現在都可以在 `config.yaml` 中修改：
+All parameters can now be modified in `config.yaml`:
 
-### 關鍵配置參數
+### Key Configuration Parameters
 ```yaml
 network:
-  server_ip: "10.28.132.110"  # 修改為你的接收端 IP
+  server_ip: "10.28.132.110"  # Modify to your receiver IP
 
 encoding:
   h264:
-    bitrate: 8000           # H.264 位元率 (kbps)
-    tune: "zerolatency"     # 低延遲調整
-    speed_preset: "ultrafast"  # 編碼速度
+    bitrate: 8000           # H.264 bitrate (kbps)
+    tune: "zerolatency"     # Low-latency tuning
+    speed_preset: "ultrafast"  # Encoding speed
 
   depth_h264:
     bitrate: 8000
@@ -21,42 +21,40 @@ encoding:
 
 streaming:
   udp:
-    buffer_size: 2097152    # UDP 緩衝大小
+    buffer_size: 2097152    # UDP buffer size
 
   jitter_buffer:
-    latency: 100            # 抖動緩衝延遲 (ms)
+    latency: 100            # Jitter buffer latency (ms)
     drop_on_latency: true
 
   processing:
-    max_threads: 4          # 解碼執行緒數
-    n_threads: 4            # 轉換執行緒數
+    max_threads: 4          # Decoding threads
+    n_threads: 4            # Conversion threads
 ```
 
 ---
 
-## 📡 使用 Python 腳本 (推薦)
+## Using Python Scripts (Recommended)
 
-### 發送端
+### Sender
 ```bash
-# 使用預設配置
-pdm run src/gst_realsense_launch/gst_sender.py --preset d435i --run
+# Use default configuration
+pdm run src/gst_realsense_launch/gst_sender.py
 
-# 覆蓋特定參數
+# Override specific parameters
 pdm run src/gst_realsense_launch/gst_sender.py \
-  --preset d435i \
   --host 10.28.132.110 \
   --resolution 640x480 \
   --fps 30 \
   --bitrate 8000 \
-  --run
 ```
 
-### 接收端
+### Receiver
 ```bash
-# 使用預設配置
+# Use default configuration
 pdm run receiver --preset d435i --show-views
 
-# 覆蓋特定參數
+# Override specific parameters
 pdm run receiver \
   --preset d435i \
   --base-port 5000 \
@@ -66,11 +64,11 @@ pdm run receiver \
 
 ---
 
-## 🔧 手動 GStreamer 命令
+## 🔧 Manual GStreamer Commands
 
-### Depth (/dev/video0) - 使用 H.264
+### Depth (/dev/video0) - Using H.264
 
-#### 發送端
+#### Sender
 ```bash
 DEV=/dev/video0
 WIDTH=640
@@ -78,7 +76,7 @@ HEIGHT=480
 FPS=30
 HOST=10.28.132.110
 PORT=5000
-BITRATE=8000  # 從 config.yaml: encoding.depth_h264.bitrate
+BITRATE=8000  # From config.yaml: encoding.depth_h264.bitrate
 
 v4l2-ctl -d "$DEV" \
     --set-fmt-video=width=$WIDTH,height=$HEIGHT,pixelformat='Z16 ' \
@@ -95,9 +93,9 @@ gst-launch-1.0 -e -v fdsrc fd=0 \
     ! udpsink host="$HOST" port=$PORT sync=false async=false
 ```
 
-#### 接收端
+#### Receiver
 ```bash
-# 參數從 config.yaml 讀取
+# Parameters from config.yaml
 BUFFER_SIZE=2097152  # streaming.udp.buffer_size
 LATENCY=100          # streaming.jitter_buffer.latency
 MAX_THREADS=4        # streaming.processing.max_threads
@@ -119,7 +117,7 @@ gst-launch-1.0 -v \
 
 ### IR Left (/dev/video2) - GRAY8
 
-#### 發送端
+#### Sender
 ```bash
 DEV=/dev/video2
 WIDTH=640
@@ -139,7 +137,7 @@ gst-launch-1.0 -e \
   ! udpsink host=$HOST port=$PORT sync=false async=false
 ```
 
-#### 接收端
+#### Receiver
 ```bash
 gst-launch-1.0 -e \
   udpsrc port=5004 caps="application/x-rtp,media=video,encoding-name=H264,payload=97" \
@@ -152,7 +150,7 @@ gst-launch-1.0 -e \
 
 ### RGB (/dev/video4) - YUYV/YUY2
 
-#### 發送端
+#### Sender
 ```bash
 DEV=/dev/video4
 WIDTH=640
@@ -172,7 +170,7 @@ gst-launch-1.0 -e \
   ! udpsink host=$HOST port=$PORT sync=false async=false
 ```
 
-#### 接收端
+#### Receiver
 ```bash
 gst-launch-1.0 -e \
   udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=98" \
@@ -183,63 +181,218 @@ gst-launch-1.0 -e \
 
 ---
 
-## 🎛️ 調整參數指南
+## 🎛️ Parameter Tuning Guide
 
-### 提高畫質
-在 `config.yaml` 中修改：
+### Improve Quality
+Modify in `config.yaml`:
 ```yaml
 encoding:
   h264:
-    bitrate: 12000        # 增加到 12 Mbps
-    speed_preset: "fast"  # 改為 fast (更高品質)
+    bitrate: 12000        # Increase to 12 Mbps
+    speed_preset: "fast"  # Change to fast (higher quality)
 ```
 
-### 降低延遲
+### Reduce Latency
 ```yaml
 streaming:
   jitter_buffer:
-    latency: 50           # 降低到 50ms
+    latency: 50           # Reduce to 50ms
 
   queue:
-    max_size_buffers: 1   # 減少緩衝
+    max_size_buffers: 1   # Reduce buffering
 ```
 
-### 網路不穩定時
+### For Unstable Networks
 ```yaml
 streaming:
   udp:
-    buffer_size: 4194304  # 增加到 4MB
+    buffer_size: 4194304  # Increase to 4MB
 
   jitter_buffer:
-    latency: 200          # 增加到 200ms
+    latency: 200          # Increase to 200ms
     drop_on_latency: false
 ```
 
 ---
 
-## 🔍 故障排除
+## 🔍 Troubleshooting
 
-### 畫面卡頓
-1. 增加 `streaming.udp.buffer_size`
-2. 調高 `streaming.jitter_buffer.latency`
-3. 降低 `encoding.h264.bitrate`
+### Stuttering Video
+1. Increase `streaming.udp.buffer_size`
+2. Increase `streaming.jitter_buffer.latency`
+3. Decrease `encoding.h264.bitrate`
 
-### 延遲太高
-1. 降低 `streaming.jitter_buffer.latency`
-2. 設定 `streaming.queue.max_size_buffers` = 1
-3. 使用 `speed_preset: "ultrafast"`
+### High Latency
+1. Decrease `streaming.jitter_buffer.latency`
+2. Set `streaming.queue.max_size_buffers` = 1
+3. Use `speed_preset: "ultrafast"`
 
-### 畫質不佳
-1. 提高 `encoding.h264.bitrate`
-2. 改用 `speed_preset: "medium"` 或 `"fast"`
-3. 對深度影像，設定 `depth_h264.use_h264: false` 使用 JPEG2000
+### Poor Quality
+1. Increase `encoding.h264.bitrate`
+2. Change to `speed_preset: "medium"` or `"fast"`
+3. For depth images, set `depth_h264.use_h264: false` to use JPEG2000
 
 ---
 
-## 💡 最佳實踐
+## 💡 Best Practices
 
-1. **區域網路**: 使用高 bitrate (10000-15000) + fast preset
-2. **WiFi 環境**: 使用中 bitrate (6000-8000) + ultrafast preset
-3. **精確深度**: 設定 `depth_h264.use_h264: false` 使用 JPEG2000
-4. **即時控制**: latency=20-50, 使用 ultrafast preset
-5. **錄製分析**: latency=100-200, 使用 medium preset, 高 bitrate
+1. **Wired LAN**: Use high bitrate (10000-15000) + fast preset
+2. **WiFi Environment**: Use medium bitrate (6000-8000) + ultrafast preset
+3. **Accurate Depth**: Set `depth_h264.use_h264: false` to use JPEG2000
+4. **Real-time Control**: latency=20-50, use ultrafast preset
+5. **Recording/Analysis**: latency=100-200, use medium preset, high bitrate
+
+---
+
+## 📝 Quick Reference
+
+### Port Mapping (from config.yaml)
+| Stream | RTP Port | RTCP Port |
+|--------|----------|-----------|
+| Color  | 5000     | 5001      |
+| Depth  | 5002     | 5003      |
+| IR1    | 5004     | 5005      |
+| IR2    | 5006     | 5007      |
+| IMU    | 5050     | -         |
+
+### Common Resolutions
+| Resolution | Usage |
+|------------|-------|
+| 640x480    | Standard, balanced |
+| 848x480    | Wide view |
+| 1280x720   | High quality |
+| 424x240    | Low bandwidth |
+
+### Bitrate Recommendations
+| Quality | Bitrate (kbps) |
+|---------|----------------|
+| Low     | 3000-5000      |
+| Medium  | 6000-8000      |
+| High    | 10000-15000    |
+
+---
+
+## 🚀 Advanced Examples
+
+### High Quality Recording
+```bash
+# Sender with high bitrate
+pdm run src/gst_realsense_launch/gst_sender.py \
+  --preset d435i \
+  --bitrate 15000 \
+  --encoder x264enc \
+  --run
+```
+
+### Low Latency Streaming
+```bash
+# Modify config.yaml first:
+# streaming.jitter_buffer.latency: 30
+# streaming.queue.max_size_buffers: 1
+
+pdm run src/gst_realsense_launch/gst_sender.py --preset d435i --run
+```
+
+### Multiple Cameras
+```bash
+# List available cameras
+pdm run src/gst_realsense_launch/gst_sender.py --list-only
+
+# Stream specific camera
+pdm run src/gst_realsense_launch/gst_sender.py \
+  --device /dev/video0 \
+  --run
+```
+
+---
+
+## 🔗 Related Documentation
+
+- `config.yaml` - Complete configuration file
+- `README.md` - Project overview
+- `使用指南.md` - Detailed usage guide (Chinese)
+
+---
+
+## ❓ FAQ
+
+**Q: How to change resolution?**
+
+A: Modify `config.yaml`:
+```yaml
+camera:
+  resolution: "848x480"  # or "640x480", "1280x720"
+```
+
+**Q: How to stream multiple cameras simultaneously?**
+
+A: The Python script automatically detects and streams all cameras
+
+**Q: How to stream only depth images?**
+
+A: Use manual commands, refer to the Depth section above
+
+**Q: Should I use JPEG2000 or H.264 for depth?**
+
+A:
+- JPEG2000: Preserves 16-bit precision, suitable for accurate depth applications
+- H.264: Lower bandwidth, smoother, suitable for general vision applications
+
+**Q: How to verify configuration is loaded?**
+
+A: Check the output when running:
+```
+✓ Loaded configuration from src/config/config.yaml
+```
+
+---
+
+## 📊 Performance Monitoring
+
+### Check FPS
+Sender will display:
+```
+<<< 29.99 fps
+```
+
+### Check Network
+```bash
+# Check packet loss
+netstat -su | grep "packet receive errors"
+
+# Monitor traffic
+sudo tcpdump -i any port 5002 -c 100
+```
+
+### Check CPU Usage
+```bash
+top -p $(pgrep gst-launch)
+```
+
+---
+
+## 🛠️ System Optimization
+
+### Increase System UDP Buffers (Important!)
+```bash
+# Temporary (on receiver)
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.rmem_default=26214400
+
+# Permanent
+echo "net.core.rmem_max=26214400" | sudo tee -a /etc/sysctl.conf
+echo "net.core.rmem_default=26214400" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+### Firewall Configuration
+```bash
+sudo ufw allow 5000:5010/udp
+sudo ufw allow 5050/udp
+```
+
+### Performance Mode
+```bash
+# Set CPU to performance mode
+sudo cpupower frequency-set -g performance
+```
