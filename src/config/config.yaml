@@ -2,7 +2,7 @@
 # This file contains all parameters needed by gst_sender.py and gst_receiver.py
 
 network:
-  server_ip: "10.28.132.110" # "10.28.33.15"  # IP address of the sender
+  server_ip: "10.28.132.110"  # IP address of the sender/receiver
   base_port: 5000  # Base port for video streams
 
   # Stream port configuration
@@ -33,12 +33,55 @@ camera:
 
 encoding:
   encoder: "auto"  # "auto", "nvh264enc", or "x264enc"
-  bitrate: 4000  # H.264 bitrate in kbps
-  jpeg2000_quality: 100  # 0-100, for depth encoding
+
+  # H.264 encoding parameters (for color and IR streams)
+  h264:
+    bitrate: 8000  # H.264 bitrate in kbps (increased for better quality)
+    tune: "zerolatency"  # zerolatency for low-latency streaming
+    speed_preset: "ultrafast"  # ultrafast, fast, medium, slow
+    key_int_max: 30  # Maximum keyframe interval (same as FPS for low latency)
+
+  # JPEG2000 encoding parameters (for depth streams)
+  jpeg2000:
+    quality: 100  # 0-100, for depth encoding
+    num_threads: 8  # Number of threads for JPEG2000 encoding
+
+  # Depth-specific H.264 parameters (when using H.264 for depth)
+  depth_h264:
+    bitrate: 8000  # Bitrate for depth stream
+    use_h264: true  # Use H.264 instead of JPEG2000 for depth (tested working)
 
 streaming:
   sequential_start: false
   startup_delay: 2
+
+  # UDP and RTP parameters
+  udp:
+    sync: false
+    async: false
+    buffer_size: 2097152  # 2MB buffer size
+
+  # RTP parameters
+  rtp:
+    payload: 96
+    mtu: 1200
+    config_interval: 1
+
+  # Jitter buffer parameters (for receiver)
+  jitter_buffer:
+    latency: 100  # ms - adjust based on network (50-200)
+    drop_on_latency: true
+    mode: 1
+
+  # Queue parameters
+  queue:
+    max_size_buffers: 2
+    leaky: "downstream"  # Drop old frames to maintain real-time
+
+  # Video processing threads
+  processing:
+    max_threads: 4  # Number of threads for video decoding
+    n_threads: 4  # Number of threads for videoconvert
 
 imu:
   enabled: true
@@ -52,12 +95,11 @@ receiver:
   base_link_frame: "base_link"
 
 # Camera presets define which streams are available for each model
-# Port offsets are added to base_port (5000) to get actual port numbers
 presets:
   d435i:
     streams:
       - name: "depth"
-        encoding: "jpeg2000"
+        encoding: "h264"  # Changed from jpeg2000 to h264 (tested working)
         port_offset: 2  # Port 5002
       - name: "color"
         encoding: "h264"
@@ -73,7 +115,7 @@ presets:
   d455:
     streams:
       - name: "depth"
-        encoding: "jpeg2000"
+        encoding: "h264"
         port_offset: 2
       - name: "color"
         encoding: "h264"
@@ -89,7 +131,7 @@ presets:
   d415:
     streams:
       - name: "depth"
-        encoding: "jpeg2000"
+        encoding: "h264"
         port_offset: 2
       - name: "color"
         encoding: "h264"
@@ -105,7 +147,7 @@ presets:
   l515:
     streams:
       - name: "depth"
-        encoding: "jpeg2000"
+        encoding: "h264"
         port_offset: 2
       - name: "color"
         encoding: "h264"

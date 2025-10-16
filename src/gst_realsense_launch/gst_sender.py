@@ -455,9 +455,24 @@ class StreamManager:
             encoder_preference: Encoder preference
             bitrate: Target bitrate for H.264
         """
-        # Create encoder and stream strategy
-        encoder = EncoderFactory.create_encoder(encoder_preference, stream_type)
-        strategy = StreamStrategyFactory.create_strategy(stream_type)
+        # Determine if we should use H.264 for depth
+        use_h264_for_depth = False
+        if stream_type == "depth":
+            encoding_cfg = self.config_loader.config.get("encoding", {})
+            depth_h264_cfg = encoding_cfg.get("depth_h264", {})
+            use_h264_for_depth = depth_h264_cfg.get("use_h264", True)
+
+        # Create encoder
+        encoder = EncoderFactory.create_encoder(
+            encoder_preference, stream_type, use_h264_for_depth=use_h264_for_depth
+        )
+
+        # Create strategy with config_loader
+        strategy = StreamStrategyFactory.create_strategy(stream_type, self.config_loader)
+
+        # Get encoding config for strategy
+        encoding_cfg = self.config_loader.config.get("encoding", {})
+        h264_cfg = encoding_cfg.get("h264", {})
 
         # Build GStreamer pipeline
         pipeline = strategy.build_sender_pipeline(
@@ -696,7 +711,10 @@ def main():
                 network_cfg["imu_port"],
             )
 
-    # Start video streams
+    use_h264_for_depth = encoding_cfg.get("depth_h264", {}).get("use_h264", True)
+    depth_bitrate = encoding_cfg.get("depth_h264", {}).get("bitrate", 8000)
+    h264_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
+
     for serial, serial_cameras in camera_groups.items():
         stream_type_counts: dict = {}  # Reset for each camera
 
@@ -719,11 +737,11 @@ def main():
 
             fps = get_best_fps(mode, camera_cfg["fps"])
 
-            # Handle multiple IR sensors by assigning them to infra1 and infra2
+            # Handle multiple IR sensors
             stream_count = stream_type_counts.get(stream_type, 0)
             stream_type_counts[stream_type] = stream_count + 1
 
-            # Map stream type to port key used in config.yaml
+            # Map stream type to port key
             if stream_type == "infra":
                 port_stream_type = f"infra{stream_count + 1}"
             else:
@@ -734,7 +752,11 @@ def main():
             stream_cfg = StreamConfig(
                 name=stream_type,
                 port=port,
-                encoding="jpeg2000" if stream_type == "depth" else "h264",
+                encoding=(
+                    "h264"
+                    if (stream_type == "depth" and use_h264_for_depth)
+                    else ("jpeg2000" if stream_type == "depth" else "h264")
+                ),
                 width=mode.size[0],
                 height=mode.size[1],
                 fps=fps,
@@ -742,10 +764,15 @@ def main():
                 fourcc=mode.fourcc,
             )
 
-            manager.add_stream(
-                stream_cfg, stream_type, encoding_cfg["encoder"], encoding_cfg["bitrate"]
-            )
+            # Use correct bitrate based on stream type
+            if stream_type == "depth":
+                actual_bitrate = depth_bitrate
+            else:
+                actual_bitrate = h264_bitrate
 
+            manager.add_stream(stream_cfg, stream_type, encoding_cfg["encoder"], actual_bitrate)
+
+    time.sleep(1)  # Give some time for streams to start
     print(f"\n{'='*70}")
     print("ALL STREAMS STARTED")
     print(f"{'='*70}")

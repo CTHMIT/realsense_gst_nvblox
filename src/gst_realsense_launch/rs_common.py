@@ -219,10 +219,31 @@ class ConfigLoader:
 
     def get_encoding_config(self, args) -> dict:
         """Get complete encoding configuration with overrides."""
+        # Get H.264 configuration
+        h264_config = {
+            "bitrate": self.get("encoding.h264.bitrate", 4000, getattr(args, "bitrate", None)),
+            "tune": self.get("encoding.h264.tune", "zerolatency"),
+            "speed_preset": self.get("encoding.h264.speed_preset", "ultrafast"),
+            "key_int_max": self.get("encoding.h264.key_int_max", 30),
+        }
+
+        # Get depth H.264 configuration
+        depth_h264_config = {
+            "bitrate": self.get("encoding.depth_h264.bitrate", 8000),
+            "use_h264": self.get("encoding.depth_h264.use_h264", True),
+        }
+
+        # Get JPEG2000 configuration
+        jpeg2000_config = {
+            "quality": self.get("encoding.jpeg2000.quality", 100),
+            "num_threads": self.get("encoding.jpeg2000.num_threads", 8),
+        }
+
         return {
             "encoder": self.get("encoding.encoder", "auto", getattr(args, "encoder", None)),
-            "bitrate": self.get("encoding.bitrate", 4000, getattr(args, "bitrate", None)),
-            "jpeg2000_quality": self.get("encoding.jpeg2000_quality", 85),
+            "h264": h264_config,
+            "depth_h264": depth_h264_config,
+            "jpeg2000": jpeg2000_config,
         }
 
     def get_imu_config(self, args) -> dict:
