@@ -530,8 +530,6 @@ class StreamManager:
 
     def stop_all(self):
         """Stop all running streams, IMU senders, and tmux session (idempotent)."""
-        if self._stopped:
-            return
         self._stopped = True
         self._shutdown.set()
 

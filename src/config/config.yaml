@@ -8,17 +8,17 @@ network:
   # Stream port configuration
   stream_ports:
     color:
-      rtp: 5000
-      rtcp: 5001
+      rtp: 5010
+      rtcp: 5015
     depth:
-      rtp: 5002
-      rtcp: 5003
+      rtp: 5020
+      rtcp: 5025
     infra1:
-      rtp: 5004
-      rtcp: 5005
+      rtp: 5030
+      rtcp: 5035
     infra2:
-      rtp: 5006
-      rtcp: 5007
+      rtp: 5040
+      rtcp: 5045
     imu:
       udp: 5050  # IMU uses simple UDP (not RTP)
 
@@ -91,13 +91,13 @@ presets:
     streams:
       - name: "depth"
         encoding: "h264"
-        port_offset: 2
+        port_offset: 20
       - name: "color"
         encoding: "h264"
-        port_offset: 0
+        port_offset: 10
       - name: "infra_stereo"  # Y8I stream (contains both infra1 and infra2)
         encoding: "h264"
-        port_offset: 4
+        port_offset: 30
     imu_enabled: true
 
   d455:
