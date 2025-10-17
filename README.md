@@ -55,6 +55,15 @@
 - 📐 **Camera Calibration**: Automatic camera_info generation from RealSense intrinsics
 - 🔧 **Flexible Configuration**: YAML-based port and stream configuration
 
+
+### d435i
+/dev/video0 → Depth (Z16) ✓
+/dev/video1 → Metadata (None) - pass
+/dev/video2 → Infrared (GREY) ✓ - double IR (Y8I)
+/dev/video3 → Metadata (None) - pass
+/dev/video4 → Color (YUYV) ✓
+/dev/video5 → Metadata (None) - pass
+
 ### Supported Streams
 
 | Stream Type | Encoding | Default Port | Description |
@@ -63,7 +72,6 @@
 | Depth      | JPEG2000 | 5002         | 16-bit depth map |
 | Infrared L | H.264    | 5004         | Left IR camera |
 | Infrared R | H.264    | 5006         | Right IR camera |
-
 ---
 
 ## 📦 Requirements

@@ -421,6 +421,76 @@ class ColorStreamStrategy(StreamPipelineStrategy):
         )
 
 
+class Y8IStreamStrategy(StreamPipelineStrategy):
+    """Strategy for Y8I interleaved infrared stream - splits into left and right."""
+
+    def build_dual_sender_pipelines(
+        self,
+        device: str,
+        width: int,
+        height: int,
+        fps: int,
+        encoder: EncoderStrategy,
+        host: str,
+        port_left: int,
+        port_right: int,
+        bitrate: int = 2000,
+    ) -> tuple[str, str]:
+        """Build pipelines to split Y8I into two separate IR streams.
+
+        Y8I format contains left and right IR images interleaved.
+        Width is 2x the actual width of each IR image.
+        """
+        config = {}
+        udp_config = {"sync": "false", "async": "false"}
+
+        if self.config_loader:
+            config = {
+                "tune": self.config_loader.get("encoding.h264.tune", "zerolatency"),
+                "speed_preset": self.config_loader.get("encoding.h264.speed_preset", "ultrafast"),
+                "key_int_max": self.config_loader.get("encoding.h264.key_int_max", fps),
+            }
+            udp_config = {
+                "sync": str(self.config_loader.get("streaming.udp.sync", False)).lower(),
+                "async": str(self.config_loader.get("streaming.udp.async", False)).lower(),
+            }
+
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+
+        # Y8I has width = 2 * single_width
+        single_width = width // 2
+
+        # Pipeline for left IR (first half)
+        pipeline_left = (
+            f"gst-launch-1.0 -e "
+            f"v4l2src device={shlex.quote(device)} do-timestamp=true "
+            f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
+            f"! videocrop left=0 right={single_width} "  # Crop to left half
+            f"! videoconvert "
+            f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "
+            f"! rtph264pay pt=96 mtu=1400 "
+            f"! udpsink host={shlex.quote(host)} port={port_left} "
+            f"sync={udp_config['sync']} async={udp_config['async']}"
+        )
+
+        # Pipeline for right IR (second half)
+        pipeline_right = (
+            f"gst-launch-1.0 -e "
+            f"v4l2src device={shlex.quote(device)} do-timestamp=true "
+            f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
+            f"! videocrop left={single_width} right=0 "  # Crop to right half
+            f"! videoconvert "
+            f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "
+            f"! rtph264pay pt=96 mtu=1400 "
+            f"! udpsink host={shlex.quote(host)} port={port_right} "
+            f"sync={udp_config['sync']} async={udp_config['async']}"
+        )
+
+        return pipeline_left, pipeline_right
+
+
 class IRStreamStrategy(StreamPipelineStrategy):
     """Strategy for infrared stream."""
 

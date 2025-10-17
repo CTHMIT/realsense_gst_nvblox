@@ -107,9 +107,9 @@ presets:
       - name: "infra1"
         encoding: "h264"
         port_offset: 4  # Port 5004
-      - name: "infra2"
-        encoding: "h264"
-        port_offset: 6  # Port 5006
+      # - name: "infra2"
+      #   encoding: "h264"
+      #   port_offset: 6  # Port 5006
     imu_enabled: true
 
   d455:

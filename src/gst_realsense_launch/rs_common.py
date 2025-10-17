@@ -327,7 +327,7 @@ def validate_network_config(config: dict) -> None:
 # FOURCC classifications for stream type detection
 FOURCC_DEPTH = {"Z16", "Y16"}
 FOURCC_COLOR = {"YUYV", "YUY2", "UYVY", "MJPG", "RGB3", "BGR3"}
-FOURCC_IR = {"GREY", "Y8", "Y8I", "Y12I", "Y16I"}
+FOURCC_IR = {"GREY", "Y8"}
 
 
 def get_stream_type_from_fourcc(fourcc: str) -> str:

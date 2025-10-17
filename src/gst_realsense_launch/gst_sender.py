@@ -222,35 +222,99 @@ class RealSenseDetector:
     def probe_device(cls, dev: str) -> DeviceInfo | None:
         """
         Probe V4L2 device and extract all capabilities.
-
         Returns DeviceInfo if device is a RealSense camera, None otherwise.
         """
-        try:
-            all_out = cls.run_cmd(["v4l2-ctl", "-d", dev, "--all"]).stdout
-            card = ""
-            for line in all_out.splitlines():
-                if line.strip().startswith("Card type"):
-                    card = line.split(":", 1)[1].strip()
-                    break
-
-            if not ("RealSense" in card or "Intel(R) RealSense" in card):
-                return None
-
-            model = cls.extract_model(card, dev)
-            serial = cls.extract_serial(dev, card)
-
-            # Parse formats
-            fmts = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"]).stdout
-            modes = cls._parse_formats(fmts)
-
-            if not modes:
-                return None
-
-            return DeviceInfo(dev=dev, card=card, model=model, serial=serial, modes=modes)
-
-        except Exception as e:
-            print(f"Warning: Failed to probe {dev}: {e}", file=sys.stderr)
+        result = cls.run_cmd(["v4l2-ctl", "-d", dev, "--all"])
+        if result.returncode != 0:
             return None
+
+        output = result.stdout
+        lines = output.split("\n")
+
+        # Extract card name
+        card_name = None
+        for line in lines:
+            if "Card type" in line:
+                card_name = line.split(":", 1)[1].strip()
+                break
+
+        if not card_name:
+            return None
+
+        # Check if it's a RealSense device
+        if "RealSense" not in card_name:
+            return None
+
+        print(f"DEBUG: Probing {dev}")
+        print(f"DEBUG: Card name: {card_name}")
+
+        # Detect model
+        model = "Unknown"
+        for pattern, model_name in cls.MODEL_PATTERNS.items():
+            if re.search(pattern, card_name, re.IGNORECASE):
+                model = model_name
+                break
+
+        # Get serial number
+        serial = cls.extract_serial(dev, card_name)
+
+        # Parse supported formats
+        modes: list = []
+        result = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"])
+        if result.returncode == 0:
+            current_fourcc = None
+            current_size = None
+            fps_list: list = []
+
+            for line in result.stdout.split("\n"):
+                if "YUYV" in line or "Z16" in line or "GREY" in line or "Y8" in line:
+                    print(f"DEBUG: {dev} - {line.strip()}")
+
+                # Match FOURCC
+                fourcc_match = re.search(r"\[(\d+)\]:\s+'([A-Z0-9]+)'", line)
+                if fourcc_match:
+                    if current_fourcc and current_size:
+                        modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
+                    current_fourcc = fourcc_match.group(2)
+                    fps_list = []
+                    current_size = None
+                    continue
+
+                # Match size
+                size_match = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
+                if size_match:
+                    if current_fourcc and current_size:
+                        modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
+                    current_size = (int(size_match.group(1)), int(size_match.group(2)))
+                    fps_list = []
+                    continue
+
+                # Match FPS
+                fps_match = re.search(r"Interval:.*\(([\d.]+)\s+fps\)", line)
+                if fps_match:
+                    fps = int(float(fps_match.group(1)))
+                    if fps not in fps_list:
+                        fps_list.append(fps)
+
+            # Don't forget the last mode
+            if current_fourcc and current_size:
+                modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
+
+        print(f"DEBUG: {dev} detected {len(modes)} modes")
+        if modes:
+            print(f"DEBUG: {dev} FOURCCs: {[m.fourcc for m in modes]}")
+
+        if not modes:
+            print(f"DEBUG: {dev} has no video modes, skipping")
+            return None
+
+        return DeviceInfo(
+            dev=dev,
+            card=card_name,
+            model=model,
+            serial=serial,
+            modes=modes,
+        )
 
     @staticmethod
     def _parse_formats(fmts: str) -> list[Mode]:
@@ -741,16 +805,18 @@ def main():
             stream_count = stream_type_counts.get(stream_type, 0)
             stream_type_counts[stream_type] = stream_count + 1
 
-            # Map stream type to port key
+            # Map stream type to port key AND stream name
             if stream_type == "infra":
                 port_stream_type = f"infra{stream_count + 1}"
+                stream_name = f"infra{stream_count + 1}"
             else:
                 port_stream_type = stream_type
+                stream_name = stream_type
 
             port = config_loader.get_port_for_stream(port_stream_type, 5000)
 
             stream_cfg = StreamConfig(
-                name=stream_type,
+                name=stream_name,
                 port=port,
                 encoding=(
                     "h264"
