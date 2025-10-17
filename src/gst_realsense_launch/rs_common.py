@@ -328,20 +328,23 @@ def validate_network_config(config: dict) -> None:
 FOURCC_DEPTH = {"Z16", "Y16"}
 FOURCC_COLOR = {"YUYV", "YUY2", "UYVY", "MJPG", "RGB3", "BGR3"}
 FOURCC_IR = {"GREY", "Y8"}
+FOURCC_IR_STEREO = {"Y8I"}
 
 
 def get_stream_type_from_fourcc(fourcc: str) -> str:
     """Determine stream type from FOURCC code.
 
     Args:
-        fourcc: Four character code (e.g., "Z16", "YUYV")
+        fourcc: Four character code (e.g., "Z16", "YUYV", "Y8I")
 
     Returns:
-        Stream type: "depth", "color", "infra", or "unknown"
+        Stream type: "depth", "color", "infra", "infra_stereo", or "unknown"
     """
     fourcc_upper = fourcc.strip().upper()
     if fourcc_upper in FOURCC_DEPTH:
         return "depth"
+    elif fourcc_upper in FOURCC_IR_STEREO:
+        return "infra_stereo"  # Y8I 是特殊的雙紅外格式
     elif fourcc_upper in FOURCC_IR:
         return "infra"
     elif fourcc_upper in FOURCC_COLOR:

@@ -421,76 +421,6 @@ class ColorStreamStrategy(StreamPipelineStrategy):
         )
 
 
-class Y8IStreamStrategy(StreamPipelineStrategy):
-    """Strategy for Y8I interleaved infrared stream - splits into left and right."""
-
-    def build_dual_sender_pipelines(
-        self,
-        device: str,
-        width: int,
-        height: int,
-        fps: int,
-        encoder: EncoderStrategy,
-        host: str,
-        port_left: int,
-        port_right: int,
-        bitrate: int = 2000,
-    ) -> tuple[str, str]:
-        """Build pipelines to split Y8I into two separate IR streams.
-
-        Y8I format contains left and right IR images interleaved.
-        Width is 2x the actual width of each IR image.
-        """
-        config = {}
-        udp_config = {"sync": "false", "async": "false"}
-
-        if self.config_loader:
-            config = {
-                "tune": self.config_loader.get("encoding.h264.tune", "zerolatency"),
-                "speed_preset": self.config_loader.get("encoding.h264.speed_preset", "ultrafast"),
-                "key_int_max": self.config_loader.get("encoding.h264.key_int_max", fps),
-            }
-            udp_config = {
-                "sync": str(self.config_loader.get("streaming.udp.sync", False)).lower(),
-                "async": str(self.config_loader.get("streaming.udp.async", False)).lower(),
-            }
-
-        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
-
-        # Y8I has width = 2 * single_width
-        single_width = width // 2
-
-        # Pipeline for left IR (first half)
-        pipeline_left = (
-            f"gst-launch-1.0 -e "
-            f"v4l2src device={shlex.quote(device)} do-timestamp=true "
-            f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
-            f"! videocrop left=0 right={single_width} "  # Crop to left half
-            f"! videoconvert "
-            f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96 mtu=1400 "
-            f"! udpsink host={shlex.quote(host)} port={port_left} "
-            f"sync={udp_config['sync']} async={udp_config['async']}"
-        )
-
-        # Pipeline for right IR (second half)
-        pipeline_right = (
-            f"gst-launch-1.0 -e "
-            f"v4l2src device={shlex.quote(device)} do-timestamp=true "
-            f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
-            f"! videocrop left={single_width} right=0 "  # Crop to right half
-            f"! videoconvert "
-            f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96 mtu=1400 "
-            f"! udpsink host={shlex.quote(host)} port={port_right} "
-            f"sync={udp_config['sync']} async={udp_config['async']}"
-        )
-
-        return pipeline_left, pipeline_right
-
-
 class IRStreamStrategy(StreamPipelineStrategy):
     """Strategy for infrared stream."""
 
@@ -570,6 +500,84 @@ class IRStreamStrategy(StreamPipelineStrategy):
         )
 
 
+class Y8IStreamStrategy(StreamPipelineStrategy):
+    """Strategy for Y8I interleaved infrared stream."""
+
+    def build_sender_pipeline(
+        self,
+        device: str,
+        width: int,
+        height: int,
+        fps: int,
+        fourcc: str,
+        encoder: EncoderStrategy,
+        host: str,
+        port: int,
+        bitrate: int = 2000,
+    ) -> str:
+        """Build Y8I sender pipeline (sends interleaved stereo as-is).
+
+        Y8I format has width = 2 * single_ir_width (e.g., 1280x480 for two 640x480 images)
+        We send the full Y8I frame, and the receiver will split it.
+        """
+        config = {}
+        udp_config = {"sync": "false", "async": "false"}
+
+        if self.config_loader:
+            config = {
+                "tune": self.config_loader.get("encoding.h264.tune", "zerolatency"),
+                "speed_preset": self.config_loader.get("encoding.h264.speed_preset", "ultrafast"),
+                "key_int_max": self.config_loader.get("encoding.h264.key_int_max", fps),
+            }
+            udp_config = {
+                "sync": str(self.config_loader.get("streaming.udp.sync", False)).lower(),
+                "async": str(self.config_loader.get("streaming.udp.async", False)).lower(),
+            }
+
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+
+        # Y8I is GRAY8 format but with double width
+        return (
+            f"gst-launch-1.0 -e "
+            f"v4l2src device={shlex.quote(device)} do-timestamp=true "
+            f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
+            f"! videoconvert "
+            f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "
+            f"! rtph264pay pt=96 mtu=1400 "
+            f"! udpsink host={shlex.quote(host)} port={port} "
+            f"sync={udp_config['sync']} async={udp_config['async']}"
+        )
+
+    def build_receiver_pipeline(
+        self,
+        port: int,
+        encoding: str,
+    ) -> str:
+        """Build Y8I receiver pipeline (receives full interleaved frame).
+
+        The receiver will get the full Y8I frame and split it in software.
+        """
+        if self.config_loader:
+            buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+            latency = self.config_loader.get("streaming.jitter_buffer.latency", 50)
+            max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        else:
+            buffer_size = 2097152
+            latency = 50
+            max_threads = 4
+
+        return (
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,encoding-name={encoding},payload=96" '
+            f"! rtpjitterbuffer latency={latency} "
+            f"! rtph264depay "
+            f"! h264parse "
+            f"! avdec_h264 max-threads={max_threads} "
+            f"! videoconvert ! video/x-raw,format=GRAY8"
+        )
+
+
 class StreamStrategyFactory:
     """Factory for creating stream pipeline strategies."""
 
@@ -578,7 +586,7 @@ class StreamStrategyFactory:
         """Create appropriate stream strategy based on type.
 
         Args:
-            stream_type: "depth", "color", or "ir"
+            stream_type: "depth", "color", "ir", or "infra_stereo"
             config_loader: Optional ConfigLoader for accessing configuration
         """
         stream_type_lower = stream_type.lower()
@@ -587,7 +595,9 @@ class StreamStrategyFactory:
             return DepthStreamStrategy(config_loader)
         elif stream_type_lower == "color":
             return ColorStreamStrategy(config_loader)
-        elif stream_type_lower == "ir":
+        elif stream_type_lower == "infra_stereo":
+            return Y8IStreamStrategy(config_loader)
+        elif stream_type_lower in ["ir", "infra"]:
             return IRStreamStrategy(config_loader)
         else:
             return ColorStreamStrategy(config_loader)

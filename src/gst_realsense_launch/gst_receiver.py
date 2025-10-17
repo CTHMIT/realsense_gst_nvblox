@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Optional
 
 try:
     import cv2
@@ -47,6 +48,41 @@ except ImportError:
 
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
 from gst_realsense_launch.rs_core import StreamStrategyFactory
+
+
+class Y8ISplitter:
+    """Split Y8I interleaved stereo infrared into infra1 and infra2."""
+
+    def __init__(self, width: int, height: int):
+        """Initialize splitter.
+
+        Args:
+            width: Single infrared image width (e.g., 640)
+            height: Image height (e.g., 480)
+        """
+        self.single_width = width
+        self.height = height
+        self.y8i_width = width * 2  # Y8I has double width
+
+    def split(self, y8i_frame: np.ndarray) -> tuple:
+        """Split Y8I frame into infra1 (left) and infra2 (right).
+
+        Args:
+            y8i_frame: numpy array of shape (height, width*2) or (height, width*2, 1)
+
+        Returns:
+            (infra1, infra2): tuple of two numpy arrays
+        """
+        if len(y8i_frame.shape) == 3:
+            y8i_frame = y8i_frame[:, :, 0]  # Remove channel dimension if present
+
+        if y8i_frame.shape[1] != self.y8i_width:
+            raise ValueError(f"Expected Y8I width {self.y8i_width}, got {y8i_frame.shape[1]}")
+
+        infra1 = y8i_frame[:, 0::2]  # Left camera (even columns)
+        infra2 = y8i_frame[:, 1::2]  # Right camera (odd columns)
+
+        return infra1, infra2
 
 
 class VirtualRealSenseNode(Node):
@@ -466,6 +502,8 @@ class VideoStreamReceiver:
         self.processes: list = []
         self.threads: list = []
 
+        self.y8i_splitter: Y8ISplitter | None = None
+
         # For visualization
         if show_views and cv2:
             self.view_images: dict = {}
@@ -482,24 +520,42 @@ class VideoStreamReceiver:
         height: int,
         intrinsics: CameraIntrinsics | None = None,
     ):
-        """Start receiving a video stream and publishing to ROS2.
+        """Start receiving a video stream and publishing to ROS2."""
 
-        Args:
-            port: UDP port for stream
-            stream_name: Stream identifier (depth, color, infra1, infra2)
-            encoding: Video encoding (h264, jpeg2000)
-            width: Image width
-            height: Image height
-            intrinsics: Camera calibration parameters
-        """
-        thread = threading.Thread(
-            target=self._run_receiver,
-            args=(port, stream_name, encoding, width, height, intrinsics),
-            daemon=True,
-        )
-        self.threads.append(thread)
-        thread.start()
-        time.sleep(0.5)  # Stagger starts
+        #  infra_stereo (Y8I)：infra1 and infra2
+        if stream_name == "infra_stereo":
+            # Y8I splitter
+            single_width = width // 2
+            self.y8i_splitter = Y8ISplitter(single_width, height)
+
+            # infra1
+            thread1 = threading.Thread(
+                target=self._run_receiver_with_y8i_split,
+                args=(port, "infra1", encoding, width, height, intrinsics),
+                daemon=True,
+            )
+            self.threads.append(thread1)
+            thread1.start()
+            time.sleep(0.5)
+
+            # infra2
+            thread2 = threading.Thread(
+                target=self._run_receiver_with_y8i_split,
+                args=(port, "infra2", encoding, width, height, intrinsics),
+                daemon=True,
+            )
+            self.threads.append(thread2)
+            thread2.start()
+            time.sleep(0.5)
+        else:
+            thread = threading.Thread(
+                target=self._run_receiver,
+                args=(port, stream_name, encoding, width, height, intrinsics),
+                daemon=True,
+            )
+            self.threads.append(thread)
+            thread.start()
+            time.sleep(0.5)
 
     def _run_receiver(
         self,
@@ -594,6 +650,101 @@ class VideoStreamReceiver:
             pass
         finally:
             # Clean up the temporary file
+            os.unlink(tmp_file.name)
+
+    def _run_receiver_with_y8i_split(
+        self,
+        port: int,
+        stream_name: str,  # "infra1" or "infra2"
+        encoding: str,
+        y8i_width: int,  # Full Y8I width (e.g., 1280)
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """Run receiver for Y8I stream and split into infra1/infra2.
+
+        This receives the Y8I stream once and publishes both infra1 and infra2.
+        Only one instance should actually receive; the other should read from shared data.
+        """
+        single_width = y8i_width // 2
+
+        # Create camera info file
+        with tempfile.NamedTemporaryFile(
+            mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+        ) as tmp_file:
+            self._create_camera_info_file(
+                tmp_file.name, stream_name, single_width, height, intrinsics
+            )
+            info_file_url = f"file://{tmp_file.name}"
+
+        # Build GStreamer pipeline for Y8I
+        strategy = StreamStrategyFactory.create_strategy("infra_stereo", self.config_loader)
+        gst_config = strategy.build_receiver_pipeline(port, encoding)
+
+        # Add videocrop to split left/right
+        if stream_name == "infra1":
+            # Crop to left half
+            gst_config += f" ! videocrop left=0 right={single_width}"
+        else:  # infra2
+            # Crop to right half
+            gst_config += f" ! videocrop left={single_width} right=0"
+
+        # Determine topics
+        image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
+        info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
+        frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
+        image_encoding = "mono8"
+
+        # Add visualization tee if enabled
+        if self.show_views and cv2:
+            gst_config += (
+                " ! tee name=t t. ! queue ! videoconvert ! appsink name=viz_sink "
+                "emit-signals=true sync=false max-buffers=1 drop=true"
+            )
+
+        # Build gscam command
+        gscam_cmd = [
+            "ros2",
+            "run",
+            "gscam",
+            "gscam_node",
+            "--ros-args",
+            "-p",
+            f"gscam_config:={gst_config}",
+            "-p",
+            f"camera_name:={self.camera_name}_{stream_name}",
+            "-p",
+            f"camera_info_url:={info_file_url}",
+            "-p",
+            f"frame_id:={frame_id}",
+            "-p",
+            "sync_sink:=false",
+            "-p",
+            f"image_encoding:={image_encoding}",
+            "-r",
+            f"camera/image_raw:={image_topic}",
+            "-r",
+            f"camera/camera_info:={info_topic}",
+        ]
+
+        print(f"\n[{stream_name}] Starting on port {port} (from Y8I)")
+        print(f"  Topic: {image_topic}")
+        print(f"  Encoding: {encoding.upper()}")
+
+        proc = subprocess.Popen(gscam_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.processes.append((stream_name, proc))
+
+        # Monitor output
+        try:
+            if proc.stdout:
+                for line in iter(proc.stdout.readline, b""):
+                    if line:
+                        line_str = line.decode("utf-8", errors="ignore").strip()
+                        if "ERROR" in line_str or "started" in line_str.lower():
+                            print(f"  [{stream_name}] {line_str}")
+        except KeyboardInterrupt:
+            pass
+        finally:
             os.unlink(tmp_file.name)
 
     def _create_camera_info_file(
@@ -711,14 +862,33 @@ def main():
     receiver_cfg = config_loader.get_receiver_config(args)
     config_loader.get_imu_config(args)
 
+    # Resolution
+    width = args.width or 640
+    height = args.height or 480
+
     # Handle presets
     if args.preset:
         preset = config_loader.get_preset(args.preset)
         if preset:
             streams = preset["streams"]
-            ports = [network_cfg["base_port"] + s["port_offset"] for s in streams]
-            stream_names = [s["name"] for s in streams]
-            encodings = [s["encoding"] for s in streams]
+            ports: list = []
+            stream_names: list = []
+            encodings: list = []
+            widths: list = []
+            heights: list = []
+
+            for s in streams:
+                port = network_cfg["base_port"] + s["port_offset"]
+                ports.append(port)
+                stream_names.append(s["name"])
+                encodings.append(s["encoding"])
+
+                if s["name"] == "infra_stereo":
+                    widths.append(width * 2)  # Y8I is double width
+                else:
+                    widths.append(width)
+                heights.append(height)
+
             print(f"Using {args.preset.upper()} preset")
         else:
             print(f"Error: Preset {args.preset} not found")
@@ -726,10 +896,6 @@ def main():
     else:
         print("Error: --preset required (d435i, d455, d415, l515)")
         sys.exit(1)
-
-    # Resolution
-    width = args.width or 640
-    height = args.height or 480
 
     print(f"\n{'='*70}")
     print("VIRTUAL REALSENSE CAMERA RECEIVER")
@@ -765,9 +931,13 @@ def main():
         view_scale=receiver_cfg.get("view_scale", 0.5),
     )
 
-    for port, stream, encoding in zip(ports, stream_names, encodings, strict=False):
-        intrinsics = config_loader.create_default_intrinsics(width, height)
-        video_receiver.start_stream(port, stream, encoding, width, height, intrinsics)
+    for port, stream, encoding, stream_width, stream_height in zip(
+        ports, stream_names, encodings, widths, heights, strict=False
+    ):
+        intrinsics = config_loader.create_default_intrinsics(
+            stream_width if stream != "infra_stereo" else stream_width // 2, stream_height
+        )
+        video_receiver.start_stream(port, stream, encoding, stream_width, stream_height, intrinsics)
 
     print("\n✓ All receivers started")
     print("\nPublishing ROS2 topics:")

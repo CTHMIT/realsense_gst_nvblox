@@ -33,6 +33,7 @@ from gst_realsense_launch.rs_common import (
     FOURCC_COLOR,
     FOURCC_DEPTH,
     FOURCC_IR,
+    FOURCC_IR_STEREO,
     ConfigLoader,
     StreamConfig,
     format_stream_label,
@@ -222,99 +223,35 @@ class RealSenseDetector:
     def probe_device(cls, dev: str) -> DeviceInfo | None:
         """
         Probe V4L2 device and extract all capabilities.
+
         Returns DeviceInfo if device is a RealSense camera, None otherwise.
         """
-        result = cls.run_cmd(["v4l2-ctl", "-d", dev, "--all"])
-        if result.returncode != 0:
+        try:
+            all_out = cls.run_cmd(["v4l2-ctl", "-d", dev, "--all"]).stdout
+            card = ""
+            for line in all_out.splitlines():
+                if line.strip().startswith("Card type"):
+                    card = line.split(":", 1)[1].strip()
+                    break
+
+            if not ("RealSense" in card or "Intel(R) RealSense" in card):
+                return None
+
+            model = cls.extract_model(card, dev)
+            serial = cls.extract_serial(dev, card)
+
+            # Parse formats
+            fmts = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"]).stdout
+            modes = cls._parse_formats(fmts)
+
+            if not modes:
+                return None
+
+            return DeviceInfo(dev=dev, card=card, model=model, serial=serial, modes=modes)
+
+        except Exception as e:
+            print(f"Warning: Failed to probe {dev}: {e}", file=sys.stderr)
             return None
-
-        output = result.stdout
-        lines = output.split("\n")
-
-        # Extract card name
-        card_name = None
-        for line in lines:
-            if "Card type" in line:
-                card_name = line.split(":", 1)[1].strip()
-                break
-
-        if not card_name:
-            return None
-
-        # Check if it's a RealSense device
-        if "RealSense" not in card_name:
-            return None
-
-        print(f"DEBUG: Probing {dev}")
-        print(f"DEBUG: Card name: {card_name}")
-
-        # Detect model
-        model = "Unknown"
-        for pattern, model_name in cls.MODEL_PATTERNS.items():
-            if re.search(pattern, card_name, re.IGNORECASE):
-                model = model_name
-                break
-
-        # Get serial number
-        serial = cls.extract_serial(dev, card_name)
-
-        # Parse supported formats
-        modes: list = []
-        result = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"])
-        if result.returncode == 0:
-            current_fourcc = None
-            current_size = None
-            fps_list: list = []
-
-            for line in result.stdout.split("\n"):
-                if "YUYV" in line or "Z16" in line or "GREY" in line or "Y8" in line:
-                    print(f"DEBUG: {dev} - {line.strip()}")
-
-                # Match FOURCC
-                fourcc_match = re.search(r"\[(\d+)\]:\s+'([A-Z0-9]+)'", line)
-                if fourcc_match:
-                    if current_fourcc and current_size:
-                        modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
-                    current_fourcc = fourcc_match.group(2)
-                    fps_list = []
-                    current_size = None
-                    continue
-
-                # Match size
-                size_match = re.search(r"Size:\s+Discrete\s+(\d+)x(\d+)", line)
-                if size_match:
-                    if current_fourcc and current_size:
-                        modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
-                    current_size = (int(size_match.group(1)), int(size_match.group(2)))
-                    fps_list = []
-                    continue
-
-                # Match FPS
-                fps_match = re.search(r"Interval:.*\(([\d.]+)\s+fps\)", line)
-                if fps_match:
-                    fps = int(float(fps_match.group(1)))
-                    if fps not in fps_list:
-                        fps_list.append(fps)
-
-            # Don't forget the last mode
-            if current_fourcc and current_size:
-                modes.append(Mode(current_fourcc, current_size, fps_list.copy()))
-
-        print(f"DEBUG: {dev} detected {len(modes)} modes")
-        if modes:
-            print(f"DEBUG: {dev} FOURCCs: {[m.fourcc for m in modes]}")
-
-        if not modes:
-            print(f"DEBUG: {dev} has no video modes, skipping")
-            return None
-
-        return DeviceInfo(
-            dev=dev,
-            card=card_name,
-            model=model,
-            serial=serial,
-            modes=modes,
-        )
 
     @staticmethod
     def _parse_formats(fmts: str) -> list[Mode]:
@@ -563,6 +500,8 @@ class StreamManager:
         label = format_stream_label(stream_type, None)
 
         print(f"\n[{config.device}] Starting {label} stream on port {config.port}")
+        print(f"  Pipeline: {pipeline_str}")
+        print(f"  Format: {config.fourcc}")
         print(f"  Resolution: {config.width}x{config.height}@{config.fps}fps")
         print(f"  Encoding: {config.encoding}")
 
@@ -641,19 +580,18 @@ def find_best_mode(
     device: DeviceInfo,
     target_size: tuple[int, int],
     stream_type: str,
-    target_format: str | None = None,  # Add new argument for desired format
+    target_format: str | None = None,
 ) -> Mode | None:
-    """
-    Find best matching mode for requested size and stream type.
-    Tries exact match first, then finds closest resolution.
-    Optionally filters by a specific FourCC format.
-    """
+    """Find best matching mode for requested size and stream type."""
     key = (stream_type or "").strip().lower()
 
     if key == "depth":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_DEPTH]
     elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
+    elif key == "infra_stereo":
+        # Y8I 格式：尋找 Y8I
+        candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR_STEREO]
     elif key == "infra":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
     else:
@@ -674,11 +612,17 @@ def find_best_mode(
         return None
 
     w, h = target_size
-    target_pixels = w * h
 
-    for mode in candidates:
-        if mode.size == target_size:
-            return mode
+    if key == "infra_stereo":
+        target_pixels = (w * 2) * h  # Y8I width is double
+        for mode in candidates:
+            if mode.size == (w * 2, h):
+                return mode
+    else:
+        target_pixels = w * h
+        for mode in candidates:
+            if mode.size == target_size:
+                return mode
 
     return min(candidates, key=lambda m: abs(m.size[0] * m.size[1] - target_pixels))
 
@@ -790,6 +734,8 @@ def main():
                 target_format = camera_cfg.get("color_format")
             elif stream_type == "depth":
                 target_format = camera_cfg.get("depth_format")
+            elif stream_type == "infra_stereo":
+                target_format = camera_cfg.get("infra_format")
             elif stream_type == "infra":
                 target_format = camera_cfg.get("infra_format")
 
@@ -801,19 +747,17 @@ def main():
 
             fps = get_best_fps(mode, camera_cfg["fps"])
 
-            # Handle multiple IR sensors
-            stream_count = stream_type_counts.get(stream_type, 0)
-            stream_type_counts[stream_type] = stream_count + 1
-
-            # Map stream type to port key AND stream name
-            if stream_type == "infra":
-                port_stream_type = f"infra{stream_count + 1}"
-                stream_name = f"infra{stream_count + 1}"
+            if stream_type == "infra_stereo":
+                port_stream_type = "infra_stereo"
+                stream_name = "infra_stereo"
             else:
                 port_stream_type = stream_type
                 stream_name = stream_type
 
-            port = config_loader.get_port_for_stream(port_stream_type, 5000)
+            if stream_type == "infra_stereo":
+                port = config_loader.get_port_for_stream("infra1", 5004)
+            else:
+                port = config_loader.get_port_for_stream(port_stream_type, 5000)
 
             stream_cfg = StreamConfig(
                 name=stream_name,
@@ -830,7 +774,6 @@ def main():
                 fourcc=mode.fourcc,
             )
 
-            # Use correct bitrate based on stream type
             if stream_type == "depth":
                 actual_bitrate = depth_bitrate
             else:
