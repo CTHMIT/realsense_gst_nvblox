@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""RealSense Streaming Core Module with Strategy Pattern.
+"""RealSense Streaming Core Module with Strategy Pattern
+
+Key fix: Removed duplicate h264parse and rtph264pay from build_sender_pipeline methods.
+Each encoder strategy already provides these elements in get_pipeline_element().
 
 This module implements the Strategy Pattern for different encoding and streaming approaches.
 Updated to use tested GStreamer pipelines from cmd_line.md.
@@ -249,6 +252,7 @@ class DepthStreamStrategy(StreamPipelineStrategy):
         )
 
         # GStreamer pipeline with H.264 encoding and RTP payload
+        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
 
         gst_cmd = (
@@ -258,8 +262,6 @@ class DepthStreamStrategy(StreamPipelineStrategy):
             f"! videoconvert "
             f"! video/x-raw,format=I420 "
             f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "  # 關鍵: 加入 h264parse
-            f"! rtph264pay pt=96 mtu=1400 "  # 關鍵: 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
@@ -353,6 +355,7 @@ class ColorStreamStrategy(StreamPipelineStrategy):
             }
 
         fourcc_cleaned = fourcc.strip().upper()
+        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
 
         # Special handling for MJPEG input
@@ -363,8 +366,6 @@ class ColorStreamStrategy(StreamPipelineStrategy):
                 f"! image/jpeg,width={width},height={height},framerate={fps}/1 "
                 f"! jpegdec ! videoconvert "
                 f"! {encoder_pipeline} "
-                f"! h264parse config-interval=1 "  # 加入 h264parse
-                f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
                 f"! udpsink host={shlex.quote(host)} port={port} "
                 f"sync={udp_config['sync']} async={udp_config['async']}"
             )
@@ -385,8 +386,6 @@ class ColorStreamStrategy(StreamPipelineStrategy):
             f"! video/x-raw,format={gst_format},width={width},height={height},framerate={fps}/1 "
             f"! videoconvert "
             f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "  # 加入 h264parse
-            f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
@@ -453,6 +452,7 @@ class IRStreamStrategy(StreamPipelineStrategy):
             }
 
         fourcc_cleaned = fourcc.strip().upper()
+        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
 
         format_map = {
@@ -467,8 +467,6 @@ class IRStreamStrategy(StreamPipelineStrategy):
             f"! video/x-raw,format={gst_format},width={width},height={height},framerate={fps}/1 "
             f"! videoconvert "
             f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "  # 加入 h264parse
-            f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
@@ -534,6 +532,7 @@ class Y8IStreamStrategy(StreamPipelineStrategy):
                 "async": str(self.config_loader.get("streaming.udp.async", False)).lower(),
             }
 
+        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
 
         # Y8I is GRAY8 format but with double width
@@ -543,8 +542,6 @@ class Y8IStreamStrategy(StreamPipelineStrategy):
             f"! video/x-raw,format=GRAY8,width={width},height={height},framerate={fps}/1 "
             f"! videoconvert "
             f"! {encoder_pipeline} "
-            f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96 mtu=1400 "
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )

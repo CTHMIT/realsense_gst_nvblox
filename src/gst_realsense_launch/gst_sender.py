@@ -659,10 +659,15 @@ def main():
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
     parser.add_argument("--list-only", action="store_true", help="List cameras and exit")
     parser.add_argument("--device", help="Stream only specific device")
+    parser.add_argument(
+        "--preset",
+        choices=["d435i", "d455", "d415", "l515"],
+        help="Use camera preset (recommended for proper Y8I handling)",
+    )
 
     args = parser.parse_args()
 
-    # Load configuration (no ports_config needed anymore)
+    # Load configuration
     config_loader = ConfigLoader(args.config)
 
     # Get configurations with overrides
@@ -707,6 +712,22 @@ def main():
         if cam.serial:
             print(f"  Serial: {cam.serial}")
 
+    # Auto-detect preset if not provided
+    if not args.preset and cameras:
+        detected_model = cameras[0].model.lower()
+        if "435i" in detected_model or "d435i" in detected_model:
+            args.preset = "d435i"
+            print(f"\n✓ Auto-detected D435i camera, using d435i preset\n")
+        elif "455" in detected_model or "d455" in detected_model:
+            args.preset = "d455"
+            print(f"\n✓ Auto-detected D455 camera, using d455 preset\n")
+        elif "415" in detected_model or "d415" in detected_model:
+            args.preset = "d415"
+            print(f"\n✓ Auto-detected D415 camera, using d415 preset\n")
+        elif "l515" in detected_model:
+            args.preset = "l515"
+            print(f"\n✓ Auto-detected L515 camera, using l515 preset\n")
+
     if args.list_only:
         sys.exit(0)
 
@@ -728,65 +749,160 @@ def main():
     depth_bitrate = encoding_cfg.get("depth_h264", {}).get("bitrate", 8000)
     h264_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
 
-    for serial, serial_cameras in camera_groups.items():
-        stream_type_counts: dict = {}  # Reset for each camera
+    # Use preset configuration if available
+    if args.preset:
+        preset = config_loader.get_preset(args.preset)
+        if preset:
+            print(f"\nUsing {args.preset.upper()} preset configuration:")
 
-        for cam in serial_cameras:
-            stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
+            # Group cameras by their detected stream type
+            camera_by_type = {}
+            for cam in cameras:
+                stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
+                camera_by_type[stream_type] = cam
 
-            target_format = None
-            if stream_type == "color":
-                target_format = camera_cfg.get("color_format")
-            elif stream_type == "depth":
-                target_format = camera_cfg.get("depth_format")
-            elif stream_type == "infra_stereo":
-                target_format = camera_cfg.get("infra_format")
-            elif stream_type == "infra":
-                target_format = camera_cfg.get("infra_format")
+            # Process each stream defined in preset
+            for stream_def in preset["streams"]:
+                stream_name = stream_def["name"]
+                encoding = stream_def["encoding"]
+                port_offset = stream_def["port_offset"]
 
-            mode = find_best_mode(cam, target_size, stream_type, target_format)
+                print(f"  - {stream_name}: port offset {port_offset}, encoding {encoding}")
 
-            if not mode:
-                print(f"No suitable mode for {stream_type} on {cam.dev}")
-                continue
+                # Find matching camera
+                cam = None
+                if stream_name == "depth":
+                    cam = camera_by_type.get("depth")
+                elif stream_name == "color":
+                    cam = camera_by_type.get("color")
+                elif stream_name == "infra_stereo":
+                    # For Y8I, try to find a camera with Y8I format, fallback to first infra
+                    for c in cameras:
+                        if c.modes and c.modes[0].fourcc.strip().upper() == "Y8I":
+                            cam = c
+                            break
+                    if not cam:
+                        cam = camera_by_type.get("infra")
+                elif stream_name == "infra1":
+                    cam = camera_by_type.get("infra")
+                elif stream_name == "infra2":
+                    # For infra2, we need to find a second infra device
+                    # This is typically not present in Y8I cameras
+                    pass
 
-            fps = get_best_fps(mode, camera_cfg["fps"])
+                if not cam:
+                    print(f"    ⚠️  No camera found for {stream_name}, skipping")
+                    continue
 
-            if stream_type == "infra_stereo":
-                port_stream_type = "infra_stereo"
-                stream_name = "infra_stereo"
-            else:
-                port_stream_type = stream_type
-                stream_name = stream_type
+                # Determine target format based on stream type
+                if stream_name == "infra_stereo":
+                    target_format = camera_cfg.get("infra_format", "Y8I")
+                    # For Y8I, width should be double
+                    mode_target_size = (target_size[0] * 2, target_size[1])
+                    actual_stream_type = "infra_stereo"
+                elif stream_name == "depth":
+                    target_format = camera_cfg.get("depth_format")
+                    mode_target_size = target_size
+                    actual_stream_type = "depth"
+                elif stream_name == "color":
+                    target_format = camera_cfg.get("color_format")
+                    mode_target_size = target_size
+                    actual_stream_type = "color"
+                else:
+                    target_format = None
+                    mode_target_size = target_size
+                    actual_stream_type = (
+                        stream_name.replace("infra", "infra").replace("1", "").replace("2", "")
+                    )
 
-            if stream_type == "infra_stereo":
-                port = config_loader.get_port_for_stream("infra1", 5004)
-            else:
-                port = config_loader.get_port_for_stream(port_stream_type, 5000)
+                mode = find_best_mode(cam, mode_target_size, actual_stream_type, target_format)
 
-            stream_cfg = StreamConfig(
-                name=stream_name,
-                port=port,
-                encoding=(
-                    "h264"
-                    if (stream_type == "depth" and use_h264_for_depth)
-                    else ("jpeg2000" if stream_type == "depth" else "h264")
-                ),
-                width=mode.size[0],
-                height=mode.size[1],
-                fps=fps,
-                device=cam.dev,
-                fourcc=mode.fourcc,
-            )
+                if not mode:
+                    print(f"    ⚠️  No suitable mode for {stream_name} on {cam.dev}")
+                    continue
 
-            if stream_type == "depth":
-                actual_bitrate = depth_bitrate
-            else:
-                actual_bitrate = h264_bitrate
+                fps = get_best_fps(mode, camera_cfg["fps"])
 
-            manager.add_stream(stream_cfg, stream_type, encoding_cfg["encoder"], actual_bitrate)
+                # Calculate port
+                port = network_cfg["base_port"] + port_offset
 
-    time.sleep(1)  # Give some time for streams to start
+                stream_cfg = StreamConfig(
+                    name=stream_name,
+                    port=port,
+                    encoding=encoding,
+                    width=mode.size[0],
+                    height=mode.size[1],
+                    fps=fps,
+                    device=cam.dev,
+                    fourcc=mode.fourcc,
+                )
+
+                if stream_name == "depth":
+                    actual_bitrate = depth_bitrate
+                else:
+                    actual_bitrate = h264_bitrate
+
+                manager.add_stream(
+                    stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
+                )
+        else:
+            print(f"Error: Preset {args.preset} not found")
+            sys.exit(1)
+    else:
+        # Fallback to auto-detection (old behavior)
+        print("\n⚠️  No preset specified, using auto-detection (may not handle Y8I correctly)")
+        print("    Recommended: use --preset d435i for proper Y8I handling\n")
+
+        for serial, serial_cameras in camera_groups.items():
+            for cam in serial_cameras:
+                stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
+
+                target_format = None
+                if stream_type == "color":
+                    target_format = camera_cfg.get("color_format")
+                elif stream_type == "depth":
+                    target_format = camera_cfg.get("depth_format")
+                elif stream_type == "infra_stereo":
+                    target_format = camera_cfg.get("infra_format")
+                elif stream_type == "infra":
+                    target_format = camera_cfg.get("infra_format")
+
+                mode = find_best_mode(cam, target_size, stream_type, target_format)
+
+                if not mode:
+                    print(f"No suitable mode for {stream_type} on {cam.dev}")
+                    continue
+
+                fps = get_best_fps(mode, camera_cfg["fps"])
+
+                if stream_type == "infra_stereo":
+                    port = config_loader.get_port_for_stream("infra1", 5004)
+                else:
+                    port = config_loader.get_port_for_stream(stream_type, 5000)
+
+                stream_cfg = StreamConfig(
+                    name=stream_type,
+                    port=port,
+                    encoding=(
+                        "h264"
+                        if (stream_type == "depth" and use_h264_for_depth)
+                        else ("jpeg2000" if stream_type == "depth" else "h264")
+                    ),
+                    width=mode.size[0],
+                    height=mode.size[1],
+                    fps=fps,
+                    device=cam.dev,
+                    fourcc=mode.fourcc,
+                )
+
+                if stream_type == "depth":
+                    actual_bitrate = depth_bitrate
+                else:
+                    actual_bitrate = h264_bitrate
+
+                manager.add_stream(stream_cfg, stream_type, encoding_cfg["encoder"], actual_bitrate)
+
+    time.sleep(1)
     print(f"\n{'='*70}")
     print("ALL STREAMS STARTED")
     print(f"{'='*70}")
