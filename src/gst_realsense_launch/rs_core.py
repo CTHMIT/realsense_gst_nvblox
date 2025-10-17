@@ -245,18 +245,21 @@ class DepthStreamStrategy(StreamPipelineStrategy):
             f"--set-fmt-video=width={width},height={height},pixelformat='{fourcc_clean}' "
             f"--set-parm={fps} "
             f"--stream-mmap "
-            f"--stream-to=- 2>/dev/null"  # Suppress stderr output
+            f"--stream-to=- 2>/dev/null"
         )
 
-        # GStreamer pipeline with tested H.264 encoding
+        # GStreamer pipeline with H.264 encoding and RTP payload
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
 
         gst_cmd = (
             f"gst-launch-1.0 -e -v fdsrc fd=0 "
             f"! videoparse format=gray16-le width={width} height={height} framerate={fps}/1 "
+            f"! queue max-size-buffers=2 leaky=downstream "
             f"! videoconvert "
             f"! video/x-raw,format=I420 "
             f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "  # 關鍵: 加入 h264parse
+            f"! rtph264pay pt=96 mtu=1400 "  # 關鍵: 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
@@ -360,6 +363,8 @@ class ColorStreamStrategy(StreamPipelineStrategy):
                 f"! image/jpeg,width={width},height={height},framerate={fps}/1 "
                 f"! jpegdec ! videoconvert "
                 f"! {encoder_pipeline} "
+                f"! h264parse config-interval=1 "  # 加入 h264parse
+                f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
                 f"! udpsink host={shlex.quote(host)} port={port} "
                 f"sync={udp_config['sync']} async={udp_config['async']}"
             )
@@ -380,6 +385,8 @@ class ColorStreamStrategy(StreamPipelineStrategy):
             f"! video/x-raw,format={gst_format},width={width},height={height},framerate={fps}/1 "
             f"! videoconvert "
             f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "  # 加入 h264parse
+            f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
@@ -460,6 +467,8 @@ class IRStreamStrategy(StreamPipelineStrategy):
             f"! video/x-raw,format={gst_format},width={width},height={height},framerate={fps}/1 "
             f"! videoconvert "
             f"! {encoder_pipeline} "
+            f"! h264parse config-interval=1 "  # 加入 h264parse
+            f"! rtph264pay pt=96 mtu=1400 "  # 加入 RTP payload
             f"! udpsink host={shlex.quote(host)} port={port} "
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
