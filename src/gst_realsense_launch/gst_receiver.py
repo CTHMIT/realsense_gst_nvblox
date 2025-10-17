@@ -22,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 try:
     import cv2
@@ -31,6 +31,10 @@ except ImportError:
     cv2 = None
     np = None
     print("Warning: OpenCV not available. --show-views will be disabled.")
+
+# Type hints only during type checking
+if TYPE_CHECKING:
+    import numpy.typing as npt
 
 try:
     import rclpy
@@ -64,7 +68,7 @@ class Y8ISplitter:
         self.height = height
         self.y8i_width = width * 2  # Y8I has double width
 
-    def split(self, y8i_frame: np.ndarray) -> tuple:
+    def split(self, y8i_frame) -> tuple:
         """Split Y8I frame into infra1 (left) and infra2 (right).
 
         Args:
@@ -73,6 +77,9 @@ class Y8ISplitter:
         Returns:
             (infra1, infra2): tuple of two numpy arrays
         """
+        if not np:
+            raise RuntimeError("NumPy is required for Y8I splitting")
+
         if len(y8i_frame.shape) == 3:
             y8i_frame = y8i_frame[:, :, 0]  # Remove channel dimension if present
 
@@ -522,7 +529,7 @@ class VideoStreamReceiver:
     ):
         """Start receiving a video stream and publishing to ROS2."""
 
-        #  infra_stereo (Y8I)：infra1 and infra2
+        # infra_stereo (Y8I): infra1 and infra2
         if stream_name == "infra_stereo":
             # Y8I splitter
             single_width = width // 2
@@ -661,11 +668,7 @@ class VideoStreamReceiver:
         height: int,
         intrinsics: CameraIntrinsics | None,
     ):
-        """Run receiver for Y8I stream and split into infra1/infra2.
-
-        This receives the Y8I stream once and publishes both infra1 and infra2.
-        Only one instance should actually receive; the other should read from shared data.
-        """
+        """Run receiver for Y8I stream and split into infra1/infra2."""
         single_width = y8i_width // 2
 
         # Create camera info file
@@ -768,26 +771,26 @@ class VideoStreamReceiver:
             coeffs = intrinsics.distortion
 
         content = f"""image_width: {width}
-image_height: {height}
-camera_name: {self.camera_name}_{stream_name}
-camera_matrix:
-  rows: 3
-  cols: 3
-  data: [{fx}, 0.0, {ppx}, 0.0, {fy}, {ppy}, 0.0, 0.0, 1.0]
-distortion_model: plumb_bob
-distortion_coefficients:
-  rows: 1
-  cols: 5
-  data: [{coeffs[0]}, {coeffs[1]}, {coeffs[2]}, {coeffs[3]}, {coeffs[4]}]
-rectification_matrix:
-  rows: 3
-  cols: 3
-  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-projection_matrix:
-  rows: 3
-  cols: 4
-  data: [{fx}, 0.0, {ppx}, 0.0, 0.0, {fy}, {ppy}, 0.0, 0.0, 0.0, 1.0, 0.0]
-"""
+    image_height: {height}
+    camera_name: {self.camera_name}_{stream_name}
+    camera_matrix:
+    rows: 3
+    cols: 3
+    data: [{fx}, 0.0, {ppx}, 0.0, {fy}, {ppy}, 0.0, 0.0, 1.0]
+    distortion_model: plumb_bob
+    distortion_coefficients:
+    rows: 1
+    cols: 5
+    data: [{coeffs[0]}, {coeffs[1]}, {coeffs[2]}, {coeffs[3]}, {coeffs[4]}]
+    rectification_matrix:
+    rows: 3
+    cols: 3
+    data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    projection_matrix:
+    rows: 3
+    cols: 4
+    data: [{fx}, 0.0, {ppx}, 0.0, 0.0, {fy}, {ppy}, 0.0, 0.0, 0.0, 1.0, 0.0]
+    """
         with open(filepath, "w") as f:
             f.write(content)
 
@@ -943,8 +946,16 @@ def main():
     print("\nPublishing ROS2 topics:")
     print(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
     print(f"  /{camera_cfg['camera_name']}/color/image_raw")
-    print(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
-    print(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
+
+    # Check if infra_stereo is present
+    if "infra_stereo" in stream_names:
+        print(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
+        print(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
+    else:
+        print(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
+        if "infra2" in stream_names:
+            print(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
+
     print(f"  /{camera_cfg['camera_name']}/imu")
     if receiver_cfg.get("publish_odom"):
         print(f"  /{camera_cfg['camera_name']}/odom")
