@@ -31,7 +31,8 @@ sudo apt-get install -y \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
     v4l-utils \
-    iperf3
+    iperf3 \
+    tmux \
 
 echo "===== [3/4] Installing Intel RealSense SDK (librealsense) ====="
 # Set up the Intel RealSense Debian repository as per official instructions

@@ -72,6 +72,17 @@
 | Depth      | JPEG2000 | 5002         | 16-bit depth map |
 | Infrared L | H.264    | 5004         | Left IR camera |
 | Infrared R | H.264    | 5006         | Right IR camera |
+
+
+### pt and payload
+| Stream       | Encoding | RTP PT  |
+| ------------ | -------- | ------- |
+| depth        | H264     | **96**  |
+| depth        | JPEG2000 | **112** |
+| color        | H264     | **98**  |
+| ir           | H264     | **97**  |
+| infra_stereo | H264     | **99**  |
+
 ---
 
 ## 📦 Requirements

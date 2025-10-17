@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-RealSense Multi-Stream Sender with Strategy Pattern
+RealSense Multi-Stream Sender with tmux Integration
 
-Automatically detects RealSense cameras and streams all available feeds
-(depth, color, IR left/right, IMU) over network using GStreamer.
-
-Architecture:
-- Uses Strategy Pattern for encoding and stream handling
-- YAML-based configuration with command-line overrides
-- Supports multiple camera types (D435i, D455, D415, L515)
+Modified to run each GStreamer pipeline in a separate tmux window for better
+visibility and debugging capabilities.
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -67,12 +64,8 @@ class DeviceInfo:
 class RealSenseDetector:
     """
     Detects and probes RealSense cameras using V4L2.
-
-    This class scans /dev/videoX devices and identifies RealSense cameras
-    by analyzing their capabilities and metadata.
     """
 
-    # RealSense model detection patterns
     MODEL_PATTERNS = {
         r"435i": "D435i",
         r"D435I": "D435i",
@@ -85,7 +78,6 @@ class RealSenseDetector:
         r"SR300": "SR300",
     }
 
-    # Cache for RealSense SDK serial numbers
     _rs_serial_cache = None
 
     @staticmethod
@@ -104,11 +96,6 @@ class RealSenseDetector:
 
     @classmethod
     def _get_rs_serial_mapping(cls) -> dict[str, str]:
-        """Get mapping of device paths to RealSense serial numbers using SDK.
-
-        Returns:
-            Dictionary mapping USB device paths to actual RealSense serials
-        """
         if cls._rs_serial_cache is not None:
             return cls._rs_serial_cache
 
@@ -124,12 +111,7 @@ class RealSenseDetector:
 
             for dev in devices:
                 serial = dev.get_info(rs.camera_info.serial_number)
-                usb_info = dev.get_info(rs.camera_info.usb_type_descriptor)
-
-                # Store mapping using USB port info as key
-                mapping[serial] = serial  # Direct mapping
-
-                # Also try to match by device name/model
+                mapping[serial] = serial
                 name = dev.get_info(rs.camera_info.name)
                 mapping[name] = serial
 
@@ -141,7 +123,6 @@ class RealSenseDetector:
 
     @classmethod
     def extract_model(cls, card_name: str, dev: str | None = None) -> str:
-        """Extract RealSense model from card name or device properties."""
         text = card_name or ""
         if dev:
             try:
@@ -161,21 +142,11 @@ class RealSenseDetector:
 
     @classmethod
     def extract_serial(cls, dev: str, card_name: str = "") -> str | None:
-        """Extract serial number from device using RealSense SDK.
-
-        Falls back to udev if SDK is not available, but SDK is more reliable.
-        """
-        # If we have RealSense SDK, use it to get the true serial
         if rs:
             try:
                 ctx = rs.context()
                 devices = ctx.query_devices()
 
-                # For a D435i, there are typically 3 video devices per camera
-                # We need to match by checking if any of the video devices
-                # belong to the same physical RealSense unit
-
-                # Get the USB device path for this video device
                 try:
                     result = cls.run_cmd(["udevadm", "info", "--query=property", f"--name={dev}"])
                     usb_path = None
@@ -187,19 +158,13 @@ class RealSenseDetector:
                         elif line.startswith("DEVPATH="):
                             usb_path = line.split("=", 1)[1].strip()
 
-                    # Extract USB port/bus info from the path
-                    # This helps identify which RealSense device this video node belongs to
                     if id_path or usb_path:
-                        # For now, if we only have one RealSense device, return its serial
                         if len(devices) == 1:
                             return devices[0].get_info(rs.camera_info.serial_number)
 
-                        # If multiple devices, we need more sophisticated matching
-                        # For now, warn the user
                         print(
                             f"Warning: Multiple RealSense devices detected. Using first device serial."
                         )
-                        print(f"  This may cause issues. Please report this scenario.")
                         return devices[0].get_info(rs.camera_info.serial_number)
 
                 except Exception as e:
@@ -208,7 +173,6 @@ class RealSenseDetector:
             except Exception as e:
                 print(f"Warning: Could not query RealSense SDK for serial: {e}")
 
-        # Fallback to udev (less reliable)
         try:
             result = cls.run_cmd(["udevadm", "info", "--query=property", f"--name={dev}"])
             for line in result.stdout.splitlines():
@@ -221,11 +185,6 @@ class RealSenseDetector:
 
     @classmethod
     def probe_device(cls, dev: str) -> DeviceInfo | None:
-        """
-        Probe V4L2 device and extract all capabilities.
-
-        Returns DeviceInfo if device is a RealSense camera, None otherwise.
-        """
         try:
             all_out = cls.run_cmd(["v4l2-ctl", "-d", dev, "--all"]).stdout
             card = ""
@@ -240,7 +199,6 @@ class RealSenseDetector:
             model = cls.extract_model(card, dev)
             serial = cls.extract_serial(dev, card)
 
-            # Parse formats
             fmts = cls.run_cmd(["v4l2-ctl", "-d", dev, "--list-formats-ext"]).stdout
             modes = cls._parse_formats(fmts)
 
@@ -255,7 +213,6 @@ class RealSenseDetector:
 
     @staticmethod
     def _parse_formats(fmts: str) -> list[Mode]:
-        """Parse v4l2-ctl format output into Mode objects."""
         modes: list[Mode] = []
         current_fourcc = None
         size_wh: tuple[int, int] | None = None
@@ -295,7 +252,6 @@ class RealSenseDetector:
 
     @classmethod
     def detect_all_cameras(cls) -> list[DeviceInfo]:
-        """Detect all RealSense cameras on system."""
         cameras = []
         for dev in cls.list_video_nodes():
             info = cls.probe_device(dev)
@@ -305,7 +261,6 @@ class RealSenseDetector:
 
     @staticmethod
     def group_by_serial(cameras: list[DeviceInfo]) -> dict:
-        """Group cameras by serial number to identify multi-sensor devices."""
         grouped: dict = {}
         for cam in cameras:
             serial = cam.serial or "unknown"
@@ -316,22 +271,9 @@ class RealSenseDetector:
 
 
 class IMUSender:
-    """
-    Sends IMU data from RealSense camera over UDP.
-
-    Captures accelerometer and gyroscope data from RealSense hardware
-    and transmits as JSON packets over network.
-    """
+    """Sends IMU data from RealSense camera over UDP."""
 
     def __init__(self, serial: str, host: str, port: int):
-        """
-        Initialize IMU sender.
-
-        Args:
-            serial: Camera serial number
-            host: Target IP address
-            port: Target UDP port
-        """
         if not rs:
             raise RuntimeError("pyrealsense2 not available")
 
@@ -341,30 +283,25 @@ class IMUSender:
         self.running: bool = False
         self.thread: threading.Thread | None = None
 
-        # Initialize RealSense pipeline
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         self.config.enable_device(serial)
         self.config.enable_stream(rs.stream.accel)
         self.config.enable_stream(rs.stream.gyro)
 
-        # UDP socket for sending
         import socket
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def start(self):
-        """Start IMU data streaming in background thread."""
         self.running = True
         self.thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.thread.start()
         print(f"✓ IMU streaming started for {self.serial}")
 
     def _stream_loop(self):
-        """Main loop for streaming IMU data."""
         pipeline_started = False
         try:
-            # Verify device exists before starting
             ctx = rs.context()
             devices = ctx.query_devices()
 
@@ -378,7 +315,6 @@ class IMUSender:
             if not device_found:
                 raise RuntimeError(f"Device {self.serial} not connected")
 
-            # Start pipeline
             self.pipeline.start(self.config)
             pipeline_started = True
 
@@ -423,59 +359,124 @@ class IMUSender:
             self.sock.close()
 
     def stop(self):
-        """Stop IMU streaming."""
         self.running = False
         if self.thread:
             self.thread.join(timeout=2)
         self.sock.close()
 
 
-class StreamManager:
-    """
-    Manages multiple concurrent GStreamer video streams.
+class TmuxSessionManager:
+    """Manages tmux session for multiple GStreamer pipelines."""
 
-    Handles starting, monitoring, and stopping multiple video pipelines
-    using the Strategy Pattern for different stream types.
-    """
+    def __init__(self, session_name: str = "realsense_streams"):
+        self.session_name = session_name
+        self.window_count = 0
+        self._check_tmux()
+        self._create_session()
+
+    def _check_tmux(self):
+        """Check if tmux is available."""
+        try:
+            subprocess.run(["tmux", "-V"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError("tmux is not installed. Please install tmux: sudo apt install tmux")
+
+    def _create_session(self):
+        """Create tmux session if it doesn't exist."""
+        # Check if session already exists
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name], capture_output=True
+        )
+
+        if result.returncode != 0:
+            # Create new detached session
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", self.session_name, "-n", "control"], check=True
+            )
+            print(f"✓ Created tmux session '{self.session_name}'")
+        else:
+            print(f"✓ Using existing tmux session '{self.session_name}'")
+
+    def create_window(self, window_name: str, command: str):
+        """Create a new tmux window and run command in it.
+
+        Args:
+            window_name: Name for the tmux window
+            command: Command to execute in the window
+        """
+        self.window_count += 1
+
+        # Create new window
+        subprocess.run(
+            [
+                "tmux",
+                "new-window",
+                "-t",
+                f"{self.session_name}:{self.window_count}",
+                "-n",
+                window_name,
+            ],
+            check=True,
+        )
+
+        # Send command to the window
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                command,
+                "C-m",  # Enter key
+            ],
+            check=True,
+        )
+
+        print(f"  ✓ Created window '{window_name}' in tmux")
+
+    def attach(self):
+        """Attach to the tmux session (for interactive use)."""
+        print(f"\nTo view the streams, attach to tmux session:")
+        print(f"  tmux attach -t {self.session_name}")
+        print(f"\nTmux navigation:")
+        print(f"  Ctrl+b n : next window")
+        print(f"  Ctrl+b p : previous window")
+        print(f"  Ctrl+b [0-9] : select window by number")
+        print(f"  Ctrl+b d : detach from session")
+        print(f"  Ctrl+b & : kill current window")
+
+    def kill_session(self):
+        """Kill the entire tmux session."""
+        subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
+        print(f"✓ Killed tmux session '{self.session_name}'")
+
+
+class StreamManager:
+    """Manages multiple concurrent GStreamer video streams using tmux."""
 
     def __init__(self, config_loader: ConfigLoader):
         self.config_loader = config_loader
-        self.processes: list[tuple[StreamConfig, subprocess.Popen]] = []
-        self.threads: list[threading.Thread] = []
         self.imu_senders: list[IMUSender] = []
+        self.tmux_manager = TmuxSessionManager()
+        self._shutdown = threading.Event()
+        self._stopped = False
 
     def add_stream(
         self, stream_config: StreamConfig, stream_type: str, encoder_preference: str, bitrate: int
     ):
-        """
-        Add a video stream to manager.
-
-        Args:
-            stream_config: Stream configuration
-            stream_type: Stream type (depth, color, ir)
-            encoder_preference: Encoder preference
-            bitrate: Target bitrate for H.264
-        """
-        # Determine if we should use H.264 for depth
+        """Add a video stream to manager."""
         use_h264_for_depth = False
         if stream_type == "depth":
             encoding_cfg = self.config_loader.config.get("encoding", {})
             depth_h264_cfg = encoding_cfg.get("depth_h264", {})
             use_h264_for_depth = depth_h264_cfg.get("use_h264", True)
 
-        # Create encoder
         encoder = EncoderFactory.create_encoder(
             encoder_preference, stream_type, use_h264_for_depth=use_h264_for_depth
         )
 
-        # Create strategy with config_loader
         strategy = StreamStrategyFactory.create_strategy(stream_type, self.config_loader)
 
-        # Get encoding config for strategy
-        encoding_cfg = self.config_loader.config.get("encoding", {})
-        h264_cfg = encoding_cfg.get("h264", {})
-
-        # Build GStreamer pipeline
         pipeline = strategy.build_sender_pipeline(
             device=stream_config.device,
             width=stream_config.width,
@@ -488,16 +489,15 @@ class StreamManager:
             bitrate=bitrate,
         )
 
-        # Start stream in thread
-        thread = threading.Thread(
-            target=self._run_pipeline, args=(stream_config, pipeline, stream_type), daemon=True
-        )
-        self.threads.append(thread)
-        thread.start()
+        # Run pipeline in tmux
+        self._run_pipeline_in_tmux(stream_config, pipeline, stream_type)
 
-    def _run_pipeline(self, config: StreamConfig, pipeline_str: str, stream_type: str):
-        """Run GStreamer pipeline and monitor output."""
+    def _run_pipeline_in_tmux(self, config: StreamConfig, pipeline_str: str, stream_type: str):
+        """Run GStreamer pipeline in a tmux window."""
         label = format_stream_label(stream_type, None)
+
+        # Create a descriptive window name
+        window_name = f"{stream_type}_{config.port}"
 
         print(f"\n[{config.device}] Starting {label} stream on port {config.port}")
         print(f"  Pipeline: {pipeline_str}")
@@ -505,39 +505,8 @@ class StreamManager:
         print(f"  Resolution: {config.width}x{config.height}@{config.fps}fps")
         print(f"  Encoding: {config.encoding}")
 
-        # Securely handle pipelines that use shell operators like '|'
-        if "|" in pipeline_str:
-            # Split pipeline into commands
-            v4l2_cmd_str, gst_cmd_str = pipeline_str.split("|", 1)
-            v4l2_cmd = shlex.split(v4l2_cmd_str)
-            gst_cmd = shlex.split(gst_cmd_str)
-
-            # Start v4l2-ctl process
-            v4l2_proc = subprocess.Popen(v4l2_cmd, stdout=subprocess.PIPE)
-
-            # Start gst-launch-1.0 process, taking input from v4l2-ctl
-            proc = subprocess.Popen(
-                gst_cmd,
-                stdin=v4l2_proc.stdout,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-        else:
-            # For simple pipelines, no shell is needed
-            cmd = shlex.split(pipeline_str)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-
-        self.processes.append((config, proc))
-
-        try:
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, b""):
-                    if line:
-                        line_str = line.decode("utf-8", errors="ignore").strip()
-                        if "ERROR" in line_str or "WARNING" in line_str:
-                            print(f"  [{config.device}] {line_str}")
-        except KeyboardInterrupt:
-            pass
+        # Create the window and run the pipeline
+        self.tmux_manager.create_window(window_name, pipeline_str)
 
     def add_imu_sender(self, serial: str, host: str, port: int):
         """Add IMU sender for camera."""
@@ -549,31 +518,36 @@ class StreamManager:
             print(f"Warning: Failed to start IMU for {serial}: {e}")
 
     def wait(self):
-        """Wait for all streams (Ctrl+C to stop)."""
+        """Block until shutdown is requested (Ctrl+C or signal)."""
         try:
+            self.tmux_manager.attach()
             print("\nAll streams running. Press Ctrl+C to stop.\n")
-            while True:
-                time.sleep(1)
+            self._shutdown.wait()
         except KeyboardInterrupt:
+            pass
+        finally:
             self.stop_all()
 
     def stop_all(self):
-        """Stop all running streams and IMU senders."""
+        """Stop all running streams, IMU senders, and tmux session (idempotent)."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self._shutdown.set()
+
         print("\n\nStopping all streams...")
+        try:
+            self.tmux_manager.kill_session()
+        except Exception as e:
+            print(f"tmux cleanup warning: {e}")
 
-        # Stop video streams
-        for config, proc in self.processes:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-                print(f"  ✓ Stopped {config.device}")
-            except Exception:
-                proc.kill()
-                print(f"  ✗ Force killed {config.device}")
-
-        # Stop IMU senders
         for imu in self.imu_senders:
-            imu.stop()
+            try:
+                imu.stop()
+            except Exception:
+                pass
+
+        print("✓ Clean exit.")
 
 
 def find_best_mode(
@@ -590,7 +564,6 @@ def find_best_mode(
     elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
     elif key == "infra_stereo":
-        # Y8I 格式:尋找 Y8I
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR_STEREO]
     elif key == "infra":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
@@ -644,9 +617,39 @@ def get_best_fps(mode: Mode, requested: int | None = None) -> int:
     return min(mode.fps_list, key=lambda f: abs(f - requested))
 
 
+def install_signal_handlers(manager: "StreamManager"):
+    import os
+
+    handled = {"fired": False}
+
+    def _handle(signum, _frame):
+        if handled["fired"]:
+            return
+        handled["fired"] = True
+
+        try:
+            manager._shutdown.set()
+        except Exception:
+            pass
+        try:
+            os.write(2, f"\nReceived signal {signum}. Shutting down...\n".encode())
+        except Exception:
+            pass
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handle)
+            try:
+                signal.siginterrupt(sig, False)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="RealSense Multi-Stream Sender with Strategy Pattern"
+        description="RealSense Multi-Stream Sender with tmux Integration"
     )
     parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
     parser.add_argument("--host", help="Override server IP from config")
@@ -662,9 +665,8 @@ def main():
     parser.add_argument(
         "--preset",
         choices=["d435i", "d455", "d415", "l515"],
-        help="Use camera preset (recommended for proper Y8I handling)",
+        help="Use camera preset",
     )
-
     args = parser.parse_args()
 
     # Load configuration
@@ -731,11 +733,14 @@ def main():
     if args.list_only:
         sys.exit(0)
 
-    # Setup streams
     manager = StreamManager(config_loader)
+
+    install_signal_handlers(manager)
+    atexit.register(manager.stop_all)
+
     camera_groups = RealSenseDetector.group_by_serial(cameras)
 
-    # Start IMU senders first (before video streams)
+    # Start IMU senders first
     for serial, serial_cameras in camera_groups.items():
         if imu_cfg["enabled"] and serial != "unknown":
             print(f"\nStarting IMU for camera {serial}")
@@ -755,28 +760,22 @@ def main():
         if preset:
             print(f"\nUsing {args.preset.upper()} preset configuration:")
 
-            # Group cameras by their detected stream type
             camera_by_type = {}
             for cam in cameras:
                 stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
                 camera_by_type[stream_type] = cam
 
-            # Process each stream defined in preset
             for stream_def in preset["streams"]:
                 stream_name = stream_def["name"]
                 encoding = stream_def["encoding"]
                 port_offset = stream_def["port_offset"]
 
-                print(f"  - {stream_name}: port offset {port_offset}, encoding {encoding}")
-
-                # Find matching camera
                 cam = None
                 if stream_name == "depth":
                     cam = camera_by_type.get("depth")
                 elif stream_name == "color":
                     cam = camera_by_type.get("color")
                 elif stream_name == "infra_stereo":
-                    # For Y8I, try to find a camera with Y8I format, fallback to first infra
                     for c in cameras:
                         if c.modes and c.modes[0].fourcc.strip().upper() == "Y8I":
                             cam = c
@@ -785,19 +784,13 @@ def main():
                         cam = camera_by_type.get("infra")
                 elif stream_name == "infra1":
                     cam = camera_by_type.get("infra")
-                elif stream_name == "infra2":
-                    # For infra2, we need to find a second infra device
-                    # This is typically not present in Y8I cameras
-                    pass
 
                 if not cam:
-                    print(f"    ⚠️  No camera found for {stream_name}, skipping")
+                    print(f" No camera found for {stream_name}, skipping")
                     continue
 
-                # Determine target format based on stream type
                 if stream_name == "infra_stereo":
                     target_format = camera_cfg.get("infra_format", "Y8I")
-                    # For Y8I, width should be double
                     mode_target_size = (target_size[0] * 2, target_size[1])
                     actual_stream_type = "infra_stereo"
                 elif stream_name == "depth":
@@ -818,12 +811,10 @@ def main():
                 mode = find_best_mode(cam, mode_target_size, actual_stream_type, target_format)
 
                 if not mode:
-                    print(f"    ⚠️  No suitable mode for {stream_name} on {cam.dev}")
+                    print(f" No suitable mode for {stream_name} on {cam.dev}")
                     continue
 
                 fps = get_best_fps(mode, camera_cfg["fps"])
-
-                # Calculate port
                 port = network_cfg["base_port"] + port_offset
 
                 stream_cfg = StreamConfig(
@@ -845,62 +836,6 @@ def main():
                 manager.add_stream(
                     stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
                 )
-        else:
-            print(f"Error: Preset {args.preset} not found")
-            sys.exit(1)
-    else:
-        # Fallback to auto-detection (old behavior)
-        print("\n⚠️  No preset specified, using auto-detection (may not handle Y8I correctly)")
-        print("    Recommended: use --preset d435i for proper Y8I handling\n")
-
-        for serial, serial_cameras in camera_groups.items():
-            for cam in serial_cameras:
-                stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
-
-                target_format = None
-                if stream_type == "color":
-                    target_format = camera_cfg.get("color_format")
-                elif stream_type == "depth":
-                    target_format = camera_cfg.get("depth_format")
-                elif stream_type == "infra_stereo":
-                    target_format = camera_cfg.get("infra_format")
-                elif stream_type == "infra":
-                    target_format = camera_cfg.get("infra_format")
-
-                mode = find_best_mode(cam, target_size, stream_type, target_format)
-
-                if not mode:
-                    print(f"No suitable mode for {stream_type} on {cam.dev}")
-                    continue
-
-                fps = get_best_fps(mode, camera_cfg["fps"])
-
-                if stream_type == "infra_stereo":
-                    port = config_loader.get_port_for_stream("infra1", 5004)
-                else:
-                    port = config_loader.get_port_for_stream(stream_type, 5000)
-
-                stream_cfg = StreamConfig(
-                    name=stream_type,
-                    port=port,
-                    encoding=(
-                        "h264"
-                        if (stream_type == "depth" and use_h264_for_depth)
-                        else ("jpeg2000" if stream_type == "depth" else "h264")
-                    ),
-                    width=mode.size[0],
-                    height=mode.size[1],
-                    fps=fps,
-                    device=cam.dev,
-                    fourcc=mode.fourcc,
-                )
-
-                if stream_type == "depth":
-                    actual_bitrate = depth_bitrate
-                else:
-                    actual_bitrate = h264_bitrate
-
-                manager.add_stream(stream_cfg, stream_type, encoding_cfg["encoder"], actual_bitrate)
 
     time.sleep(1)
     print(f"\n{'='*70}")

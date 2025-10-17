@@ -13,6 +13,18 @@ import shutil
 import subprocess
 from abc import ABC, abstractmethod
 
+RTP_PT = {
+    ("depth", "H264"): 96,
+    ("depth", "JPEG2000"): 112,
+    ("color", "H264"): 98,
+    ("ir", "H264"): 97,
+    ("infra_stereo", "H264"): 99,
+}
+
+
+def get_pt(stream_type: str, encoding_name: str) -> int:
+    return RTP_PT[(stream_type.lower(), encoding_name.upper())]
+
 
 class EncoderStrategy(ABC):
     """Abstract base class for video encoding strategies."""
@@ -23,7 +35,7 @@ class EncoderStrategy(ABC):
         pass
 
     @abstractmethod
-    def get_pipeline_element(self, bitrate: int | None, config: dict = None) -> str:
+    def get_pipeline_element(self, bitrate: int | None, pt: int, config: dict = None) -> str:
         """Get GStreamer pipeline element string for this encoder."""
         pass
 
@@ -44,7 +56,7 @@ class NvH264EncoderStrategy(EncoderStrategy):
         )
         return result.returncode == 0
 
-    def get_pipeline_element(self, bitrate: int, config: dict = None) -> str:
+    def get_pipeline_element(self, bitrate: int, pt: int, config: dict = None) -> str:
         config = config or {}
         tune = config.get("tune", "zerolatency")
         key_int_max = config.get("key_int_max", 30)
@@ -53,7 +65,7 @@ class NvH264EncoderStrategy(EncoderStrategy):
             f"nvh264enc preset=low-latency-hq rc-mode=cbr bitrate={bitrate} "
             f"gop-size={key_int_max} bframes=0 "
             f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96"
+            f"! rtph264pay pt={pt}"
         )
 
     def get_encoding_name(self) -> str:
@@ -71,7 +83,7 @@ class X264EncoderStrategy(EncoderStrategy):
         )
         return result.returncode == 0
 
-    def get_pipeline_element(self, bitrate: int, config: dict = None) -> str:
+    def get_pipeline_element(self, bitrate: int, pt: int, config: dict = None) -> str:
         """Get software H.264 encoder pipeline with tested parameters."""
         config = config or {}
         tune = config.get("tune", "zerolatency")
@@ -82,7 +94,7 @@ class X264EncoderStrategy(EncoderStrategy):
             f"x264enc tune={tune} speed-preset={speed_preset} bitrate={bitrate} "
             f"key-int-max={key_int_max} "
             f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96"
+            f"! rtph264pay pt={pt}"
         )
 
     def get_encoding_name(self) -> str:
@@ -100,11 +112,13 @@ class JPEG2000EncoderStrategy(EncoderStrategy):
         )
         return result.returncode == 0
 
-    def get_pipeline_element(self, bitrate: int | None = None, config: dict = None) -> str:
+    def get_pipeline_element(
+        self, bitrate: int | None = None, pt: int = None, config: dict = None
+    ) -> str:
         config = config or {}
         num_threads = config.get("num_threads", 8)
 
-        return f"openjpegenc num-threads={num_threads} ! jpeg2000parse ! rtpj2kpay pt=96"
+        return f"openjpegenc num-threads={num_threads} ! jpeg2000parse ! rtpj2kpay pt={pt}"
 
     def get_encoding_name(self) -> str:
         return "JPEG2000"
@@ -121,7 +135,7 @@ class EncoderFactory:
 
         Args:
             preference: "auto", "nvh264enc", "x264enc", or "jpeg2000"
-            stream_type: "depth", "color", or "ir"
+            stream_type: "depth", "color", "infra_stereo or "infra"
             use_h264_for_depth: If True, use H.264 for depth instead of JPEG2000
         """
         # Use H.264 for depth if configured (tested working)
@@ -251,9 +265,9 @@ class DepthStreamStrategy(StreamPipelineStrategy):
             f"--stream-to=- 2>/dev/null"
         )
 
-        # GStreamer pipeline with H.264 encoding and RTP payload
-        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
-        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+        enc_name = encoder.get_encoding_name().upper()
+        pt = get_pt("depth", enc_name)
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, pt=pt, config=config)
 
         gst_cmd = (
             f"gst-launch-1.0 -e -v fdsrc fd=0 "
@@ -299,28 +313,25 @@ class DepthStreamStrategy(StreamPipelineStrategy):
 
         # For H.264 encoded depth (tested working)
         if encoding.upper() == "H264":
+            pt = get_pt("depth", "H264")
             return (
                 f"udpsrc port={port} buffer-size={buffer_size} "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,'
-                f'encoding-name=H264,payload=96" '
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={pt}" '
                 f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                f"! rtph264depay "
-                f"! h264parse "
-                f"! avdec_h264 max-threads={max_threads} skip-frame=0 "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
                 f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} "
-                f"! video/x-raw,format=GRAY16_LE"
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY16_LE"
             )
 
         # For JPEG2000 encoded depth (16-bit preservation)
-        else:
-            return (
-                f"udpsrc port={port} buffer-size={buffer_size} "
-                f'caps="application/x-rtp,media=video,encoding-name={encoding},payload=96" '
-                f"! rtpjitterbuffer latency={latency} "
-                f"! rtpj2kdepay ! openjpegdec "
-                f"! videoconvert ! video/x-raw,format=GRAY16_LE"
-            )
+        pt = get_pt("depth", "JPEG2000")
+        return (
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG2000,payload={pt}" '
+            f"! rtpjitterbuffer latency={latency} "
+            f"! rtpj2kdepay ! openjpegdec "
+            f"! videoconvert ! video/x-raw,format=GRAY16_LE"
+        )
 
 
 class ColorStreamStrategy(StreamPipelineStrategy):
@@ -355,8 +366,8 @@ class ColorStreamStrategy(StreamPipelineStrategy):
             }
 
         fourcc_cleaned = fourcc.strip().upper()
-        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
-        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+        pt = get_pt("color", "H264")
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, pt=pt, config=config)
 
         # Special handling for MJPEG input
         if fourcc_cleaned == "MJPG":
@@ -408,15 +419,13 @@ class ColorStreamStrategy(StreamPipelineStrategy):
             max_threads = 4
             n_threads = 4
 
+        pt = get_pt("color", "H264")
         return (
             f"udpsrc port={port} buffer-size={buffer_size} "
-            f'caps="application/x-rtp,media=video,encoding-name={encoding},payload=96" '
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name={encoding},payload={pt}" '
             f"! rtpjitterbuffer latency={latency} "
-            f"! rtph264depay "
-            f"! h264parse "
-            f"! avdec_h264 max-threads={max_threads} "
-            f"! videoconvert n-threads={n_threads} "
-            f"! video/x-raw,format=BGR"
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+            f"! videoconvert n-threads={n_threads} ! video/x-raw,format=BGR"
         )
 
 
@@ -452,8 +461,8 @@ class IRStreamStrategy(StreamPipelineStrategy):
             }
 
         fourcc_cleaned = fourcc.strip().upper()
-        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
-        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+        pt = get_pt("ir", "H264")
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, pt=pt, config=config)
 
         format_map = {
             "GREY": "GRAY8",
@@ -487,13 +496,12 @@ class IRStreamStrategy(StreamPipelineStrategy):
             latency = 50
             max_threads = 4
 
+        pt = get_pt("ir", "H264")
         return (
             f"udpsrc port={port} buffer-size={buffer_size} "
-            f'caps="application/x-rtp,media=video,encoding-name={encoding},payload=96" '
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name={encoding},payload={pt}" '
             f"! rtpjitterbuffer latency={latency} "
-            f"! rtph264depay "
-            f"! h264parse "
-            f"! avdec_h264 max-threads={max_threads} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
             f"! videoconvert ! video/x-raw,format=GRAY8"
         )
 
@@ -532,8 +540,8 @@ class Y8IStreamStrategy(StreamPipelineStrategy):
                 "async": str(self.config_loader.get("streaming.udp.async", False)).lower(),
             }
 
-        # FIXED: encoder_pipeline already contains h264parse and rtph264pay
-        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, config=config)
+        pt = get_pt("infra_stereo", "H264")
+        encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, pt=pt, config=config)
 
         # Y8I is GRAY8 format but with double width
         return (
@@ -564,13 +572,12 @@ class Y8IStreamStrategy(StreamPipelineStrategy):
             latency = 50
             max_threads = 4
 
+        pt = get_pt("infra_stereo", "H264")
         return (
             f"udpsrc port={port} buffer-size={buffer_size} "
-            f'caps="application/x-rtp,media=video,encoding-name={encoding},payload=96" '
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name={encoding},payload={pt}" '
             f"! rtpjitterbuffer latency={latency} "
-            f"! rtph264depay "
-            f"! h264parse "
-            f"! avdec_h264 max-threads={max_threads} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
             f"! videoconvert ! video/x-raw,format=GRAY8"
         )
 
