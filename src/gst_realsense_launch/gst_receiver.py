@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 try:
@@ -564,6 +565,49 @@ class VideoStreamReceiver:
             thread.start()
             time.sleep(0.5)
 
+    def _get_calibration_file_path(
+        self,
+        stream_name: str,
+        width: int,
+        height: int,
+    ) -> str | None:
+        """Get the path to the calibration file for the given stream and resolution.
+
+        Looks for calibration files in src/config/ directory with format:
+        - color_camera_640x480.yaml
+        - depth_camera_640x480.yaml
+        - infrared_camera_640x480.yaml
+
+        Returns None if file doesn't exist.
+        """
+        # Map stream names to file prefixes
+        stream_mapping = {
+            "depth": "depth",
+            "color": "color",
+            "infra1": "infrared",
+            "infra2": "infrared",
+        }
+
+        stream_prefix = stream_mapping.get(stream_name, stream_name)
+        resolution = f"{width}x{height}"
+
+        # Search paths for calibration files
+        config_paths = [
+            Path("src/config"),
+            Path(__file__).parent.parent / "config",
+            Path.home() / ".config" / "realsense",
+        ]
+
+        filename = f"{stream_prefix}_camera_{resolution}.yaml"
+
+        for config_dir in config_paths:
+            filepath = config_dir / filename
+            if filepath.exists():
+                print(f"  ✓ Found calibration file: {filepath}")
+                return str(filepath.absolute())
+
+        return None
+
     def _run_receiver(
         self,
         port: int,
@@ -573,11 +617,22 @@ class VideoStreamReceiver:
         height: int,
         intrinsics: CameraIntrinsics | None,
     ):
-        """Run video receiver and optionally capture for visualization."""
-        # Create a secure temporary file for camera_info
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
-        ) as tmp_file:
+        """Run a receiver for a single video stream."""
+        # First, try to load calibration from existing files
+        calib_file = self._get_calibration_file_path(stream_name, width, height)
+
+        if calib_file:
+            # Use existing calibration file
+            info_file_url = f"file://{calib_file}"
+            tmp_file = None
+        else:
+            # Fall back to creating temporary file with defaults
+            print(
+                f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
+            )
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
             self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
             info_file_url = f"file://{tmp_file.name}"
 
@@ -656,8 +711,9 @@ class VideoStreamReceiver:
         except KeyboardInterrupt:
             pass
         finally:
-            # Clean up the temporary file
-            os.unlink(tmp_file.name)
+            # Clean up temporary file only if we created one
+            if tmp_file:
+                os.unlink(tmp_file.name)
 
     def _run_receiver_with_y8i_split(
         self,
@@ -671,10 +727,21 @@ class VideoStreamReceiver:
         """Run receiver for Y8I stream and split into infra1/infra2."""
         single_width = y8i_width // 2
 
-        # Create camera info file
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
-        ) as tmp_file:
+        # First, try to load calibration from existing files
+        calib_file = self._get_calibration_file_path(stream_name, single_width, height)
+
+        if calib_file:
+            # Use existing calibration file
+            info_file_url = f"file://{calib_file}"
+            tmp_file = None
+        else:
+            # Fall back to creating temporary file with defaults
+            print(
+                f"  ⚠ No calibration file found for {stream_name} {single_width}x{height}, using defaults"
+            )
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
             self._create_camera_info_file(
                 tmp_file.name, stream_name, single_width, height, intrinsics
             )
@@ -748,7 +815,9 @@ class VideoStreamReceiver:
         except KeyboardInterrupt:
             pass
         finally:
-            os.unlink(tmp_file.name)
+            # Clean up temporary file only if we created one
+            if tmp_file:
+                os.unlink(tmp_file.name)
 
     def _create_camera_info_file(
         self,
