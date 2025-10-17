@@ -758,10 +758,14 @@ class VideoStreamReceiver:
         gst_config = strategy.build_receiver_pipeline(port, encoding)
 
         # Add videocrop to split left/right
+        # Y8I format is 1280x480 containing two 640x480 images interleaved
+        # videocrop parameters specify how many pixels to REMOVE (not keep!)
         if stream_name == "infra1":
-            gst_config += f" ! videocrop left=0 right={single_width}"
+            # Keep left half (first 640 pixels), crop RIGHT 640 pixels
+            gst_config += f" ! videocrop right={single_width}"
         else:  # infra2
-            gst_config += f" ! videocrop left={single_width} right=0"
+            # Keep right half (last 640 pixels), crop LEFT 640 pixels
+            gst_config += f" ! videocrop left={single_width}"
 
         # Determine topics
         image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"

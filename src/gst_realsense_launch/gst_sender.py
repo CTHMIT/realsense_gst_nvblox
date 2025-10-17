@@ -590,7 +590,7 @@ def find_best_mode(
     elif key == "color":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_COLOR]
     elif key == "infra_stereo":
-        # Y8I 格式：尋找 Y8I
+        # Y8I 格式:尋找 Y8I
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR_STEREO]
     elif key == "infra":
         candidates = [m for m in device.modes if m.fourcc.strip().upper() in FOURCC_IR]
@@ -614,17 +614,22 @@ def find_best_mode(
     w, h = target_size
 
     if key == "infra_stereo":
-        target_pixels = (w * 2) * h  # Y8I width is double
+        target_y8i_width = w * 2
+        target_pixels = target_y8i_width * h
+
         for mode in candidates:
-            if mode.size == (w * 2, h):
+            if mode.size == (target_y8i_width, h):
                 return mode
+
+        return min(candidates, key=lambda m: abs(m.size[0] * m.size[1] - target_pixels))
     else:
         target_pixels = w * h
+
         for mode in candidates:
             if mode.size == target_size:
                 return mode
 
-    return min(candidates, key=lambda m: abs(m.size[0] * m.size[1] - target_pixels))
+        return min(candidates, key=lambda m: abs(m.size[0] * m.size[1] - target_pixels))
 
 
 def get_best_fps(mode: Mode, requested: int | None = None) -> int:
