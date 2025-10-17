@@ -512,13 +512,6 @@ class VideoStreamReceiver:
 
         self.y8i_splitter: Y8ISplitter | None = None
 
-        # For visualization
-        if show_views and cv2:
-            self.view_images: dict = {}
-            self.view_lock = threading.Lock()
-            self.view_thread = threading.Thread(target=self._visualization_loop, daemon=True)
-            self.view_thread.start()
-
     def start_stream(
         self,
         port: int,
@@ -622,11 +615,9 @@ class VideoStreamReceiver:
         calib_file = self._get_calibration_file_path(stream_name, width, height)
 
         if calib_file:
-            # Use existing calibration file
             info_file_url = f"file://{calib_file}"
             tmp_file = None
         else:
-            # Fall back to creating temporary file with defaults
             print(
                 f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
             )
@@ -642,7 +633,7 @@ class VideoStreamReceiver:
         )
         gst_config = strategy.build_receiver_pipeline(port, encoding)
 
-        # Determine topics
+        # Determine topics and encoding
         if stream_name == "depth":
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
@@ -661,12 +652,29 @@ class VideoStreamReceiver:
         else:
             return
 
-        # Add visualization tee if enabled
-        if self.show_views and cv2:
-            gst_config += (
-                " ! tee name=t t. ! queue ! videoconvert ! appsink name=viz_sink "
-                "emit-signals=true sync=false max-buffers=1 drop=true"
-            )
+        # Add visualization branch if enabled (using GStreamer native display)
+        if self.show_views:
+            # Scale down for display
+            display_width = int(width * self.view_scale)
+            display_height = int(height * self.view_scale)
+
+            # For depth, convert to visible format
+            if stream_name == "depth":
+                viz_pipeline = (
+                    f" ! tee name=t "
+                    f"t. ! queue ! videoconvert ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                    f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                    f"t. ! queue"
+                )
+            else:
+                # For color and infrared
+                viz_pipeline = (
+                    f" ! tee name=t "
+                    f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                    f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                    f"t. ! queue"
+                )
+            gst_config += viz_pipeline
 
         # Build gscam command
         gscam_cmd = [
@@ -693,7 +701,8 @@ class VideoStreamReceiver:
             f"camera/camera_info:={info_topic}",
         ]
 
-        print(f"\n[{stream_name}] Starting on port {port}")
+        display_status = "with GStreamer display" if self.show_views else ""
+        print(f"\n[{stream_name}] Starting on port {port} {display_status}")
         print(f"  Topic: {image_topic}")
         print(f"  Encoding: {encoding.upper()}")
 
@@ -711,7 +720,6 @@ class VideoStreamReceiver:
         except KeyboardInterrupt:
             pass
         finally:
-            # Clean up temporary file only if we created one
             if tmp_file:
                 os.unlink(tmp_file.name)
 
@@ -731,11 +739,9 @@ class VideoStreamReceiver:
         calib_file = self._get_calibration_file_path(stream_name, single_width, height)
 
         if calib_file:
-            # Use existing calibration file
             info_file_url = f"file://{calib_file}"
             tmp_file = None
         else:
-            # Fall back to creating temporary file with defaults
             print(
                 f"  ⚠ No calibration file found for {stream_name} {single_width}x{height}, using defaults"
             )
@@ -753,10 +759,8 @@ class VideoStreamReceiver:
 
         # Add videocrop to split left/right
         if stream_name == "infra1":
-            # Crop to left half
             gst_config += f" ! videocrop left=0 right={single_width}"
         else:  # infra2
-            # Crop to right half
             gst_config += f" ! videocrop left={single_width} right=0"
 
         # Determine topics
@@ -765,12 +769,18 @@ class VideoStreamReceiver:
         frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
         image_encoding = "mono8"
 
-        # Add visualization tee if enabled
-        if self.show_views and cv2:
-            gst_config += (
-                " ! tee name=t t. ! queue ! videoconvert ! appsink name=viz_sink "
-                "emit-signals=true sync=false max-buffers=1 drop=true"
+        # Add visualization branch if enabled
+        if self.show_views:
+            display_width = int(single_width * self.view_scale)
+            display_height = int(height * self.view_scale)
+
+            viz_pipeline = (
+                f" ! tee name=t "
+                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                f"t. ! queue"
             )
+            gst_config += viz_pipeline
 
         # Build gscam command
         gscam_cmd = [
@@ -797,7 +807,8 @@ class VideoStreamReceiver:
             f"camera/camera_info:={info_topic}",
         ]
 
-        print(f"\n[{stream_name}] Starting on port {port} (from Y8I)")
+        display_status = "with GStreamer display" if self.show_views else ""
+        print(f"\n[{stream_name}] Starting on port {port} (from Y8I) {display_status}")
         print(f"  Topic: {image_topic}")
         print(f"  Encoding: {encoding.upper()}")
 
@@ -815,7 +826,6 @@ class VideoStreamReceiver:
         except KeyboardInterrupt:
             pass
         finally:
-            # Clean up temporary file only if we created one
             if tmp_file:
                 os.unlink(tmp_file.name)
 
@@ -862,32 +872,6 @@ class VideoStreamReceiver:
     """
         with open(filepath, "w") as f:
             f.write(content)
-
-    def _visualization_loop(self):
-        """Display received video streams in windows."""
-        if not cv2:
-            return
-
-        while True:
-            time.sleep(0.03)  # ~30fps display
-
-            with self.view_lock:
-                for name, img in self.view_images.items():
-                    if img is not None:
-                        # Scale for display
-                        display_img = cv2.resize(
-                            img,
-                            (
-                                int(img.shape[1] * self.view_scale),
-                                int(img.shape[0] * self.view_scale),
-                            ),
-                        )
-                        cv2.imshow(f"{self.camera_name}_{name}", display_img)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-
-        cv2.destroyAllWindows()
 
     def stop_all(self):
         """Stop all video receivers."""
