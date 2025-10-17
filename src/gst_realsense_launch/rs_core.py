@@ -43,14 +43,17 @@ class NvH264EncoderStrategy(EncoderStrategy):
 
     def get_pipeline_element(self, bitrate: int, config: dict = None) -> str:
         config = config or {}
-        tune = config.get("tune", "zerolatency")
         key_int_max = config.get("key_int_max", 30)
+        qp_min = config.get("qp_min", 10)
+        qp_max = config.get("qp_max", 25)
+        mtu = config.get("mtu", 1400)
 
         return (
-            f"nvh264enc preset=low-latency-hq rc-mode=cbr bitrate={bitrate} "
-            f"gop-size={key_int_max} bframes=0 "
+            f"nvh264enc preset=low-latency-hq rc-mode=cbr-ld-hq bitrate={bitrate} "
+            f"gop-size={key_int_max} zerolatency=true qp-min={qp_min} qp-max={qp_max} "
+            f"! video/x-h264,profile=high "
             f"! h264parse config-interval=1 "
-            f"! rtph264pay pt=96"
+            f"! rtph264pay pt=96 mtu={mtu}"
         )
 
     def get_encoding_name(self) -> str:
