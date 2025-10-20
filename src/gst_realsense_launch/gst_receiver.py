@@ -18,17 +18,8 @@ import threading
 import time
 from pathlib import Path
 
-from utils.logger import LOGGER
-
-try:
-    import cv2
-    import numpy as np
-except ImportError:
-    cv2 = None
-    np = None
-    LOGGER.info("Warning: OpenCV not available. --show-views will be disabled.")
-
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
+from utils.logger import LOGGER
 
 
 class TmuxSessionManager:
