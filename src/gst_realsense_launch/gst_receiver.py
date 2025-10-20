@@ -89,9 +89,9 @@ class TmuxSessionManager:
 
     def attach_info(self):
         """Display instructions for attaching to the tmux session."""
-        LOGGER.info(f"\nTo view the streams, attach to tmux session:")
+        LOGGER.info(f"To view the streams, attach to tmux session:")
         LOGGER.info(f"  tmux attach -t {self.session_name}")
-        LOGGER.info(f"\nTmux navigation:")
+        LOGGER.info(f"Tmux navigation:")
         LOGGER.info(f"  Ctrl+b n : next window")
         LOGGER.info(f"  Ctrl+b p : previous window")
         LOGGER.info(f"  Ctrl+b [0-9] : select window by number")
@@ -317,7 +317,7 @@ class VideoStreamReceiver:
 
         window_name = f"{stream_name}_{port}"
 
-        LOGGER.info(f"\n[{stream_name}] Starting on port {port}")
+        LOGGER.info(f"[{stream_name}] Starting on port {port}")
         LOGGER.info(f"  Topic: {image_topic}")
         LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect (mono16)'}")
 
@@ -682,7 +682,7 @@ projection_matrix:
         """Wait until shutdown is requested."""
         try:
             self.tmux_manager.attach_info()
-            LOGGER.info("\nAll receivers running. Press Ctrl+C to stop.\n")
+            LOGGER.info("All receivers running. Press Ctrl+C to stop.")
             self._shutdown_event.wait()
         except KeyboardInterrupt:
             pass
@@ -690,25 +690,25 @@ projection_matrix:
     def stop_all(self):
         """Stop all video receivers and tmux session."""
         self._shutdown_event.set()
-        LOGGER.info("\n\n" + "=" * 40)
+        LOGGER.info("=" * 40)
         LOGGER.info("INITIATING SHUTDOWN - Stopping all receivers")
         LOGGER.info("=" * 40)
 
         try:
             if self.tmux_manager:
-                LOGGER.info("\n[1/2] Stopping GStreamer pipelines...")
+                LOGGER.info("[1/2] Stopping GStreamer pipelines...")
                 self.tmux_manager.kill_session()
                 time.sleep(1)
 
-            LOGGER.info("\n[2/2] Checking for orphaned processes...")
+            LOGGER.info("[2/2] Checking for orphaned processes...")
             self._cleanup_orphaned_processes()
 
         except Exception as e:
             LOGGER.error(f"Error during cleanup: {e}")
 
-        LOGGER.info("\n" + "=" * 40)
+        LOGGER.info("=" * 40)
         LOGGER.info("✓ SHUTDOWN COMPLETE")
-        LOGGER.info("=" * 40 + "\n")
+        LOGGER.info("=" * 40)
 
     def _cleanup_orphaned_processes(self):
         """Clean up any orphaned gscam or depth_image_proc processes."""
@@ -853,14 +853,14 @@ def main():
             LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
             sys.exit(1)
 
-        LOGGER.info(f"\n{'='*40}")
+        LOGGER.info(f"{'='*40}")
         LOGGER.info("REALSENSE GSTREAMER RECEIVER")
         LOGGER.info(f"{'='*40}")
         LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
-        LOGGER.info("\nVideo Streams:")
+        LOGGER.info("Video Streams:")
         for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
             LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
-        LOGGER.info(f"{'='*40}\n")
+        LOGGER.info(f"{'='*40}")
 
         video_receiver = VideoStreamReceiver(
             camera_name=camera_cfg["camera_name"],
@@ -880,36 +880,36 @@ def main():
             )
 
         time.sleep(1)
-        LOGGER.info(f"\n{'='*40}")
+        LOGGER.info(f"{'='*40}")
         LOGGER.info("ALL RECEIVERS STARTED")
-        LOGGER.info(f"{'='*40}\n")
+        LOGGER.info(f"{'='*40}")
 
         video_receiver.wait()
 
     except Exception as e:
-        LOGGER.error(f"\n✗ Fatal error: {e}")
+        LOGGER.error(f"✗ Fatal error: {e}")
         import traceback
 
         traceback.print_exc()
 
     finally:
-        LOGGER.info("\nStarting cleanup sequence...")
+        LOGGER.info("Starting cleanup sequence...")
         if "video_receiver" in locals():
             try:
                 video_receiver.stop_all()
             except Exception as e:
                 LOGGER.error(f"Error stopping video receiver: {e}")
 
-        LOGGER.info("\n" + "=" * 40)
+        LOGGER.info("=" * 40)
         LOGGER.info("✓ ALL CLEANUP COMPLETE")
-        LOGGER.info("=" * 40 + "\n")
+        LOGGER.info("=" * 40 + "")
 
 
 if __name__ == "__main__":
     import signal
 
     def signal_handler(signum, frame):
-        LOGGER.info(f"\n⚠ Received signal {signum}")
+        LOGGER.info(f"⚠ Received signal {signum}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
