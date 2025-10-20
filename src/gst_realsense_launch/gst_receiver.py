@@ -157,9 +157,97 @@ class TmuxSessionManager:
         LOGGER.info(f"  Ctrl+b & : kill current window")
 
     def kill_session(self):
-        """Kill the entire tmux session."""
-        subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
-        LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
+        """Kill the entire tmux session and ensure all processes are terminated."""
+        if not self._session_exists():
+            LOGGER.info(f"Tmux session '{self.session_name}' already terminated")
+            return
+
+        try:
+            # Step 1: List all windows and their panes
+            result = subprocess.run(
+                ["tmux", "list-panes", "-t", self.session_name, "-F", "#{pane_pid}"],
+                capture_output=True,
+                text=True,  # ✅ 添加這個確保返回 str
+                timeout=5,
+            )
+
+            if result.returncode == 0:
+                pids = result.stdout.strip().split("\n")
+                LOGGER.info(f"Found {len(pids)} processes in tmux session")
+
+                # Step 2: Send SIGTERM to all processes
+                for pid in pids:
+                    if pid and pid.isdigit():
+                        try:
+                            # Send SIGTERM first (graceful)
+                            subprocess.run(["kill", "-TERM", pid], timeout=2, check=False)
+                            LOGGER.debug(f"  Sent SIGTERM to PID {pid}")
+                        except Exception as e:
+                            LOGGER.debug(f"  Could not terminate PID {pid}: {e}")
+
+                # Step 3: Wait a bit for graceful shutdown
+                time.sleep(2)
+
+                # Step 4: Force kill any remaining processes
+                for pid in pids:
+                    if pid and pid.isdigit():
+                        try:
+                            # Check if process still exists
+                            check = subprocess.run(
+                                ["ps", "-p", pid],
+                                capture_output=True,
+                                timeout=1,
+                                check=False,
+                            )
+                            if check.returncode == 0:
+                                # Process still alive, force kill
+                                subprocess.run(["kill", "-KILL", pid], timeout=1, check=False)
+                                LOGGER.debug(f"  Force killed PID {pid}")
+                        except Exception as e:
+                            LOGGER.debug(f"  Could not check/kill PID {pid}: {e}")
+
+            # Step 5: Kill the tmux session itself
+            result = subprocess.run(
+                ["tmux", "kill-session", "-t", self.session_name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
+            else:
+                LOGGER.warning(f"Could not kill tmux session (may already be gone)")
+
+            # Step 6: Verify session is gone
+            time.sleep(0.5)
+            if not self._session_exists():
+                LOGGER.info("✓ Tmux session cleanup verified")
+            else:
+                LOGGER.warning("⚠ Tmux session may still exist")
+
+        except subprocess.TimeoutExpired:
+            LOGGER.error("Timeout while trying to kill tmux session")
+            # Last resort: force kill tmux server
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", f"tmux.*{self.session_name}"],
+                    timeout=2,
+                    check=False,
+                )
+            except Exception as e:
+                LOGGER.error(f"Could not force kill tmux: {e}")
+        except Exception as e:
+            LOGGER.error(f"Error during tmux cleanup: {e}")
+
+    def _session_exists(self) -> bool:
+        """Check if the tmux session exists."""
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name],
+            capture_output=True,
+        )
+        return result.returncode == 0
 
 
 class VirtualRealSenseNode(Node):
@@ -552,10 +640,46 @@ class VirtualRealSenseNode(Node):
         return [qx, qy, qz, qw]
 
     def shutdown(self):
-        """Clean shutdown."""
+        """Clean shutdown with proper resource cleanup."""
+        LOGGER.info("Shutting down VirtualRealSenseNode...")
+
+        # Step 1: Stop receiver thread
         self.running = False
-        self.receiver_thread.join(timeout=2)
-        self.socket.close()
+        if self.receiver_thread and self.receiver_thread.is_alive():
+            LOGGER.info("  Stopping receiver thread...")
+            self.receiver_thread.join(timeout=3)
+            if self.receiver_thread.is_alive():
+                LOGGER.warning("  Receiver thread did not stop gracefully")
+
+        # Step 2: Stop timers
+        try:
+            if hasattr(self, "tf_timer"):
+                self.tf_timer.cancel()
+            if hasattr(self, "odom_timer"):
+                self.odom_timer.cancel()
+            LOGGER.info("  ✓ Timers stopped")
+        except Exception as e:
+            LOGGER.debug(f"  Error stopping timers: {e}")
+
+        # Step 3: Close socket
+        try:
+            if hasattr(self, "socket"):
+                self.socket.close()
+            LOGGER.info("  ✓ Socket closed")
+        except Exception as e:
+            LOGGER.debug(f"  Error closing socket: {e}")
+
+        # Step 4: Destroy publishers
+        try:
+            if hasattr(self, "imu_pub"):
+                self.destroy_publisher(self.imu_pub)
+            if hasattr(self, "odom_pub"):
+                self.destroy_publisher(self.odom_pub)
+            LOGGER.info("  ✓ Publishers destroyed")
+        except Exception as e:
+            LOGGER.debug(f"  Error destroying publishers: {e}")
+
+        LOGGER.info("✓ VirtualRealSenseNode shutdown complete")
 
 
 class VideoStreamReceiver:
@@ -1134,13 +1258,170 @@ projection_matrix:
             pass
 
     def stop_all(self):
-        """Stop all video receivers and tmux session."""
+        """Stop all video receivers and tmux session with thorough cleanup."""
         self._shutdown_event.set()
-        LOGGER.info("\n\nStopping all receivers...")
+        LOGGER.info("\n\n" + "=" * 70)
+        LOGGER.info("INITIATING SHUTDOWN - Stopping all receivers")
+        LOGGER.info("=" * 70)
+
+        cleanup_successful = True
+
         try:
-            self.tmux_manager.kill_session()
+            # Step 1: Kill tmux session and all child processes
+            if self.tmux_manager:
+                LOGGER.info("\n[1/3] Stopping GStreamer pipelines...")
+                self.tmux_manager.kill_session()
+                time.sleep(1)
+
+            # Step 2: Clean up any orphaned gscam processes
+            LOGGER.info("\n[2/3] Checking for orphaned processes...")
+            self._cleanup_orphaned_processes()
+
+            # Step 3: Release any locked resources
+            LOGGER.info("\n[3/3] Releasing resources...")
+            self._release_resources()
+
         except Exception as e:
-            LOGGER.info(f"tmux cleanup warning: {e}")
+            LOGGER.error(f"Error during cleanup: {e}")
+            cleanup_successful = False
+
+        LOGGER.info("\n" + "=" * 70)
+        if cleanup_successful:
+            LOGGER.info("✓ SHUTDOWN COMPLETE - All resources released")
+        else:
+            LOGGER.warning("⚠ SHUTDOWN COMPLETED WITH WARNINGS")
+            LOGGER.info("  Run this command to force cleanup:")
+            LOGGER.info(f"    pkill -9 -f 'gscam|depth_image_proc|{self.camera_name}'")
+        LOGGER.info("=" * 70 + "\n")
+
+    def _cleanup_orphaned_processes(self):
+        """Clean up any orphaned gscam or depth_image_proc processes."""
+        process_patterns = [
+            f"gscam.*{self.camera_name}",
+            f"depth_image_proc.*{self.camera_name}",
+            "convert_metric_node",
+        ]
+
+        for pattern in process_patterns:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+
+                if result.returncode == 0 and result.stdout:
+                    pids = result.stdout.strip().split("\n")
+                    for pid in pids:
+                        if pid and pid.isdigit():
+                            try:
+                                subprocess.run(
+                                    ["kill", "-TERM", pid],
+                                    timeout=1,
+                                    check=False,
+                                )
+                                LOGGER.info(f"  Terminated orphaned process (PID {pid})")
+                                time.sleep(0.5)
+
+                                check = subprocess.run(
+                                    ["ps", "-p", pid],
+                                    capture_output=True,
+                                    timeout=1,
+                                    check=False,
+                                )
+                                if check.returncode == 0:
+                                    subprocess.run(
+                                        ["kill", "-KILL", pid],
+                                        timeout=1,
+                                        check=False,
+                                    )
+                                    LOGGER.info(f"  Force killed process (PID {pid})")
+                            except Exception as e:
+                                LOGGER.debug(f"  Could not kill PID {pid}: {e}")
+            except Exception as e:
+                LOGGER.debug(f"  Error checking pattern '{pattern}': {e}")
+
+    def _release_resources(self):
+        """Release any resources that might be locked."""
+        try:
+            temp_dir = Path(tempfile.gettempdir())
+            temp_files = temp_dir.glob(f"{self.camera_name}_*_*.yaml")
+
+            for temp_file in temp_files:
+                try:
+                    temp_file.unlink()
+                    LOGGER.debug(f"  Removed temp file: {temp_file}")
+                except Exception as e:
+                    LOGGER.debug(f"  Could not remove {temp_file}: {e}")
+        except Exception as e:
+            LOGGER.debug(f"  Error cleaning temp files: {e}")
+
+        LOGGER.info("  ✓ Resources released")
+
+
+def check_and_cleanup_existing_resources(camera_name: str):
+    """Check for and clean up any existing resources before starting."""
+    LOGGER.info("Checking for existing resources...")
+
+    issues_found = False
+
+    # Check for existing tmux session
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ["tmux", "has-session", "-t", "realsense_receiver"], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        LOGGER.warning("  ⚠ Found existing tmux session 'realsense_receiver'")
+        issues_found = True
+
+        # Ask user if they want to clean up
+        try:
+            response = input("    Clean up existing session? (y/n): ").lower()
+            if response == "y":
+                subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
+                LOGGER.info("    ✓ Cleaned up existing session")
+                time.sleep(1)
+        except:
+            LOGGER.info("    Automatically cleaning up...")
+            subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
+            time.sleep(1)
+
+    # Check for orphaned processes
+    patterns = [
+        f"gscam.*{camera_name}",
+        "depth_image_proc",
+        "convert_metric_node",
+    ]
+
+    for pattern in patterns:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            pids = result.stdout.strip().split("\n")
+            LOGGER.warning(f"  ⚠ Found {len(pids)} orphaned processes matching '{pattern}'")
+            issues_found = True
+
+            for pid in pids:
+                if pid and pid.isdigit():
+                    try:
+                        subprocess.run(["kill", "-TERM", pid], timeout=1)
+                        LOGGER.info(f"    ✓ Terminated PID {pid}")
+                    except:
+                        pass
+
+    if issues_found:
+        LOGGER.info("  Waiting for cleanup to complete...")
+        time.sleep(2)
+        LOGGER.info("✓ Cleanup complete")
+    else:
+        LOGGER.info("✓ No existing resources found")
+
+    return True
 
 
 def main():
@@ -1167,129 +1448,179 @@ def main():
 
     args = parser.parse_args()
 
-    # Load configuration
-    config_loader = ConfigLoader(args.config)
-
-    # Get configurations
-    network_cfg = config_loader.get_network_config(args)
-    camera_cfg = config_loader.get_camera_config(args)
-    receiver_cfg = config_loader.get_receiver_config(args)
-    config_loader.get_imu_config(args)
-
-    # Resolution
-    width = args.width or 640
-    height = args.height or 480
-
-    # Handle presets
-    if args.preset:
-        preset = config_loader.get_preset(args.preset)
-        if preset:
-            streams = preset["streams"]
-            ports: list = []
-            stream_names: list = []
-            encodings: list = []
-            widths: list = []
-            heights: list = []
-
-            for s in streams:
-                port = network_cfg["base_port"] + s["port_offset"]
-                ports.append(port)
-                stream_names.append(s["name"])
-                encodings.append(s["encoding"])
-
-                if s["name"] == "infra_stereo":
-                    widths.append(width * 2)  # Y8I is double width
-                else:
-                    widths.append(width)
-                heights.append(height)
-
-            LOGGER.info(f"Using {args.preset.upper()} preset")
-        else:
-            LOGGER.info(f"Error: Preset {args.preset} not found")
-            sys.exit(1)
-    else:
-        LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
-        sys.exit(1)
-
-    LOGGER.info(f"\n{'='*70}")
-    LOGGER.info("VIRTUAL REALSENSE CAMERA RECEIVER")
-    LOGGER.info(f"{'='*70}")
-    LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
-    LOGGER.info(f"IMU Port: {network_cfg['imu_port']}")
-    LOGGER.info(f"Local IP: {receiver_cfg['local_ip']}")
-    LOGGER.info("\nVideo Streams:")
-    for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
-        LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
-    LOGGER.info(f"{'='*70}\n")
-
-    # Initialize ROS2
-    rclpy.init()
-
-    # Create virtual camera node
-    virtual_camera = VirtualRealSenseNode(
-        camera_name=camera_cfg["camera_name"],
-        imu_port=network_cfg["imu_port"],
-        config_loader=config_loader,
-        receiver_config=receiver_cfg,
-    )
-
-    # Spin node in background
-    ros_thread = threading.Thread(target=lambda: rclpy.spin(virtual_camera), daemon=True)
-    ros_thread.start()
-    time.sleep(1)
-
-    # Start video receivers in tmux
-    video_receiver = VideoStreamReceiver(
-        camera_name=camera_cfg["camera_name"],
-        config_loader=config_loader,
-        show_views=receiver_cfg.get("show_views", False),
-        view_scale=receiver_cfg.get("view_scale", 0.5),
-    )
-
-    for port, stream, encoding, stream_width, stream_height in zip(
-        ports, stream_names, encodings, widths, heights, strict=False
-    ):
-        intrinsics = config_loader.create_default_intrinsics(
-            stream_width if stream != "infra_stereo" else stream_width // 2, stream_height
-        )
-        video_receiver.start_stream(port, stream, encoding, stream_width, stream_height, intrinsics)
-
-    time.sleep(1)
-    LOGGER.info(f"\n{'='*70}")
-    LOGGER.info("ALL RECEIVERS STARTED")
-    LOGGER.info(f"{'='*70}")
-
-    LOGGER.info("\nPublishing ROS2 topics:")
-    LOGGER.info(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
-    LOGGER.info(f"  /{camera_cfg['camera_name']}/color/image_raw")
-
-    # Check if infra_stereo is present
-    if "infra_stereo" in stream_names:
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
-    else:
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
-        if "infra2" in stream_names:
-            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
-
-    LOGGER.info(f"  /{camera_cfg['camera_name']}/imu")
-    if receiver_cfg.get("publish_odom"):
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/odom")
-    LOGGER.info(f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames")
-
-    # Wait for shutdown
     try:
-        video_receiver.wait()
-    except KeyboardInterrupt:
-        LOGGER.info("\n\nShutting down...")
 
-    # Cleanup
-    video_receiver.stop_all()
-    virtual_camera.shutdown()
-    virtual_camera.destroy_node()
-    rclpy.shutdown()
-    LOGGER.info("✓ Shutdown complete")
+        # Load configuration
+        config_loader = ConfigLoader(args.config)
+
+        # Get configurations
+        network_cfg = config_loader.get_network_config(args)
+        camera_cfg = config_loader.get_camera_config(args)
+        receiver_cfg = config_loader.get_receiver_config(args)
+        config_loader.get_imu_config(args)
+
+        check_and_cleanup_existing_resources(camera_cfg["camera_name"])
+
+        # Resolution
+        width = args.width or 640
+        height = args.height or 480
+
+        # Handle presets
+        if args.preset:
+            preset = config_loader.get_preset(args.preset)
+            if preset:
+                streams = preset["streams"]
+                ports: list = []
+                stream_names: list = []
+                encodings: list = []
+                widths: list = []
+                heights: list = []
+
+                for s in streams:
+                    port = network_cfg["base_port"] + s["port_offset"]
+                    ports.append(port)
+                    stream_names.append(s["name"])
+                    encodings.append(s["encoding"])
+
+                    if s["name"] == "infra_stereo":
+                        widths.append(width * 2)  # Y8I is double width
+                    else:
+                        widths.append(width)
+                    heights.append(height)
+
+                LOGGER.info(f"Using {args.preset.upper()} preset")
+            else:
+                LOGGER.info(f"Error: Preset {args.preset} not found")
+                sys.exit(1)
+        else:
+            LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
+            sys.exit(1)
+
+        LOGGER.info(f"\n{'='*70}")
+        LOGGER.info("VIRTUAL REALSENSE CAMERA RECEIVER")
+        LOGGER.info(f"{'='*70}")
+        LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
+        LOGGER.info(f"IMU Port: {network_cfg['imu_port']}")
+        LOGGER.info(f"Local IP: {receiver_cfg['local_ip']}")
+        LOGGER.info("\nVideo Streams:")
+        for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
+            LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
+        LOGGER.info(f"{'='*70}\n")
+
+        # Initialize ROS2
+        rclpy.init()
+
+        # Create virtual camera node
+        virtual_camera = VirtualRealSenseNode(
+            camera_name=camera_cfg["camera_name"],
+            imu_port=network_cfg["imu_port"],
+            config_loader=config_loader,
+            receiver_config=receiver_cfg,
+        )
+
+        # Spin node in background
+        ros_thread = threading.Thread(target=lambda: rclpy.spin(virtual_camera), daemon=True)
+        ros_thread.start()
+        time.sleep(1)
+
+        # Start video receivers in tmux
+        video_receiver = VideoStreamReceiver(
+            camera_name=camera_cfg["camera_name"],
+            config_loader=config_loader,
+            show_views=receiver_cfg.get("show_views", False),
+            view_scale=receiver_cfg.get("view_scale", 0.5),
+        )
+
+        for port, stream, encoding, stream_width, stream_height in zip(
+            ports, stream_names, encodings, widths, heights, strict=False
+        ):
+            intrinsics = config_loader.create_default_intrinsics(
+                stream_width if stream != "infra_stereo" else stream_width // 2, stream_height
+            )
+            video_receiver.start_stream(
+                port, stream, encoding, stream_width, stream_height, intrinsics
+            )
+
+        time.sleep(1)
+        LOGGER.info(f"\n{'='*70}")
+        LOGGER.info("ALL RECEIVERS STARTED")
+        LOGGER.info(f"{'='*70}")
+
+        LOGGER.info("\nPublishing ROS2 topics:")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/color/image_raw")
+
+        # Check if infra_stereo is present
+        if "infra_stereo" in stream_names:
+            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
+            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
+        else:
+            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
+            if "infra2" in stream_names:
+                LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
+
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/imu")
+        if receiver_cfg.get("publish_odom"):
+            LOGGER.info(f"  /{camera_cfg['camera_name']}/odom")
+        LOGGER.info(
+            f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames"
+        )
+
+        # Wait for shutdown
+        try:
+            video_receiver.wait()
+        except KeyboardInterrupt:
+            LOGGER.info("\n\nShutting down...")
+    except Exception as e:
+        LOGGER.error(f"\n❌ Fatal error: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    finally:
+        # Ensure cleanup happens no matter what
+        LOGGER.info("\nStarting cleanup sequence...")
+
+        # Cleanup video receiver (this includes tmux)
+        if video_receiver:
+            try:
+                video_receiver.stop_all()
+            except Exception as e:
+                LOGGER.error(f"Error stopping video receiver: {e}")
+
+        # Cleanup virtual camera node
+        if virtual_camera:
+            try:
+                virtual_camera.shutdown()
+                virtual_camera.destroy_node()
+            except Exception as e:
+                LOGGER.error(f"Error shutting down virtual camera: {e}")
+
+        # Shutdown ROS2
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+                LOGGER.info("✓ ROS2 shutdown complete")
+        except Exception as e:
+            LOGGER.error(f"Error shutting down ROS2: {e}")
+
+        # Wait for ROS thread to finish
+        if ros_thread and ros_thread.is_alive():
+            ros_thread.join(timeout=2)
+
+        LOGGER.info("\n" + "=" * 70)
+        LOGGER.info("✓ ALL CLEANUP COMPLETE")
+        LOGGER.info("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
+    import signal
+
+    def signal_handler(signum, frame):
+        LOGGER.info(f"\n⚠ Received signal {signum}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     main()
