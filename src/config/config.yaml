@@ -27,7 +27,7 @@ network:
 camera:
   resolution: "640x480"
   fps: 30
-  name: "camera0"
+  name: "camera"
   stream_preference: "auto"
   color_format: "YUYV"  # Sender: V4L2 format preference
   depth_format: "Z16"   # Sender: V4L2 format preference
