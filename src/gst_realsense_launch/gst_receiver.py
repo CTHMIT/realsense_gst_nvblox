@@ -55,44 +55,6 @@ from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
 from gst_realsense_launch.rs_core import StreamStrategyFactory
 
 
-class Y8ISplitter:
-    """Split Y8I interleaved stereo infrared into infra1 and infra2."""
-
-    def __init__(self, width: int, height: int):
-        """Initialize splitter.
-
-        Args:
-            width: Single infrared image width (e.g., 640)
-            height: Image height (e.g., 480)
-        """
-        self.single_width = width
-        self.height = height
-        self.y8i_width = width * 2  # Y8I has double width
-
-    def split(self, y8i_frame) -> tuple:
-        """Split Y8I frame into infra1 (left) and infra2 (right).
-
-        Args:
-            y8i_frame: numpy array of shape (height, width*2) or (height, width*2, 1)
-
-        Returns:
-            (infra1, infra2): tuple of two numpy arrays
-        """
-        if not np:
-            raise RuntimeError("NumPy is required for Y8I splitting")
-
-        if len(y8i_frame.shape) == 3:
-            y8i_frame = y8i_frame[:, :, 0]  # Remove channel dimension if present
-
-        if y8i_frame.shape[1] != self.y8i_width:
-            raise ValueError(f"Expected Y8I width {self.y8i_width}, got {y8i_frame.shape[1]}")
-
-        infra1 = y8i_frame[:, 0::2]  # Left camera (even columns)
-        infra2 = y8i_frame[:, 1::2]  # Right camera (odd columns)
-
-        return infra1, infra2
-
-
 class VirtualRealSenseNode(Node):
     """ROS2 Node that creates a virtual RealSense camera.
 
@@ -142,7 +104,7 @@ class VirtualRealSenseNode(Node):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Bind to localhost by default for security, allow override via environment variable
-        bind_address = os.getenv("BIND_ADDRESS", "127.0.0.1")
+        bind_address = self.config_loader.config.get("server_ip")
         self.socket.bind((bind_address, imu_port))
         self.socket.settimeout(1.0)
 
@@ -510,8 +472,6 @@ class VideoStreamReceiver:
         self.processes: list = []
         self.threads: list = []
 
-        self.y8i_splitter: Y8ISplitter | None = None
-
     def start_stream(
         self,
         port: int,
@@ -525,9 +485,8 @@ class VideoStreamReceiver:
 
         # infra_stereo (Y8I): infra1 and infra2
         if stream_name == "infra_stereo":
-            # Y8I splitter
+            # Y8I splitter - split into infra1 and infra2
             single_width = width // 2
-            self.y8i_splitter = Y8ISplitter(single_width, height)
 
             # infra1
             thread1 = threading.Thread(
@@ -627,24 +586,45 @@ class VideoStreamReceiver:
             self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
             info_file_url = f"file://{tmp_file.name}"
 
-        # Build GStreamer pipeline
-        strategy = StreamStrategyFactory.create_strategy(
-            "depth" if stream_name == "depth" else "color"
-        )
-        gst_config = strategy.build_receiver_pipeline(port, encoding)
-
-        # Determine topics and encoding
+        # Build GStreamer pipeline using tested configuration
         if stream_name == "depth":
+            # Depth stream: H264 -> GRAY16_LE
+            gst_config = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
+                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! queue max-size-buffers=2 leaky=downstream "
+                f"! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE"
+            )
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
             frame_id = f"{self.camera_name}_depth_optical_frame"
             image_encoding = "16UC1"
+
         elif stream_name == "color":
+            # Color stream: H264 -> BGR
+            gst_config = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
+                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoconvert n-threads=4 ! video/x-raw,format=BGR"
+            )
             image_topic = f"/{self.camera_name}/color/image_raw"
             info_topic = f"/{self.camera_name}/color/camera_info"
             frame_id = f"{self.camera_name}_color_optical_frame"
             image_encoding = "bgr8"
+
         elif stream_name.startswith("infra"):
+            # Infrared stream: H264 -> GRAY8
+            gst_config = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
+                f"! rtpjitterbuffer latency=100 "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoconvert ! video/x-raw,format=GRAY8"
+            )
             image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
             info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
             frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
@@ -652,28 +632,18 @@ class VideoStreamReceiver:
         else:
             return
 
-        # Add visualization branch if enabled (using GStreamer native display)
+        # Add visualization branch if enabled
         if self.show_views:
-            # Scale down for display
             display_width = int(width * self.view_scale)
             display_height = int(height * self.view_scale)
 
-            # For depth, convert to visible format
-            if stream_name == "depth":
-                viz_pipeline = (
-                    f" ! tee name=t "
-                    f"t. ! queue ! videoconvert ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                    f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                    f"t. ! queue"
-                )
-            else:
-                # For color and infrared
-                viz_pipeline = (
-                    f" ! tee name=t "
-                    f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                    f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                    f"t. ! queue"
-                )
+            # Add tee and visualization sink
+            viz_pipeline = (
+                f" ! tee name=t "
+                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                f"t. ! queue"
+            )
             gst_config += viz_pipeline
 
         # Build gscam command
@@ -701,7 +671,7 @@ class VideoStreamReceiver:
             f"camera/camera_info:={info_topic}",
         ]
 
-        display_status = "with GStreamer display" if self.show_views else ""
+        display_status = "with display" if self.show_views else ""
         print(f"\n[{stream_name}] Starting on port {port} {display_status}")
         print(f"  Topic: {image_topic}")
         print(f"  Encoding: {encoding.upper()}")
@@ -753,18 +723,22 @@ class VideoStreamReceiver:
             )
             info_file_url = f"file://{tmp_file.name}"
 
-        # Build GStreamer pipeline for Y8I
-        strategy = StreamStrategyFactory.create_strategy("infra_stereo", self.config_loader)
-        gst_config = strategy.build_receiver_pipeline(port, encoding)
+        # Build GStreamer pipeline for Y8I with splitting
+        gst_config = (
+            f"udpsrc port={port} buffer-size=2097152 "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=99" '
+            f"! rtpjitterbuffer latency=100 "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+            f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
+        )
 
         # Add videocrop to split left/right
-        # Y8I format is 1280x480 containing two 640x480 images interleaved
-        # videocrop parameters specify how many pixels to REMOVE (not keep!)
+        # Y8I format is 1280x800 containing two 640x800 images interleaved column-wise
         if stream_name == "infra1":
-            # Keep left half (first 640 pixels), crop RIGHT 640 pixels
+            # Keep left half, crop RIGHT half
             gst_config += f" ! videocrop right={single_width}"
         else:  # infra2
-            # Keep right half (last 640 pixels), crop LEFT 640 pixels
+            # Keep right half, crop LEFT half
             gst_config += f" ! videocrop left={single_width}"
 
         # Determine topics
@@ -811,7 +785,7 @@ class VideoStreamReceiver:
             f"camera/camera_info:={info_topic}",
         ]
 
-        display_status = "with GStreamer display" if self.show_views else ""
+        display_status = "with display" if self.show_views else ""
         print(f"\n[{stream_name}] Starting on port {port} (from Y8I) {display_status}")
         print(f"  Topic: {image_topic}")
         print(f"  Encoding: {encoding.upper()}")
@@ -854,26 +828,26 @@ class VideoStreamReceiver:
             coeffs = intrinsics.distortion
 
         content = f"""image_width: {width}
-    image_height: {height}
-    camera_name: {self.camera_name}_{stream_name}
-    camera_matrix:
-    rows: 3
-    cols: 3
-    data: [{fx}, 0.0, {ppx}, 0.0, {fy}, {ppy}, 0.0, 0.0, 1.0]
-    distortion_model: plumb_bob
-    distortion_coefficients:
-    rows: 1
-    cols: 5
-    data: [{coeffs[0]}, {coeffs[1]}, {coeffs[2]}, {coeffs[3]}, {coeffs[4]}]
-    rectification_matrix:
-    rows: 3
-    cols: 3
-    data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-    projection_matrix:
-    rows: 3
-    cols: 4
-    data: [{fx}, 0.0, {ppx}, 0.0, 0.0, {fy}, {ppy}, 0.0, 0.0, 0.0, 1.0, 0.0]
-    """
+image_height: {height}
+camera_name: {self.camera_name}_{stream_name}
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [{fx}, 0.0, {ppx}, 0.0, {fy}, {ppy}, 0.0, 0.0, 1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [{coeffs[0]}, {coeffs[1]}, {coeffs[2]}, {coeffs[3]}, {coeffs[4]}]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [{fx}, 0.0, {ppx}, 0.0, 0.0, {fy}, {ppy}, 0.0, 0.0, 0.0, 1.0, 0.0]
+"""
         with open(filepath, "w") as f:
             f.write(content)
 

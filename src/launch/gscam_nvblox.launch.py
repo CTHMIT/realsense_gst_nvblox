@@ -1,35 +1,106 @@
+#!/usr/bin/env python3
+"""
+RealSense Virtual Camera Launch File for isaac_ros_nvblox
+
+This launch file receives RealSense streams over network and publishes them
+to ROS2 topics compatible with isaac_ros_nvblox.
+
+"""
+
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 from launch import LaunchDescription  # type: ignore[attr-defined]
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 
 
 def generate_launch_description():
-    # Args
-    declare_depth_width = DeclareLaunchArgument("depth_width", default_value="424")
-    declare_depth_height = DeclareLaunchArgument("depth_height", default_value="240")
-    declare_color_width = DeclareLaunchArgument("color_width", default_value="424")
-    declare_color_height = DeclareLaunchArgument("color_height", default_value="240")
-    declare_depth_port = DeclareLaunchArgument("depth_port", default_value="5000")
-    declare_color_port = DeclareLaunchArgument("color_port", default_value="5002")
+    """Generate launch description for RealSense virtual camera."""
 
+    # Launch arguments
+    camera_name_arg = DeclareLaunchArgument(
+        "camera_name", default_value="camera0", description="Camera name for topics and frames"
+    )
+
+    depth_port_arg = DeclareLaunchArgument(
+        "depth_port", default_value="5020", description="Port for depth stream"
+    )
+
+    color_port_arg = DeclareLaunchArgument(
+        "color_port", default_value="5010", description="Port for color stream"
+    )
+
+    infra1_port_arg = DeclareLaunchArgument(
+        "infra1_port", default_value="5030", description="Port for infra1 stream (Y8I)"
+    )
+
+    infra2_port_arg = DeclareLaunchArgument(
+        "infra2_port",
+        default_value="5030",
+        description="Port for infra2 stream (Y8I, same as infra1)",
+    )
+
+    depth_width_arg = DeclareLaunchArgument(
+        "depth_width", default_value="640", description="Depth image width"
+    )
+
+    depth_height_arg = DeclareLaunchArgument(
+        "depth_height", default_value="480", description="Depth image height"
+    )
+
+    color_width_arg = DeclareLaunchArgument(
+        "color_width", default_value="640", description="Color image width"
+    )
+
+    color_height_arg = DeclareLaunchArgument(
+        "color_height", default_value="480", description="Color image height"
+    )
+
+    infra_width_arg = DeclareLaunchArgument(
+        "infra_width", default_value="640", description="Infrared image width (single camera)"
+    )
+
+    infra_height_arg = DeclareLaunchArgument(
+        "infra_height", default_value="800", description="Infrared image height"
+    )
+
+    use_depth_float_arg = DeclareLaunchArgument(
+        "use_depth_float",
+        default_value="true",
+        description="Convert depth to 32FC1 format (required for nvblox)",
+    )
+
+    enable_infra_arg = DeclareLaunchArgument(
+        "enable_infra", default_value="false", description="Enable infrared streams"
+    )
+
+    # LaunchConfiguration
+    camera_name = LaunchConfiguration("camera_name")
+    depth_port = LaunchConfiguration("depth_port")
+    color_port = LaunchConfiguration("color_port")
+    infra1_port = LaunchConfiguration("infra1_port")
+    infra2_port = LaunchConfiguration("infra2_port")
     depth_width = LaunchConfiguration("depth_width")
     depth_height = LaunchConfiguration("depth_height")
     color_width = LaunchConfiguration("color_width")
     color_height = LaunchConfiguration("color_height")
-    depth_port = LaunchConfiguration("depth_port")
-    color_port = LaunchConfiguration("color_port")
+    infra_width = LaunchConfiguration("infra_width")
+    infra_height = LaunchConfiguration("infra_height")
+    use_depth_float = LaunchConfiguration("use_depth_float")
+    enable_infra = LaunchConfiguration("enable_infra")
 
     pkg_share = FindPackageShare("gst_realsense_launch")
 
+    # Camera info URLs
     depth_camera_info_url = [
         "file://",
         PathJoinSubstitution(
             [pkg_share, "config", ["depth_camera_", depth_width, "x", depth_height, ".yaml"]]
         ),
     ]
+
     color_camera_info_url = [
         "file://",
         PathJoinSubstitution(
@@ -37,92 +108,375 @@ def generate_launch_description():
         ),
     ]
 
-    # Depth (JPEG2000 → GRAY16_LE → mono16)
-    depth_node = Node(
+    infrared_camera_info_url = [
+        "file://",
+        PathJoinSubstitution(
+            [pkg_share, "config", ["infrared_camera_", infra_width, "x", infra_height, ".yaml"]]
+        ),
+    ]
+
+    # ========================================================================
+    # DEPTH CAMERA NODE
+    # ========================================================================
+    # Receives H.264 encoded depth stream and outputs 16UC1 format
+    depth_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
-        name="depth_camera",
+        name="depth_gscam",
+        namespace=camera_name,
         parameters=[
             {
                 "gscam_config": [
                     "udpsrc port=",
                     depth_port,
-                    " ",
-                    'caps="application/x-rtp,media=video,encoding-name=JPEG2000,',
-                    'payload=96,clock-rate=90000" ',
-                    # avdec_jpeg2000 or openjpegdec
-                    "! rtpj2kdepay ! jpeg2000parse ! avdec_jpeg2000 ",
-                    "! videoconvert ! video/x-raw,format=GRAY16_LE",
+                    " buffer-size=2097152 ",
+                    'caps="application/x-rtp,media=video,clock-rate=90000,'
+                    'encoding-name=H264,payload=96" ',
+                    "! rtpjitterbuffer latency=100 drop-on-latency=true ",
+                    "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
+                    "! queue max-size-buffers=2 leaky=downstream ",
+                    "! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE",
                 ],
-                "image_encoding": "mono16",  #  16-bit
-                "use_gst_timestamps": True,
-                "use_sensor_data_qos": True,
-                "sync_sink": False,
-                "reopen_on_eof": True,
-                "camera_name": "realsense_depth_424x240",
+                "camera_name": [camera_name, "_depth"],
                 "camera_info_url": depth_camera_info_url,
-                "frame_id": "camera_depth_optical_frame",
+                "frame_id": [camera_name, "_depth_optical_frame"],
+                "image_encoding": "16UC1",
+                "sync_sink": False,
+                "use_gst_timestamps": True,
+                "reopen_on_eof": True,
             }
         ],
         remappings=[
-            ("camera/image_raw", "/camera_0/depth/image"),
-            ("camera/camera_info", "/camera_0/depth/camera_info"),
+            ("camera/image_raw", "depth/image_rect_raw"),
+            ("camera/camera_info", "depth/camera_info"),
         ],
+        output="screen",
     )
 
-    # Color (H264 → RGB → rgb8)
-    color_node = Node(
+    # ========================================================================
+    # DEPTH TO FLOAT CONVERTER (for nvblox)
+    # ========================================================================
+    # Converts 16UC1 depth to 32FC1 format required by nvblox
+    depth_to_float_node = Node(
+        package="depth_image_proc",
+        executable="convert_metric_node",
+        name="depth_to_float",
+        namespace=camera_name,
+        condition=IfCondition(use_depth_float),
+        remappings=[
+            ("image_raw", "depth/image_rect_raw"),
+            ("camera_info", "depth/camera_info"),
+            ("image", "depth/image"),  # 32FC1 output for nvblox
+        ],
+        output="screen",
+    )
+
+    # ========================================================================
+    # COLOR CAMERA NODE
+    # ========================================================================
+    # Receives H.264 encoded color stream and outputs RGB8 format
+    color_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
-        name="color_camera",
+        name="color_gscam",
+        namespace=camera_name,
         parameters=[
             {
                 "gscam_config": [
                     "udpsrc port=",
                     color_port,
-                    " ",
-                    'caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000"',
-                    "! rtpjitterbuffer latency=100 drop-on-late=true"
-                    "! rtph264depay ! h24parse ! avdec_h264 ",
-                    "! videoconvert ! video/x-raw,format=RGB",
+                    " buffer-size=2097152 ",
+                    'caps="application/x-rtp,media=video,clock-rate=90000,'
+                    'encoding-name=H264,payload=98" ',
+                    "! rtpjitterbuffer latency=120 drop-on-latency=true ",
+                    "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
+                    "! videoconvert n-threads=4 ! video/x-raw,format=RGB",
                 ],
-                "image_encoding": "rgb8",
-                "use_gst_timestamps": True,
-                "use_sensor_data_qos": True,
-                "sync_sink": False,
-                "reopen_on_eof": True,
-                "camera_name": "realsense_color_424x240",
+                "camera_name": [camera_name, "_color"],
                 "camera_info_url": color_camera_info_url,
-                "frame_id": "camera_color_optical_frame",
+                "frame_id": [camera_name, "_color_optical_frame"],
+                "image_encoding": "rgb8",
+                "sync_sink": False,
+                "use_gst_timestamps": True,
+                "reopen_on_eof": True,
             }
         ],
         remappings=[
-            ("camera/image_raw", "/camera_0/color/image"),
-            ("camera/camera_info", "/camera_0/color/camera_info"),
+            ("camera/image_raw", "color/image_raw"),
+            ("camera/camera_info", "color/camera_info"),
         ],
+        output="screen",
     )
 
-    depth_to_float_node = Node(
-        package="depth_image_proc",
-        executable="convert_metric_node",
-        name="depth_to_float",
+    # ========================================================================
+    # INFRARED 1 CAMERA NODE (LEFT)
+    # ========================================================================
+    # Receives Y8I stereo stream and extracts left camera
+    infra1_gscam_node = Node(
+        package="gscam",
+        executable="gscam_node",
+        name="infra1_gscam",
+        namespace=camera_name,
+        condition=IfCondition(enable_infra),
+        parameters=[
+            {
+                "gscam_config": [
+                    "udpsrc port=",
+                    infra1_port,
+                    " buffer-size=2097152 ",
+                    'caps="application/x-rtp,media=video,clock-rate=90000,'
+                    'encoding-name=H264,payload=99" ',
+                    "! rtpjitterbuffer latency=100 ",
+                    "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
+                    "! videoconvert ! video/x-raw,format=GRAY8 ",
+                    # Split Y8I: crop right half to keep left camera
+                    "! videocrop right=",
+                    infra_width,
+                ],
+                "camera_name": [camera_name, "_infra1"],
+                "camera_info_url": infrared_camera_info_url,
+                "frame_id": [camera_name, "_infra1_optical_frame"],
+                "image_encoding": "mono8",
+                "sync_sink": False,
+                "use_gst_timestamps": True,
+                "reopen_on_eof": True,
+            }
+        ],
         remappings=[
-            ("image_raw", "/camera_0/depth/image"),
-            ("camera_info", "/camera_0/depth/camera_info"),
-            ("image", "/camera_0/depth/image_float"),  # 32FC1
+            ("camera/image_raw", "infra1/image_rect_raw"),
+            ("camera/camera_info", "infra1/camera_info"),
+        ],
+        output="screen",
+    )
+
+    # ========================================================================
+    # INFRARED 2 CAMERA NODE (RIGHT)
+    # ========================================================================
+    # Receives Y8I stereo stream and extracts right camera
+    infra2_gscam_node = Node(
+        package="gscam",
+        executable="gscam_node",
+        name="infra2_gscam",
+        namespace=camera_name,
+        condition=IfCondition(enable_infra),
+        parameters=[
+            {
+                "gscam_config": [
+                    "udpsrc port=",
+                    infra2_port,
+                    " buffer-size=2097152 ",
+                    'caps="application/x-rtp,media=video,clock-rate=90000,'
+                    'encoding-name=H264,payload=99" ',
+                    "! rtpjitterbuffer latency=100 ",
+                    "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
+                    "! videoconvert ! video/x-raw,format=GRAY8 ",
+                    # Split Y8I: crop left half to keep right camera
+                    "! videocrop left=",
+                    infra_width,
+                ],
+                "camera_name": [camera_name, "_infra2"],
+                "camera_info_url": infrared_camera_info_url,
+                "frame_id": [camera_name, "_infra2_optical_frame"],
+                "image_encoding": "mono8",
+                "sync_sink": False,
+                "use_gst_timestamps": True,
+                "reopen_on_eof": True,
+            }
+        ],
+        remappings=[
+            ("camera/image_raw", "infra2/image_rect_raw"),
+            ("camera/camera_info", "infra2/camera_info"),
+        ],
+        output="screen",
+    )
+
+    # ========================================================================
+    # STATIC TRANSFORM PUBLISHERS
+    # ========================================================================
+    # Publish static transforms for RealSense camera structure
+
+    # camera_link (base frame)
+    # This would typically come from robot_state_publisher or your TF tree
+
+    # camera_link -> depth_frame
+    depth_frame_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="depth_frame_tf",
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "0",
+            "0",
+            "0",
+            "1",  # rotation (quaternion)
+            [camera_name, "_link"],
+            [camera_name, "_depth_frame"],
         ],
     )
 
+    # depth_frame -> depth_optical_frame
+    depth_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="depth_optical_tf",
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "-0.5",
+            "0.5",
+            "-0.5",
+            "0.5",  # rotation (quaternion)
+            [camera_name, "_depth_frame"],
+            [camera_name, "_depth_optical_frame"],
+        ],
+    )
+
+    # camera_link -> color_frame
+    color_frame_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="color_frame_tf",
+        arguments=[
+            "0.015",
+            "0",
+            "0",  # translation (15mm offset)
+            "0",
+            "0",
+            "0",
+            "1",  # rotation (quaternion)
+            [camera_name, "_link"],
+            [camera_name, "_color_frame"],
+        ],
+    )
+
+    # color_frame -> color_optical_frame
+    color_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="color_optical_tf",
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "-0.5",
+            "0.5",
+            "-0.5",
+            "0.5",  # rotation (quaternion)
+            [camera_name, "_color_frame"],
+            [camera_name, "_color_optical_frame"],
+        ],
+    )
+
+    # camera_link -> infra1_frame
+    infra1_frame_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="infra1_frame_tf",
+        condition=IfCondition(enable_infra),
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "0",
+            "0",
+            "0",
+            "1",  # rotation (quaternion)
+            [camera_name, "_link"],
+            [camera_name, "_infra1_frame"],
+        ],
+    )
+
+    # infra1_frame -> infra1_optical_frame
+    infra1_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="infra1_optical_tf",
+        condition=IfCondition(enable_infra),
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "-0.5",
+            "0.5",
+            "-0.5",
+            "0.5",  # rotation (quaternion)
+            [camera_name, "_infra1_frame"],
+            [camera_name, "_infra1_optical_frame"],
+        ],
+    )
+
+    # camera_link -> infra2_frame
+    infra2_frame_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="infra2_frame_tf",
+        condition=IfCondition(enable_infra),
+        arguments=[
+            "0.050",
+            "0",
+            "0",  # translation (50mm stereo baseline)
+            "0",
+            "0",
+            "0",
+            "1",  # rotation (quaternion)
+            [camera_name, "_link"],
+            [camera_name, "_infra2_frame"],
+        ],
+    )
+
+    # infra2_frame -> infra2_optical_frame
+    infra2_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="infra2_optical_tf",
+        condition=IfCondition(enable_infra),
+        arguments=[
+            "0",
+            "0",
+            "0",  # translation
+            "-0.5",
+            "0.5",
+            "-0.5",
+            "0.5",  # rotation (quaternion)
+            [camera_name, "_infra2_frame"],
+            [camera_name, "_infra2_optical_frame"],
+        ],
+    )
+
+    # Build launch description
     return LaunchDescription(
         [
-            declare_depth_width,
-            declare_depth_height,
-            declare_color_width,
-            declare_color_height,
-            declare_depth_port,
-            declare_color_port,
-            depth_node,
-            color_node,
+            # Arguments
+            camera_name_arg,
+            depth_port_arg,
+            color_port_arg,
+            infra1_port_arg,
+            infra2_port_arg,
+            depth_width_arg,
+            depth_height_arg,
+            color_width_arg,
+            color_height_arg,
+            infra_width_arg,
+            infra_height_arg,
+            use_depth_float_arg,
+            enable_infra_arg,
+            # Camera nodes
+            depth_gscam_node,
             depth_to_float_node,
+            color_gscam_node,
+            infra1_gscam_node,
+            infra2_gscam_node,
+            # Static transforms
+            depth_frame_tf,
+            depth_optical_tf,
+            color_frame_tf,
+            color_optical_tf,
+            infra1_frame_tf,
+            infra1_optical_tf,
+            infra2_frame_tf,
+            infra2_optical_tf,
         ]
     )
