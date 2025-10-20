@@ -391,7 +391,7 @@ class TmuxSessionManager:
 
         if result.returncode == 0:
             # Session exists, kill it first
-            LOGGER.warning(f"⚠️  Found existing tmux session '{self.session_name}', cleaning up...")
+            LOGGER.warning(f"Found existing tmux session '{self.session_name}', cleaning up...")
             kill_result = subprocess.run(
                 ["tmux", "kill-session", "-t", self.session_name], capture_output=True
             )
@@ -571,15 +571,16 @@ class StreamManager:
                 if self.verbose:
                     self.tmux_manager.attach()
                 else:
-                    LOGGER.info(f"Streams are running in {self.session_name} tmux session.")
+                    LOGGER.info(
+                        f"Streams are running in {self.tmux_manager.session_name} tmux session."
+                    )
             LOGGER.info("All streams running. Press Ctrl+C to stop.")
 
-            # Use timeout loop to allow KeyboardInterrupt to be caught
             while not self._shutdown.is_set():
                 self._shutdown.wait(timeout=0.5)
 
         except KeyboardInterrupt:
-            LOGGER.info("\nReceived KeyboardInterrupt. Shutting down...")
+            LOGGER.info("Received KeyboardInterrupt. Shutting down...")
         finally:
             self.stop_all()
 
@@ -699,14 +700,14 @@ def install_signal_handlers(manager: "StreamManager"):
         if current_time - signal_count["last_time"] < 2:
             signal_count["count"] += 1
             if signal_count["count"] >= 2:
-                LOGGER.warning("\nForce quit detected! Terminating immediately...")
+                LOGGER.warning("Force quit detected! Terminating immediately...")
                 os._exit(1)  # Force immediate exit
         else:
             signal_count["count"] = 1
 
         signal_count["last_time"] = current_time
 
-        LOGGER.info(f"\nReceived {sig_name} signal. Initiating shutdown...")
+        LOGGER.info(f"Received {sig_name} signal. Initiating shutdown...")
         LOGGER.info("(Press Ctrl+C again within 2 seconds to force quit)")
         manager._shutdown.set()
 
@@ -779,7 +780,7 @@ def main():
             LOGGER.error(f"✗ Device {args.device} not found!")
             sys.exit(1)
 
-    LOGGER.info(f"✓ Found {len(cameras)} RealSense camera(s)\n")
+    LOGGER.info(f"✓ Found {len(cameras)} RealSense camera(s)")
 
     # Display camera info
     for i, cam in enumerate(cameras, 1):
@@ -792,16 +793,16 @@ def main():
         detected_model = cameras[0].model.lower()
         if "435i" in detected_model or "d435i" in detected_model:
             args.preset = "d435i"
-            LOGGER.info(f"\n✓ Auto-detected D435i camera, using d435i preset\n")
+            LOGGER.info(f"✓ Auto-detected D435i camera, using d435i preset")
         elif "455" in detected_model or "d455" in detected_model:
             args.preset = "d455"
-            LOGGER.info(f"\n✓ Auto-detected D455 camera, using d455 preset\n")
+            LOGGER.info(f"✓ Auto-detected D455 camera, using d455 preset")
         elif "415" in detected_model or "d415" in detected_model:
             args.preset = "d415"
-            LOGGER.info(f"\n✓ Auto-detected D415 camera, using d415 preset\n")
+            LOGGER.info(f"✓ Auto-detected D415 camera, using d415 preset")
         elif "l515" in detected_model:
             args.preset = "l515"
-            LOGGER.info(f"\n✓ Auto-detected L515 camera, using l515 preset\n")
+            LOGGER.info(f"✓ Auto-detected L515 camera, using l515 preset")
 
     if args.list_only:
         sys.exit(0)
@@ -815,7 +816,8 @@ def main():
     # Start IMU senders first
     for serial, serial_cameras in camera_groups.items():
         if imu_cfg["enabled"] and serial != "unknown":
-            LOGGER.info(f"\nStarting IMU for camera {serial}")
+            if args.verbose:
+                LOGGER.info(f"Starting IMU for camera {serial}")
             manager.add_imu_sender(
                 serial,
                 network_cfg["server_ip"],
@@ -830,7 +832,8 @@ def main():
     if args.preset:
         preset = config_loader.get_preset(args.preset)
         if preset:
-            LOGGER.info(f"\nUsing {args.preset.upper()} preset configuration:")
+            if args.verbose:
+                LOGGER.info(f"Using {args.preset.upper()} preset configuration:")
 
             camera_by_type = {}
             for cam in cameras:
