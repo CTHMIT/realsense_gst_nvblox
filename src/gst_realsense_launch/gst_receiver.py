@@ -63,6 +63,7 @@ class TmuxSessionManager:
         self.session_name = session_name
         self.window_count = 0
         self._check_tmux()
+        self._cleanup_old_session()
         self._create_session()
 
     def _check_tmux(self):
@@ -72,21 +73,29 @@ class TmuxSessionManager:
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise RuntimeError("tmux is not installed. Please install tmux: sudo apt install tmux")
 
-    def _create_session(self):
-        """Create tmux session if it doesn't exist."""
-        # Check if session already exists
+    def _cleanup_old_session(self):
+        """Kill old session if it exists."""
         result = subprocess.run(
             ["tmux", "has-session", "-t", self.session_name], capture_output=True
         )
+        if result.returncode == 0:
+            subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
+            print(f"✓ Cleaned up old tmux session '{self.session_name}'")
+            time.sleep(0.5)
 
-        if result.returncode != 0:
-            # Create new detached session
+    def _create_session(self):
+        """Create tmux session if it doesn't exist."""
+        try:
+            # Create new detached session with a dummy command
             subprocess.run(
-                ["tmux", "new-session", "-d", "-s", self.session_name, "-n", "control"], check=True
+                ["tmux", "new-session", "-d", "-s", self.session_name],
+                check=True,
+                capture_output=True,
             )
             print(f"✓ Created tmux session '{self.session_name}'")
-        else:
-            print(f"✓ Using existing tmux session '{self.session_name}'")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Could not create tmux session: {e}")
+            raise
 
     def create_window(self, window_name: str, command: str):
         """Create a new tmux window and run command in it.
@@ -95,35 +104,44 @@ class TmuxSessionManager:
             window_name: Name for the tmux window
             command: Command to execute in the window
         """
-        self.window_count += 1
+        try:
+            # Create new window (tmux will auto-assign window index)
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "new-window",
+                    "-t",
+                    self.session_name,
+                    "-n",
+                    window_name,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
-        # Create new window
-        subprocess.run(
-            [
-                "tmux",
-                "new-window",
-                "-t",
-                f"{self.session_name}:{self.window_count}",
-                "-n",
-                window_name,
-            ],
-            check=True,
-        )
+            # Send command to the window
+            subprocess.run(
+                [
+                    "tmux",
+                    "send-keys",
+                    "-t",
+                    f"{self.session_name}:{window_name}",
+                    command,
+                    "C-m",  # Enter key
+                ],
+                check=True,
+                capture_output=True,
+            )
 
-        # Send command to the window
-        subprocess.run(
-            [
-                "tmux",
-                "send-keys",
-                "-t",
-                f"{self.session_name}:{window_name}",
-                command,
-                "C-m",  # Enter key
-            ],
-            check=True,
-        )
+            self.window_count += 1
+            print(f"  ✓ Created window '{window_name}' in tmux")
 
-        print(f"  ✓ Created window '{window_name}' in tmux")
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ Failed to create window '{window_name}': {e}")
+            if e.stderr:
+                print(f"     Error output: {e.stderr}")
+            raise
 
     def attach_info(self):
         """Display instructions for attaching to the tmux session."""
