@@ -824,13 +824,13 @@ def main():
                 network_cfg["imu_port"],
             )
 
-    use_h264_for_depth = encoding_cfg.get("depth_h264", {}).get("use_h264", True)
     depth_bitrate = encoding_cfg.get("depth_h264", {}).get("bitrate", 8000)
     h264_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
 
     # Use preset configuration if available
     if args.preset:
         preset = config_loader.get_preset(args.preset)
+
         if preset:
             if args.verbose:
                 LOGGER.info(f"Using {args.preset.upper()} preset configuration:")

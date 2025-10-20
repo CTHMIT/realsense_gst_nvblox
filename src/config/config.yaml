@@ -48,7 +48,7 @@ encoding:
 
   depth_h264:
     bitrate: 16000  # kbps - used specifically for depth stream
-    use_h264: true  # If false, use JPEG2000 for depth (preserves 16-bit)
+    use_h264: false  # If false, use JPEG2000 for depth (preserves 16-bit)
 
 streaming:
   sequential_start: false
@@ -58,7 +58,7 @@ streaming:
   udp:
     sync: false
     async: false
-    buffer_size: 109715200  # 2MB buffer for all streams
+    buffer_size: 3000000000  # 30MB buffer for all streams
 
   # RTP Configuration
   rtp:

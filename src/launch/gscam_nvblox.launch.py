@@ -28,7 +28,7 @@ def generate_launch_description():
     # LAUNCH ARGUMENTS
     # ========================================================================
     camera_name_arg = DeclareLaunchArgument(
-        "camera_name", default_value="camera0", description="Camera name for topics and frames"
+        "camera_name", default_value="camera", description="Camera name for topics and frames"
     )
 
     depth_port_arg = DeclareLaunchArgument(

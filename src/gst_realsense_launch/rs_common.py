@@ -214,7 +214,7 @@ class ConfigLoader:
                 "camera.resolution", "640x480", getattr(args, "resolution", None)
             ),
             "fps": self.get("camera.fps", None, getattr(args, "fps", None)),
-            "camera_name": self.get("camera.name", "camera0", getattr(args, "camera_name", None)),
+            "camera_name": self.get("camera.name", "camera", getattr(args, "camera_name", None)),
             "stream_preference": self.get(
                 "camera.stream_preference", "auto", getattr(args, "stream", None)
             ),
