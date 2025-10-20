@@ -105,9 +105,14 @@ receiver:
   odom_frame: "odom"
   base_link_frame: "base_link"
 
+  depth_conversion:
+    enabled: true           # enable for transfer to float32
+    scale: 0.001           # depth (mm -> m)，RealSense is mm
+    output_topic: "depth/image"
+
   # ROS2 Image Encoding - CRITICAL: Must match GStreamer output format
   image_encoding:
-    depth: "16UC1"       # 16-bit unsigned, 1 channel
+    depth: "mono16"       # 16-bit unsigned, 1 channel
     color: "rgb8"        # 8-bit RGB (changed from bgr8 to rgb8)
     infra: "mono8"       # 8-bit monochrome
 

@@ -683,12 +683,12 @@ class VideoStreamReceiver:
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
             frame_id = f"{self.camera_name}_depth_optical_frame"
-            image_encoding = image_encodings.get("depth", "16UC1")
+            image_encoding = None
         elif stream_name == "color":
             image_topic = f"/{self.camera_name}/color/image_raw"
             info_topic = f"/{self.camera_name}/color/camera_info"
             frame_id = f"{self.camera_name}_color_optical_frame"
-            image_encoding = image_encodings.get("color", "rgb8")  # Changed to rgb8
+            image_encoding = image_encodings.get("color", "rgb8")
         elif stream_name.startswith("infra"):
             image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
             info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
@@ -706,10 +706,18 @@ class VideoStreamReceiver:
             f"-p camera_info_url:={info_file_url}",
             f"-p frame_id:={frame_id}",
             "-p sync_sink:=false",
-            f"-p image_encoding:={image_encoding}",
-            f"-r camera/image_raw:={image_topic}",
-            f"-r camera/camera_info:={info_topic}",
         ]
+
+        # 只有在 image_encoding 不是 None 時才添加
+        if image_encoding:
+            gscam_cmd_parts.append(f"-p image_encoding:={image_encoding}")
+
+        gscam_cmd_parts.extend(
+            [
+                f"-r camera/image_raw:={image_topic}",
+                f"-r camera/camera_info:={info_topic}",
+            ]
+        )
 
         gscam_cmd = " ".join(gscam_cmd_parts)
 
@@ -722,11 +730,47 @@ class VideoStreamReceiver:
 
         LOGGER.info(f"\n[{stream_name}] Starting on port {port}")
         LOGGER.info(f"  Topic: {image_topic}")
-        LOGGER.info(f"  Encoding: {image_encoding}")
-        LOGGER.info(f"  GStreamer Config: {gst_config[:100]}...")  # Show first 100 chars
+        LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect (mono16)'}")
+        LOGGER.info(f"  GStreamer Config: {gst_config[:100]}...")
 
         # Run in tmux
         self.tmux_manager.create_window(window_name, gscam_cmd)
+
+        # 如果是深度流且啟用了轉換，啟動 depth_image_proc 節點
+        if stream_name == "depth":
+            self._start_depth_conversion_node(port, image_topic, info_topic)
+
+    def _start_depth_conversion_node(self, port: int, depth_topic: str, info_topic: str):
+        """Start depth_image_proc convert_metric node for float32 conversion."""
+
+        depth_config = self.config_loader.get("receiver.depth_conversion", {})
+
+        if not depth_config.get("enabled", True):
+            LOGGER.info("  Depth conversion disabled in config")
+            return
+
+        output_topic = depth_config.get("output_topic", "depth/image")
+        output_full_topic = f"/{self.camera_name}/{output_topic}"
+
+        # Build depth conversion command
+        convert_cmd_parts = [
+            "ros2 run depth_image_proc convert_metric_node",
+            "--ros-args",
+            f"-r image_raw:={depth_topic}",
+            f"-r camera_info:={info_topic}",
+            f"-r image:={output_full_topic}",
+        ]
+
+        convert_cmd = " ".join(convert_cmd_parts)
+        window_name = f"depth_convert_{port}"
+
+        LOGGER.info(f"  [CONVERT] Starting depth to float32 conversion")
+        LOGGER.info(f"    Input: {depth_topic} (mono16)")
+        LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
+
+        # 延遲啟動，確保 gscam 先啟動
+        time.sleep(0.5)
+        self.tmux_manager.create_window(window_name, convert_cmd)
 
     def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
         """Build GStreamer pipeline for standard streams (ROS2 only, no visualization)."""
