@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 from gst_realsense_launch.rs_common import (
     FOURCC_COLOR,
@@ -515,11 +516,7 @@ class StreamManager:
         if self.tmux_manager is None:
             self.tmux_manager = TmuxSessionManager()
 
-        use_h264_for_depth = False
-        if stream_type == "depth":
-            encoding_cfg = self.config_loader.config.get("encoding", {})
-            depth_h264_cfg = encoding_cfg.get("depth_h264", {})
-            use_h264_for_depth = depth_h264_cfg.get("use_h264", True)
+        use_h264_for_depth = stream_config.encoding.lower() == "h264"
 
         encoder = EncoderFactory.create_encoder(
             encoder_preference, stream_type, use_h264_for_depth=use_h264_for_depth
@@ -824,8 +821,7 @@ def main():
                 network_cfg["imu_port"],
             )
 
-    depth_bitrate = encoding_cfg.get("depth_h264", {}).get("bitrate", 8000)
-    h264_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
+    actual_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
 
     # Use preset configuration if available
     if args.preset:
@@ -903,11 +899,6 @@ def main():
                     fourcc=mode.fourcc,
                     verbose=args.verbose,
                 )
-
-                if stream_name == "depth":
-                    actual_bitrate = depth_bitrate
-                else:
-                    actual_bitrate = h264_bitrate
 
                 manager.add_stream(
                     stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
