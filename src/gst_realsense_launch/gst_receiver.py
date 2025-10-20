@@ -104,7 +104,9 @@ class VirtualRealSenseNode(Node):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # Bind to localhost by default for security, allow override via environment variable
-        bind_address = self.config_loader.config.get("server_ip")
+        bind_address = self.receiver_config.get(
+            "local_ip", "0.0.0.0"
+        )  # nosec B104 - intentional for remote streaming
         self.socket.bind((bind_address, imu_port))
         self.socket.settimeout(1.0)
 

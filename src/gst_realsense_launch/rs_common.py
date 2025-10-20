@@ -256,6 +256,7 @@ class ConfigLoader:
     def get_receiver_config(self, args) -> dict:
         """Get receiver configuration with overrides."""
         return {
+            "local_ip": self.get("network.local_ip", None, getattr(args, "local_ip", None)),
             "show_views": self.get(
                 "receiver.show_views", False, getattr(args, "show_views", False)
             ),

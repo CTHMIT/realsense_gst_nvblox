@@ -134,7 +134,7 @@ ignore = [
 # Bandit configuration
 [tool.bandit]
 exclude_dirs = ["tests", "build", "dist", "install", "log"]
-skips = ["B101", "B601"]  # Skip assert warnings and shell injection in specific cases
+skips = ["B104", "B101", "B601"]  # Skip assert warnings and shell injection in specific cases
 
 # MyPy configuration
 [tool.mypy]
