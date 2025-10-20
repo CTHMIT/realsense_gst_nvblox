@@ -593,9 +593,9 @@ class StreamManager:
             self._stopped = True
             self._shutdown.set()
 
-            LOGGER.info("\n" + "=" * 70)
+            LOGGER.info("\n" + "=" * 40)
             LOGGER.info("SHUTTING DOWN - Stopping all streams...")
-            LOGGER.info("=" * 70)
+            LOGGER.info("=" * 40)
 
             # Stop IMU senders first
             if self.imu_senders:
