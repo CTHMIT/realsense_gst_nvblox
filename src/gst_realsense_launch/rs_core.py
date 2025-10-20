@@ -15,17 +15,24 @@ from abc import ABC, abstractmethod
 
 from utils.logger import LOGGER
 
-RTP_PT = {
-    ("depth", "H264"): 96,
-    ("depth", "JPEG2000"): 112,
-    ("color", "H264"): 98,
-    ("ir", "H264"): 97,
-    ("infra_stereo", "H264"): 99,
-}
 
+def get_pt(stream_type: str, encoding_name: str, config_loader=None) -> int:
+    """Get RTP payload type from config or defaults."""
+    if config_loader:
+        payload_types: dict[str, int] = config_loader.get("streaming.rtp.payload_types", {})
+        key = f"{stream_type.lower()}_{encoding_name.lower()}"
+        if key in payload_types:
+            return payload_types[key]
 
-def get_pt(stream_type: str, encoding_name: str) -> int:
-    return RTP_PT[(stream_type.lower(), encoding_name.upper())]
+    # Fallback to hardcoded defaults
+    RTP_PT = {
+        ("depth", "H264"): 96,
+        ("depth", "JPEG2000"): 112,
+        ("color", "H264"): 98,
+        ("ir", "H264"): 97,
+        ("infra_stereo", "H264"): 99,
+    }
+    return RTP_PT.get((stream_type.lower(), encoding_name.upper()), 96)
 
 
 class EncoderStrategy(ABC):

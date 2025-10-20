@@ -1,9 +1,10 @@
 # RealSense Streaming Configuration
 # This file contains all parameters needed by gst_sender.py and gst_receiver.py
+# All parameters should be modified ONLY in this file to ensure sender/receiver consistency
 
 network:
-  local_ip: "0.0.0.0"  # IP address of the sender
-  server_ip: "10.28.132.110"  # IP address of the receiver
+  local_ip: "0.0.0.0"  # IP address for binding (receiver)
+  server_ip: "10.28.132.110"  # IP address of the receiver (sender target)
   base_port: 5000  # Base port for video streams
 
   # Stream port configuration
@@ -28,15 +29,15 @@ camera:
   fps: 30
   name: "camera0"
   stream_preference: "auto"
-  color_format: "YUYV"
-  depth_format: "Z16"
-  infra_format: "Y8I"  # Y8I contains both infra1 and infra2 interleaved
+  color_format: "YUYV"  # Sender: V4L2 format preference
+  depth_format: "Z16"   # Sender: V4L2 format preference
+  infra_format: "Y8I"   # Y8I contains both infra1 and infra2 interleaved
 
 encoding:
-  encoder: "auto"
+  encoder: "auto"  # Options: auto, nvh264enc, x264enc
 
   h264:
-    bitrate: 8000
+    bitrate: 8000  # kbps - used for color and infrared streams
     tune: "zerolatency"
     speed_preset: "ultrafast"
     key_int_max: 30
@@ -46,47 +47,92 @@ encoding:
     num_threads: 8
 
   depth_h264:
-    bitrate: 8000
-    use_h264: true
+    bitrate: 8000  # kbps - used specifically for depth stream
+    use_h264: true  # If false, use JPEG2000 for depth (preserves 16-bit)
 
+# ============================================================================
+# STREAMING PARAMETERS - MUST BE IDENTICAL FOR SENDER AND RECEIVER
+# ============================================================================
 streaming:
   sequential_start: false
   startup_delay: 2
 
+  # UDP Configuration (sender and receiver)
   udp:
     sync: false
     async: false
-    buffer_size: 2097152
+    buffer_size: 2097152  # 2MB buffer for all streams
 
+  # RTP Configuration
   rtp:
-    payload: 96
     mtu: 1200
     config_interval: 1
+    # Payload type mappings - CRITICAL: Must match between sender and receiver
+    payload_types:
+      depth_h264: 96
+      depth_jpeg2000: 112
+      color_h264: 98
+      ir_h264: 97
+      infra_stereo_h264: 99
 
+  # Jitter Buffer Configuration (receiver side)
+  # These values control how the receiver handles network jitter
   jitter_buffer:
-    latency: 100
-    drop_on_latency: true
-    mode: 1
+    depth:
+      latency: 200              # ms - increased for better stability
+      drop_on_latency: true
+    color:
+      latency: 200              # ms - increased for better stability
+      drop_on_latency: true
+    infra:
+      latency: 200              # ms - same as depth/color for consistency
+      drop_on_latency: true
+    infra_stereo:
+      latency: 200              # ms - same as other streams
+      drop_on_latency: true
 
+  # Queue Configuration (both sender and receiver)
   queue:
-    max_size_buffers: 2
-    leaky: "downstream"
+    max_size_buffers: 4         # Increased from 2 to 4 for better buffering
+    leaky: "downstream"         # Drop old frames when queue is full
 
+  # Processing Configuration (both sender and receiver)
   processing:
-    max_threads: 4
-    n_threads: 4
+    max_threads: 4              # Maximum threads for H.264 decoding
+    n_threads: 4                # Threads for videoconvert operations
 
+# ============================================================================
+# IMU CONFIGURATION
+# ============================================================================
 imu:
   enabled: true
-  publish_rate: 200.0
+  publish_rate: 200.0  # Hz - ROS2 publish rate
 
+# ============================================================================
+# RECEIVER SPECIFIC CONFIGURATION
+# ============================================================================
 receiver:
-  show_views: false
-  view_scale: 0.5
-  publish_odom: true
+  show_views: false      # Display video streams in separate windows
+  view_scale: 0.5        # Scale factor for visualization windows (0.0-1.0)
+  publish_odom: true     # Publish odometry for navigation stack
   odom_frame: "odom"
   base_link_frame: "base_link"
 
+  # ROS2 Image Encoding - CRITICAL: Must match GStreamer output format
+  image_encoding:
+    depth: "16UC1"       # 16-bit unsigned, 1 channel
+    color: "rgb8"        # 8-bit RGB (changed from bgr8 to rgb8)
+    infra: "mono8"       # 8-bit monochrome
+
+  # GStreamer Format Conversion - CRITICAL: Must match image_encoding
+  gstreamer_format:
+    depth: "GRAY16_LE"   # GStreamer format for depth
+    color: "RGB"         # GStreamer format for color (changed from BGR to RGB)
+    infra: "GRAY8"       # GStreamer format for infrared
+
+# ============================================================================
+# CAMERA PRESETS
+# ============================================================================
 presets:
   d435i:
     streams:
@@ -143,6 +189,9 @@ presets:
         port_offset: 0
     imu_enabled: true
 
+# ============================================================================
+# CALIBRATION CONFIGURATION
+# ============================================================================
 calibration:
   default_intrinsics:
     fx_ratio: 0.6

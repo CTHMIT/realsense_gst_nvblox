@@ -687,21 +687,24 @@ class VideoStreamReceiver:
             gst_config = self._build_pipeline(port, stream_name, width, height)
 
         # Determine topics and encoding
+        image_encodings = self.config_loader.get("receiver.image_encoding", {})
+
+        # Determine topics and encoding
         if stream_name == "depth":
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
             frame_id = f"{self.camera_name}_depth_optical_frame"
-            image_encoding = "16UC1"
+            image_encoding = image_encodings.get("depth", "16UC1")
         elif stream_name == "color":
             image_topic = f"/{self.camera_name}/color/image_raw"
             info_topic = f"/{self.camera_name}/color/camera_info"
             frame_id = f"{self.camera_name}_color_optical_frame"
-            image_encoding = "bgr8"
+            image_encoding = image_encodings.get("color", "rgb8")  # Changed from bgr8
         elif stream_name.startswith("infra"):
             image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
             info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
             frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
-            image_encoding = "mono8"
+            image_encoding = image_encodings.get("infra", "mono8")
         else:
             return
 
@@ -737,33 +740,73 @@ class VideoStreamReceiver:
 
     def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
         """Build GStreamer pipeline for standard streams (ROS2 only, no visualization)."""
+
+        # Get streaming parameters from config
+        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+
+        # Get payload types from config
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+
+        # Get format conversion settings from config
+        gst_formats = self.config_loader.get("receiver.gstreamer_format", {})
+
         if stream_name == "depth":
             # Depth stream: H264 -> GRAY16_LE
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("depth_h264", 96)
+            output_format = gst_formats.get("depth", "GRAY16_LE")
+
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! queue max-size-buffers=2 leaky=downstream "
-                f"! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE"
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
             )
         elif stream_name == "color":
-            # Color stream: H264 -> BGR
+            # Color stream: H264 -> RGB (changed from BGR)
+            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.color.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("color_h264", 98)
+            output_format = gst_formats.get("color", "RGB")
+
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
-                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! videoconvert n-threads=4 ! video/x-raw,format=BGR"
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
             )
         elif stream_name.startswith("infra"):
             # Infrared stream: H264 -> GRAY8
+            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.infra.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("ir_h264", 97)
+            output_format = gst_formats.get("infra", "GRAY8")
+
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
-                f"! rtpjitterbuffer latency=100 "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! videoconvert ! video/x-raw,format=GRAY8"
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
             )
         else:
             return ""
@@ -774,11 +817,27 @@ class VideoStreamReceiver:
         """Build GStreamer pipeline for Y8I streams (ROS2 only, no visualization)."""
         single_width = y8i_width // 2
 
+        # Get streaming parameters from config
+        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
+        )
+        drop_str = "true" if drop_on_latency else "false"
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+
+        # Get payload type from config
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        payload = payload_types.get("infra_stereo_h264", 99)
+
         pipeline = (
-            f"udpsrc port={port} buffer-size=2097152 "
-            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=99" '
-            f"! rtpjitterbuffer latency=100 "
-            f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+            f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+            f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
             f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
         )
 
@@ -831,37 +890,58 @@ class VideoStreamReceiver:
         display_height: int,
     ) -> str:
         """Build independent visualization pipeline."""
+
+        # Get streaming parameters from config
+        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.depth.drop_on_latency", True
+        )
+        drop_str = "true" if drop_on_latency else "false"
+
         if stream_name == "depth":
-            # Depth visualization with normalization for better viewing
+
+            payload = payload_types.get("depth_h264", 96)
+
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! queue max-size-buffers=2 leaky=downstream "
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                 f"! videoconvert "
                 f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
                 f"! videoconvert "
                 f"! autovideosink sync=false"
             )
         elif stream_name == "color":
+            payload = payload_types.get("color_h264", 98)
             # Color visualization
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
-                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert "
                 f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
                 f"! videoconvert "
                 f"! autovideosink sync=false"
             )
         elif stream_name.startswith("infra"):
+            payload = payload_types.get("ir_h264", 97)
             # Infrared visualization
             pipeline = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
-                f"! rtpjitterbuffer latency=100 "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert "
                 f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
                 f"! videoconvert "
                 f"! autovideosink sync=false"
