@@ -83,6 +83,16 @@
 | ir           | H264     | **97**  |
 | infra_stereo | H264     | **99**  |
 
+
+### Format for gst and ros2
+
+| Stream | Format      | ROS Encoding | GStreamer Output               |
+| ------ | ----------- | ------------ | ------------------------------ |
+| Color  | `RGB`       | `rgb8`       | `video/x-raw,format=RGB`       |
+| Depth  | `GRAY16_LE` | `16UC1`      | `video/x-raw,format=GRAY16_LE` |
+| Infra  | `GRAY8`     | `mono8`      | `video/x-raw,format=GRAY8`     |
+
+
 ---
 
 ## 📦 Requirements

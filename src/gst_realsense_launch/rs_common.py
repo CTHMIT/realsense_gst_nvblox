@@ -12,10 +12,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from utils.logger import LOGGER
+
 try:
     import yaml
 except ImportError:
-    print("Error: pyyaml not found. Install: pip install pyyaml")
+    LOGGER.error("Error: pyyaml not found. Install: pip install pyyaml")
     sys.exit(1)
 
 
@@ -31,6 +33,7 @@ class StreamConfig:
     fps: int
     device: str | None = None
     fourcc: str | None = None
+    verbose: bool = False
 
 
 @dataclass
@@ -96,13 +99,13 @@ class ConfigLoader:
                 try:
                     with path.open(encoding="utf-8") as f:
                         config = yaml.safe_load(f)
-                        print(f"✓ Loaded configuration from {path}")
+                        LOGGER.info(f"✓ Loaded configuration from {path}")
                         return cast(dict, config)
                 except Exception as e:
-                    print(f"Warning: Failed to load {path}: {e}")
+                    LOGGER.warning(f"Warning: Failed to load {path}: {e}")
                     continue
 
-        print("Warning: No config file found. Using defaults.")
+        LOGGER.warning("Warning: No config file found. Using defaults.")
         return {}
 
     def get(self, key_path: str, default: Any = None, override: Any = None) -> Any:
@@ -189,7 +192,7 @@ class ConfigLoader:
             return cast(int, imu_port)
 
         # Final fallback to default
-        print("Warning: IMU port not configured, using default port 5050")
+        LOGGER.warning("Warning: IMU port not configured, using default port 5050")
         return 5050
 
     def get_network_config(self, args) -> dict:

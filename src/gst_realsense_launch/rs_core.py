@@ -13,6 +13,8 @@ import shutil
 import subprocess
 from abc import ABC, abstractmethod
 
+from utils.logger import LOGGER
+
 RTP_PT = {
     ("depth", "H264"): 96,
     ("depth", "JPEG2000"): 112,

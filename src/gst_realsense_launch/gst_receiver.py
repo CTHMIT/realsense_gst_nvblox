@@ -26,13 +26,15 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
+from utils.logger import LOGGER
+
 try:
     import cv2
     import numpy as np
 except ImportError:
     cv2 = None
     np = None
-    print("Warning: OpenCV not available. --show-views will be disabled.")
+    LOGGER.info("Warning: OpenCV not available. --show-views will be disabled.")
 
 # Type hints only during type checking
 if TYPE_CHECKING:
@@ -48,8 +50,8 @@ try:
     from std_msgs.msg import Header
     from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 except ImportError:
-    print("Error: ROS2 not found. Source your ROS2 installation:")
-    print("  source /opt/ros/humble/setup.bash")
+    LOGGER.info("Error: ROS2 not found. Source your ROS2 installation:")
+    LOGGER.info("  source /opt/ros/humble/setup.bash")
     sys.exit(1)
 
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
@@ -80,7 +82,7 @@ class TmuxSessionManager:
         )
         if result.returncode == 0:
             subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
-            print(f"✓ Cleaned up old tmux session '{self.session_name}'")
+            LOGGER.info(f"✓ Cleaned up old tmux session '{self.session_name}'")
             time.sleep(0.5)
 
     def _create_session(self):
@@ -92,9 +94,9 @@ class TmuxSessionManager:
                 check=True,
                 capture_output=True,
             )
-            print(f"✓ Created tmux session '{self.session_name}'")
+            LOGGER.info(f"✓ Created tmux session '{self.session_name}'")
         except subprocess.CalledProcessError as e:
-            print(f"Warning: Could not create tmux session: {e}")
+            LOGGER.info(f"Warning: Could not create tmux session: {e}")
             raise
 
     def create_window(self, window_name: str, command: str):
@@ -135,29 +137,29 @@ class TmuxSessionManager:
             )
 
             self.window_count += 1
-            print(f"  ✓ Created window '{window_name}' in tmux")
+            LOGGER.info(f"  ✓ Created window '{window_name}' in tmux")
 
         except subprocess.CalledProcessError as e:
-            print(f"  ✗ Failed to create window '{window_name}': {e}")
+            LOGGER.info(f"  ✗ Failed to create window '{window_name}': {e}")
             if e.stderr:
-                print(f"     Error output: {e.stderr}")
+                LOGGER.info(f"     Error output: {e.stderr}")
             raise
 
     def attach_info(self):
         """Display instructions for attaching to the tmux session."""
-        print(f"\nTo view the streams, attach to tmux session:")
-        print(f"  tmux attach -t {self.session_name}")
-        print(f"\nTmux navigation:")
-        print(f"  Ctrl+b n : next window")
-        print(f"  Ctrl+b p : previous window")
-        print(f"  Ctrl+b [0-9] : select window by number")
-        print(f"  Ctrl+b d : detach from session")
-        print(f"  Ctrl+b & : kill current window")
+        LOGGER.info(f"\nTo view the streams, attach to tmux session:")
+        LOGGER.info(f"  tmux attach -t {self.session_name}")
+        LOGGER.info(f"\nTmux navigation:")
+        LOGGER.info(f"  Ctrl+b n : next window")
+        LOGGER.info(f"  Ctrl+b p : previous window")
+        LOGGER.info(f"  Ctrl+b [0-9] : select window by number")
+        LOGGER.info(f"  Ctrl+b d : detach from session")
+        LOGGER.info(f"  Ctrl+b & : kill current window")
 
     def kill_session(self):
         """Kill the entire tmux session."""
         subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
-        print(f"✓ Killed tmux session '{self.session_name}'")
+        LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
 
 
 class VirtualRealSenseNode(Node):
@@ -602,7 +604,7 @@ class VideoStreamReceiver:
             # Y8I splitter - split into infra1 and infra2
             single_width = width // 2
 
-            # infra1
+            # infra1 - gscam for ROS2
             self._start_single_stream_in_tmux(
                 port,
                 "infra1",
@@ -613,9 +615,14 @@ class VideoStreamReceiver:
                 is_y8i=True,
                 y8i_width=width,
             )
+            # infra1 - optional visualization
+            if self.show_views:
+                self._start_visualization_in_tmux(
+                    port, "infra1", single_width, height, is_y8i=True, y8i_width=width
+                )
             time.sleep(0.5)
 
-            # infra2
+            # infra2 - gscam for ROS2
             self._start_single_stream_in_tmux(
                 port,
                 "infra2",
@@ -626,11 +633,20 @@ class VideoStreamReceiver:
                 is_y8i=True,
                 y8i_width=width,
             )
+            # infra2 - optional visualization
+            if self.show_views:
+                self._start_visualization_in_tmux(
+                    port, "infra2", single_width, height, is_y8i=True, y8i_width=width
+                )
             time.sleep(0.5)
         else:
+            # gscam for ROS2
             self._start_single_stream_in_tmux(
                 port, stream_name, encoding, width, height, intrinsics
             )
+            # Optional visualization
+            if self.show_views:
+                self._start_visualization_in_tmux(port, stream_name, width, height)
             time.sleep(0.5)
 
     def _start_single_stream_in_tmux(
@@ -653,7 +669,7 @@ class VideoStreamReceiver:
             info_file_url = f"file://{calib_file}"
             tmp_file_path = None
         else:
-            print(
+            LOGGER.info(
                 f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
             )
             tmp_file = tempfile.NamedTemporaryFile(
@@ -712,15 +728,15 @@ class VideoStreamReceiver:
         # Create window name
         window_name = f"{stream_name}_{port}"
 
-        print(f"\n[{stream_name}] Starting on port {port}")
-        print(f"  Topic: {image_topic}")
-        print(f"  Encoding: {encoding.upper()}")
+        LOGGER.info(f"\n[{stream_name}] Starting on port {port}")
+        LOGGER.info(f"  Topic: {image_topic}")
+        LOGGER.info(f"  Encoding: {encoding.upper()}")
 
         # Run in tmux
         self.tmux_manager.create_window(window_name, gscam_cmd)
 
     def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
-        """Build GStreamer pipeline for standard streams."""
+        """Build GStreamer pipeline for standard streams (ROS2 only, no visualization)."""
         if stream_name == "depth":
             # Depth stream: H264 -> GRAY16_LE
             pipeline = (
@@ -752,21 +768,10 @@ class VideoStreamReceiver:
         else:
             return ""
 
-        # Add visualization if enabled
-        if self.show_views:
-            display_width = int(width * self.view_scale)
-            display_height = int(height * self.view_scale)
-            pipeline += (
-                f" ! tee name=t "
-                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                f"t. ! queue"
-            )
-
         return pipeline
 
     def _build_y8i_pipeline(self, port: int, stream_name: str, y8i_width: int, height: int) -> str:
-        """Build GStreamer pipeline for Y8I streams (infra1/infra2)."""
+        """Build GStreamer pipeline for Y8I streams (ROS2 only, no visualization)."""
         single_width = y8i_width // 2
 
         pipeline = (
@@ -783,16 +788,121 @@ class VideoStreamReceiver:
         else:  # infra2
             pipeline += f" ! videocrop left={single_width}"
 
-        # Add visualization if enabled
-        if self.show_views:
-            display_width = int(single_width * self.view_scale)
-            display_height = int(height * self.view_scale)
-            pipeline += (
-                f" ! tee name=t "
-                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                f"t. ! queue"
+        return pipeline
+
+    def _start_visualization_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        width: int,
+        height: int,
+        is_y8i: bool = False,
+        y8i_width: int = None,
+    ):
+        """Start a separate visualization window for a stream."""
+        display_width = int(width * self.view_scale)
+        display_height = int(height * self.view_scale)
+
+        # Build visualization pipeline (independent of gscam)
+        if is_y8i:
+            viz_pipeline = self._build_visualization_pipeline_y8i(
+                port, stream_name, y8i_width, height, display_width, display_height
             )
+        else:
+            viz_pipeline = self._build_visualization_pipeline(
+                port, stream_name, width, height, display_width, display_height
+            )
+
+        window_name = f"viz_{stream_name}_{port}"
+
+        # Create gst-launch command
+        gst_cmd = f"gst-launch-1.0 -v {viz_pipeline}"
+
+        LOGGER.info(f"  [VIZ] Starting visualization for {stream_name}")
+        self.tmux_manager.create_window(window_name, gst_cmd)
+
+    def _build_visualization_pipeline(
+        self,
+        port: int,
+        stream_name: str,
+        width: int,
+        height: int,
+        display_width: int,
+        display_height: int,
+    ) -> str:
+        """Build independent visualization pipeline."""
+        if stream_name == "depth":
+            # Depth visualization with normalization for better viewing
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
+                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! queue max-size-buffers=2 leaky=downstream "
+                f"! videoconvert "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        elif stream_name == "color":
+            # Color visualization
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
+                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        elif stream_name.startswith("infra"):
+            # Infrared visualization
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
+                f"! rtpjitterbuffer latency=100 "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        else:
+            return ""
+
+        return pipeline
+
+    def _build_visualization_pipeline_y8i(
+        self,
+        port: int,
+        stream_name: str,
+        y8i_width: int,
+        height: int,
+        display_width: int,
+        display_height: int,
+    ) -> str:
+        """Build independent visualization pipeline for Y8I streams."""
+        single_width = y8i_width // 2
+
+        pipeline = (
+            f"udpsrc port={port} buffer-size=2097152 "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=99" '
+            f"! rtpjitterbuffer latency=100 "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+            f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
+        )
+
+        # Add videocrop to split left/right
+        if stream_name == "infra1":
+            pipeline += f" ! videocrop right={single_width}"
+        else:  # infra2
+            pipeline += f" ! videocrop left={single_width}"
+
+        # Add scaling and display
+        pipeline += (
+            f" ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+            f"! videoconvert "
+            f"! autovideosink sync=false"
+        )
 
         return pipeline
 
@@ -826,7 +936,7 @@ class VideoStreamReceiver:
         for config_dir in config_paths:
             filepath = config_dir / filename
             if filepath.exists():
-                print(f"  ✓ Found calibration file: {filepath}")
+                LOGGER.info(f"  ✓ Found calibration file: {filepath}")
                 return str(filepath.absolute())
 
         return None
@@ -879,7 +989,7 @@ projection_matrix:
         """Wait until shutdown is requested."""
         try:
             self.tmux_manager.attach_info()
-            print("\nAll receivers running. Press Ctrl+C to stop.\n")
+            LOGGER.info("\nAll receivers running. Press Ctrl+C to stop.\n")
             self._shutdown_event.wait()
         except KeyboardInterrupt:
             pass
@@ -887,11 +997,11 @@ projection_matrix:
     def stop_all(self):
         """Stop all video receivers and tmux session."""
         self._shutdown_event.set()
-        print("\n\nStopping all receivers...")
+        LOGGER.info("\n\nStopping all receivers...")
         try:
             self.tmux_manager.kill_session()
         except Exception as e:
-            print(f"tmux cleanup warning: {e}")
+            LOGGER.info(f"tmux cleanup warning: {e}")
 
 
 def main():
@@ -954,24 +1064,24 @@ def main():
                     widths.append(width)
                 heights.append(height)
 
-            print(f"Using {args.preset.upper()} preset")
+            LOGGER.info(f"Using {args.preset.upper()} preset")
         else:
-            print(f"Error: Preset {args.preset} not found")
+            LOGGER.info(f"Error: Preset {args.preset} not found")
             sys.exit(1)
     else:
-        print("Error: --preset required (d435i, d455, d415, l515)")
+        LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
         sys.exit(1)
 
-    print(f"\n{'='*70}")
-    print("VIRTUAL REALSENSE CAMERA RECEIVER")
-    print(f"{'='*70}")
-    print(f"Camera Name: {camera_cfg['camera_name']}")
-    print(f"IMU Port: {network_cfg['imu_port']}")
-    print(f"Local IP: {receiver_cfg['local_ip']}")
-    print("\nVideo Streams:")
+    LOGGER.info(f"\n{'='*70}")
+    LOGGER.info("VIRTUAL REALSENSE CAMERA RECEIVER")
+    LOGGER.info(f"{'='*70}")
+    LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
+    LOGGER.info(f"IMU Port: {network_cfg['imu_port']}")
+    LOGGER.info(f"Local IP: {receiver_cfg['local_ip']}")
+    LOGGER.info("\nVideo Streams:")
     for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
-        print(f"  {stream:10s} - Port {port} ({enc.upper()})")
-    print(f"{'='*70}\n")
+        LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
+    LOGGER.info(f"{'='*70}\n")
 
     # Initialize ROS2
     rclpy.init()
@@ -1006,40 +1116,40 @@ def main():
         video_receiver.start_stream(port, stream, encoding, stream_width, stream_height, intrinsics)
 
     time.sleep(1)
-    print(f"\n{'='*70}")
-    print("ALL RECEIVERS STARTED")
-    print(f"{'='*70}")
+    LOGGER.info(f"\n{'='*70}")
+    LOGGER.info("ALL RECEIVERS STARTED")
+    LOGGER.info(f"{'='*70}")
 
-    print("\nPublishing ROS2 topics:")
-    print(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
-    print(f"  /{camera_cfg['camera_name']}/color/image_raw")
+    LOGGER.info("\nPublishing ROS2 topics:")
+    LOGGER.info(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
+    LOGGER.info(f"  /{camera_cfg['camera_name']}/color/image_raw")
 
     # Check if infra_stereo is present
     if "infra_stereo" in stream_names:
-        print(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
-        print(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
     else:
-        print(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
         if "infra2" in stream_names:
-            print(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
+            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
 
-    print(f"  /{camera_cfg['camera_name']}/imu")
+    LOGGER.info(f"  /{camera_cfg['camera_name']}/imu")
     if receiver_cfg.get("publish_odom"):
-        print(f"  /{camera_cfg['camera_name']}/odom")
-    print(f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames")
+        LOGGER.info(f"  /{camera_cfg['camera_name']}/odom")
+    LOGGER.info(f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames")
 
     # Wait for shutdown
     try:
         video_receiver.wait()
     except KeyboardInterrupt:
-        print("\n\nShutting down...")
+        LOGGER.info("\n\nShutting down...")
 
     # Cleanup
     video_receiver.stop_all()
     virtual_camera.shutdown()
     virtual_camera.destroy_node()
     rclpy.shutdown()
-    print("✓ Shutdown complete")
+    LOGGER.info("✓ Shutdown complete")
 
 
 if __name__ == "__main__":

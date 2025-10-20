@@ -12,6 +12,8 @@ from typing import Any
 
 import yaml
 
+from utils.logger import LOGGER
+
 
 class RealSenseCameraInfoParser:
     """Parser for RealSense camera intrinsic parameters."""
@@ -34,10 +36,10 @@ class RealSenseCameraInfoParser:
             )
             return result.stdout
         except subprocess.CalledProcessError as e:
-            print(f"Command execution failed: {e}")
+            LOGGER.info(f"Command execution failed: {e}")
             return None
         except FileNotFoundError:
-            print(
+            LOGGER.info(
                 "rs-enumerate-devices command not found. "
                 "Please ensure RealSense SDK is installed."
             )
@@ -55,7 +57,7 @@ class RealSenseCameraInfoParser:
                 break
 
         if start_idx == -1:
-            print("Intrinsic Parameters section not found")
+            LOGGER.info("Intrinsic Parameters section not found")
             return
 
         # Find the end position (Motion Intrinsic or Extrinsic)
@@ -234,7 +236,7 @@ class RealSenseCameraInfoParser:
             resolutions = self.camera_data[stream_type]
 
             if not resolutions:
-                print(f"⚠  Warning: No data found for {stream_type} stream")
+                LOGGER.info(f"⚠  Warning: No data found for {stream_type} stream")
                 continue
 
             # 1. Save overview file containing all resolutions
@@ -255,8 +257,8 @@ class RealSenseCameraInfoParser:
                     sort_keys=False,
                 )
 
-            print(f"✓ Saved {stream_type} overview to {filepath}")
-            print(
+            LOGGER.info(f"✓ Saved {stream_type} overview to {filepath}")
+            LOGGER.info(
                 f"  Contains {len(resolutions)} resolutions: "
                 f"{', '.join(sorted(resolutions.keys()))}"
             )
@@ -280,65 +282,59 @@ class RealSenseCameraInfoParser:
                         sort_keys=False,
                     )
 
-            print(f"  ✓ Generated {len(resolutions)} individual resolution config files")
-            print()
+            LOGGER.info(f"  ✓ Generated {len(resolutions)} individual resolution config files")
 
 
 def main():
     """Main entry point."""
-    print("=" * 70)
-    print("RealSense Camera Info Parser for ROS 2")
-    print("=" * 70)
-    print()
+    LOGGER.info("=" * 70)
+    LOGGER.info("RealSense Camera Info Parser for ROS 2")
+    LOGGER.info("=" * 70)
 
     parser = RealSenseCameraInfoParser()
 
     # Method 1: Execute rs-enumerate-devices command
-    print("Running rs-enumerate-devices -c ...")
+    LOGGER.info("Running rs-enumerate-devices -c ...")
     output = parser.run_rs_enumerate()
 
     # Method 2: If command fails, try reading from file
     if not output:
-        print("\nAttempting to read from file...")
+        LOGGER.info("\nAttempting to read from file...")
         try:
             with open("rs_output.txt", encoding="utf-8") as f:
                 output = f.read()
-            print("✓ Successfully read data from rs_output.txt")
+            LOGGER.info("✓ Successfully read data from rs_output.txt")
         except FileNotFoundError:
-            print("❌ Unable to obtain camera information")
-            print("\nTip: You can save the output of 'rs-enumerate-devices -c'")
-            print("     to rs_output.txt and run this script again")
+            LOGGER.info("❌ Unable to obtain camera information")
+            LOGGER.info("\nTip: You can save the output of 'rs-enumerate-devices -c'")
+            LOGGER.info("     to rs_output.txt and run this script again")
             return
     else:
-        print("✓ Successfully executed command and obtained camera information")
-
-    print()
+        LOGGER.info("✓ Successfully executed command and obtained camera information")
 
     # Parse intrinsic data
-    print("Parsing camera parameters...")
+    LOGGER.info("Parsing camera parameters...")
     parser.parse_intrinsics_section(output)
 
     # Display parsing summary
-    print("\nParsing Summary:")
-    print(f"  - Depth:    {len(parser.camera_data['depth'])} resolutions")
-    print(f"  - Color:    {len(parser.camera_data['color'])} resolutions")
-    print(f"  - Infrared: {len(parser.camera_data['infrared'])} resolutions")
-    print()
+    LOGGER.info("\nParsing Summary:")
+    LOGGER.info(f"  - Depth:    {len(parser.camera_data['depth'])} resolutions")
+    LOGGER.info(f"  - Color:    {len(parser.camera_data['color'])} resolutions")
+    LOGGER.info(f"  - Infrared: {len(parser.camera_data['infrared'])} resolutions")
 
     # Save to files
-    print("Generating ROS 2 camera_info configuration files...")
-    print()
+    LOGGER.info("Generating ROS 2 camera_info configuration files...")
     parser.save_to_files()
 
-    print("=" * 70)
-    print("✓ Complete!")
-    print("=" * 70)
-    print("\nGenerated files are located in the camera_info/ directory:")
-    print("  - depth_camera_info.yaml")
-    print("  - color_camera_info.yaml")
-    print("  - infrared_camera_info.yaml")
-    print("\nYou can use these configurations in ROS 2 launch files:")
-    print("  camera_info_url: file://$(find-pkg-share pkg)/config/depth_camera_info.yaml")
+    LOGGER.info("=" * 70)
+    LOGGER.info("✓ Complete!")
+    LOGGER.info("=" * 70)
+    LOGGER.info("\nGenerated files are located in the camera_info/ directory:")
+    LOGGER.info("  - depth_camera_info.yaml")
+    LOGGER.info("  - color_camera_info.yaml")
+    LOGGER.info("  - infrared_camera_info.yaml")
+    LOGGER.info("\nYou can use these configurations in ROS 2 launch files:")
+    LOGGER.info("  camera_info_url: file://$(find-pkg-share pkg)/config/depth_camera_info.yaml")
 
 
 if __name__ == "__main__":

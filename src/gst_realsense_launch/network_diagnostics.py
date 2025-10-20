@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
+from utils.logger import LOGGER
+
 try:
     import yaml
 except ImportError:
@@ -94,13 +96,13 @@ class NetworkDiagnostics:
         Returns:
             True if all critical tests pass, False otherwise.
         """
-        print(f"\n{'='*70}")
-        print("REALSENSE STREAMING NETWORK DIAGNOSTICS")
-        print(f"{'='*70}")
-        print(f"Target Host: {self.target_host}")
-        print(f"Base Port: {self.base_port}")
-        print(f"Metadata Port: {self.metadata_port}")
-        print(f"{'='*70}\n")
+        LOGGER.info(f"\n{'='*70}")
+        LOGGER.info("REALSENSE STREAMING NETWORK DIAGNOSTICS")
+        LOGGER.info(f"{'='*70}")
+        LOGGER.info(f"Target Host: {self.target_host}")
+        LOGGER.info(f"Base Port: {self.base_port}")
+        LOGGER.info(f"Metadata Port: {self.metadata_port}")
+        LOGGER.info(f"{'='*70}\n")
 
         # Run tests in order
         tests = [
@@ -124,7 +126,6 @@ class NetworkDiagnostics:
             result = test()
             self.results.append(result)
 
-            # Print result
             status = "✓" if result.success else "✗"
             color = "\033[92m" if result.success else "\033[91m"
             reset = "\033[0m"
@@ -140,20 +141,18 @@ class NetworkDiagnostics:
                     color = "\033[93m"  # Yellow for info warnings
                     status = "⚠"
 
-            print(f"{color}{status}{reset} {result.test_name}{info_marker}")
-            print(f"  {result.message}")
+            LOGGER.info(f"{color}{status}{reset} {result.test_name}{info_marker}")
+            LOGGER.info(f"  {result.message}")
 
             if result.details:
                 for key, value in result.details.items():
-                    print(f"  {key}: {value}")
-
-            print()
+                    LOGGER.info(f"  {key}: {value}")
 
             if not result.success:
                 all_passed = False
 
-        # Print summary
-        print(f"{'='*70}")
+        # LOGGER.info summary
+        LOGGER.info(f"{'='*70}")
         passed = sum(1 for r in self.results if r.success)
         total = len(self.results)
 
@@ -174,14 +173,12 @@ class NetworkDiagnostics:
             if any(test_type in r.test_name for test_type in info_tests) and not r.success
         )
 
-        print(f"SUMMARY: {passed}/{total} tests passed", end="")
+        LOGGER.info(f"SUMMARY: {passed}/{total} tests passed")
         if info_count > 0:
-            print(f" ({info_count} informational)")
-        else:
-            print()
+            LOGGER.info(f" ({info_count} informational)")
 
         if critical_passed:
-            print("✓ All critical tests passed - streaming should work!")
+            LOGGER.info("✓ All critical tests passed - streaming should work!")
             suggestions = []
             if not include_stress_test:
                 suggestions.append("   • Run with --stress-test flag for load testing")
@@ -189,20 +186,20 @@ class NetworkDiagnostics:
                 suggestions.append("   • Run with --system-ports to test ROS2/Zenoh ports")
 
             if suggestions:
-                print("\n💪 Want more confidence?")
+                LOGGER.info("\n💪 Want more confidence?")
                 for suggestion in suggestions:
-                    print(suggestion)
+                    LOGGER.info(suggestion)
         else:
-            print("✗ Some critical tests failed - streaming may have issues")
+            LOGGER.info("✗ Some critical tests failed - streaming may have issues")
 
         if info_count > 0:
-            print("\n💡 Tip: Informational test failures are expected when:")
-            print("   - ICMP/ping is blocked by firewall (very common)")
-            print("   - iperf3 server is not running on target")
-            print("   - System ports are not configured or in use by other services")
-            print("   These don't affect RealSense UDP streaming functionality")
+            LOGGER.info("\n💡 Tip: Informational test failures are expected when:")
+            LOGGER.info("   - ICMP/ping is blocked by firewall (very common)")
+            LOGGER.info("   - iperf3 server is not running on target")
+            LOGGER.info("   - System ports are not configured or in use by other services")
+            LOGGER.info("   These don't affect RealSense UDP streaming functionality")
 
-        print(f"{'='*70}\n")
+        LOGGER.info(f"{'='*70}\n")
 
         return critical_passed  # Return based on critical tests only
 
@@ -473,7 +470,7 @@ class NetworkDiagnostics:
             bytes_sent = 0
             packets_sent = 0
 
-            print("  Running built-in bandwidth test...", end="", flush=True)
+            LOGGER.info("  Running built-in bandwidth test...")
 
             while time.time() - start_time < duration:
                 try:
@@ -486,7 +483,7 @@ class NetworkDiagnostics:
             elapsed = time.time() - start_time
             sock.close()
 
-            print(" Done!")
+            LOGGER.info(" Done!")
 
             # Calculate throughput
             bandwidth_mbps = (bytes_sent * 8) / (elapsed * 1_000_000)
@@ -646,7 +643,7 @@ class NetworkDiagnostics:
             pass
 
         # ICMP failed, fallback to UDP-based latency test
-        print("  ICMP blocked, using UDP latency test...", end="", flush=True)
+        LOGGER.info("  ICMP blocked, using UDP latency test...")
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -682,7 +679,7 @@ class NetworkDiagnostics:
                     pass
 
             sock.close()
-            print(" Done!")
+            LOGGER.info(" Done!")
 
             if latencies:
                 avg_latency = sum(latencies) / len(latencies)
@@ -728,7 +725,7 @@ class NetworkDiagnostics:
     def test_stress(self) -> NetworkTestResult:
         """Perform stress test simulating real streaming conditions."""
         try:
-            print("  Running stress test (10 seconds)...", end="", flush=True)
+            LOGGER.info("  Running stress test (10 seconds)...")
 
             # Simulate 4 streams (color, depth, infrared1, infrared2)
             num_streams = 4
@@ -790,7 +787,7 @@ class NetworkDiagnostics:
 
             elapsed = time.time() - start_time
 
-            print(" Done!")
+            LOGGER.info(" Done!")
 
             # Calculate statistics
             actual_bitrate_mbps = (bytes_sent * 8) / (elapsed * 1_000_000)
@@ -868,7 +865,7 @@ class NetworkDiagnostics:
                     },
                 )
 
-            print(f"  Testing {len(ports_to_test)} system ports...", end="", flush=True)
+            LOGGER.info(f"  Testing {len(ports_to_test)} system ports...")
 
             # Test each port
             accessible_ports = 0
@@ -887,7 +884,7 @@ class NetworkDiagnostics:
                 except Exception as e:
                     port_details[f"{description} ({port})"] = f"Error: {str(e)[:30]}"
 
-            print(" Done!")
+            LOGGER.info(" Done!")
 
             success_rate = accessible_ports / len(ports_to_test)
 
@@ -931,7 +928,7 @@ class NetworkDiagnostics:
         with open(filename, "w") as f:
             json.dump(data, f, indent=2)
 
-        print(f"Results exported to {filename}")
+        LOGGER.info(f"Results exported to {filename}")
 
 
 def _try_int(value: Any) -> int | None:
@@ -988,8 +985,8 @@ def load_config(config_path: str = None, ports_path: str = None) -> LoadedConfig
     }
     # If no YAML support, return defaults
     if yaml is None:
-        print("Warning: PyYAML not installed. Using default values.")
-        print("Install with: pip install pyyaml")
+        LOGGER.info("Warning: PyYAML not installed. Using default values.")
+        LOGGER.info("Install with: pip install pyyaml")
         return default_config
 
     full_config: dict[str, Any] = {}
@@ -1015,7 +1012,7 @@ def load_config(config_path: str = None, ports_path: str = None) -> LoadedConfig
             with open(config_path) as f:
                 config = yaml.safe_load(f)
 
-            print(f"✓ Loaded configuration from: {config_path}")
+            LOGGER.info(f"✓ Loaded configuration from: {config_path}")
             full_config_data.update(config)
 
             # Extract network configuration
@@ -1032,9 +1029,9 @@ def load_config(config_path: str = None, ports_path: str = None) -> LoadedConfig
             )
 
         except Exception as e:
-            print(f"Warning: Failed to load config file: {e}")
+            LOGGER.info(f"Warning: Failed to load config file: {e}")
     else:
-        print(f"Warning: Config file not found. Using default values.")
+        LOGGER.info(f"Warning: Config file not found. Using default values.")
 
     # Search for ports.yaml
     if ports_path is None:
@@ -1057,11 +1054,11 @@ def load_config(config_path: str = None, ports_path: str = None) -> LoadedConfig
             with open(ports_path) as f:
                 ports_config = yaml.safe_load(f)
 
-            print(f"✓ Loaded ports configuration from: {ports_path}")
+            LOGGER.info(f"✓ Loaded ports configuration from: {ports_path}")
             full_config_data["ports"] = ports_config
 
         except Exception as e:
-            print(f"Warning: Failed to load ports file: {e}")
+            LOGGER.info(f"Warning: Failed to load ports file: {e}")
 
     # Merge full config into default config
     default_config["full_config"] = full_config_data
@@ -1146,17 +1143,16 @@ Examples:
     if target_host is None:
         parser.error("No target host specified. Provide it as argument or in config.yaml")
 
-    print(f"Configuration:")
-    print(f"  Host: {target_host}")
-    print(f"  Base Port: {base_port}")
-    print(f"  Metadata Port: {metadata_port}")
+    LOGGER.info(f"Configuration:")
+    LOGGER.info(f"  Host: {target_host}")
+    LOGGER.info(f"  Base Port: {base_port}")
+    LOGGER.info(f"  Metadata Port: {metadata_port}")
     if args.system_ports:
         ports_cfg = full_config.get("ports")
         if ports_cfg:
-            print(f"  System Ports: Loaded from ports.yaml")
+            LOGGER.info(f"  System Ports: Loaded from ports.yaml")
         else:
-            print(f"  System Ports: Not found (will skip)")
-    print()
+            LOGGER.info(f"  System Ports: Not found (will skip)")
 
     # Run diagnostics
     diag = NetworkDiagnostics(target_host, base_port, metadata_port, full_config)
