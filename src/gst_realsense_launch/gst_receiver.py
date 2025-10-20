@@ -11,6 +11,7 @@ Features:
 - Odometry publishing (for navigation stack)
 - Optional live visualization of received streams
 - Full compatibility with isaac_ros_nvblox
+- Tmux-based stream management (like sender)
 """
 
 import argparse
@@ -53,6 +54,92 @@ except ImportError:
 
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
 from gst_realsense_launch.rs_core import StreamStrategyFactory
+
+
+class TmuxSessionManager:
+    """Manages tmux session for multiple GStreamer receiver pipelines."""
+
+    def __init__(self, session_name: str = "realsense_receiver"):
+        self.session_name = session_name
+        self.window_count = 0
+        self._check_tmux()
+        self._create_session()
+
+    def _check_tmux(self):
+        """Check if tmux is available."""
+        try:
+            subprocess.run(["tmux", "-V"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError("tmux is not installed. Please install tmux: sudo apt install tmux")
+
+    def _create_session(self):
+        """Create tmux session if it doesn't exist."""
+        # Check if session already exists
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name], capture_output=True
+        )
+
+        if result.returncode != 0:
+            # Create new detached session
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", self.session_name, "-n", "control"], check=True
+            )
+            print(f"✓ Created tmux session '{self.session_name}'")
+        else:
+            print(f"✓ Using existing tmux session '{self.session_name}'")
+
+    def create_window(self, window_name: str, command: str):
+        """Create a new tmux window and run command in it.
+
+        Args:
+            window_name: Name for the tmux window
+            command: Command to execute in the window
+        """
+        self.window_count += 1
+
+        # Create new window
+        subprocess.run(
+            [
+                "tmux",
+                "new-window",
+                "-t",
+                f"{self.session_name}:{self.window_count}",
+                "-n",
+                window_name,
+            ],
+            check=True,
+        )
+
+        # Send command to the window
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                f"{self.session_name}:{window_name}",
+                command,
+                "C-m",  # Enter key
+            ],
+            check=True,
+        )
+
+        print(f"  ✓ Created window '{window_name}' in tmux")
+
+    def attach_info(self):
+        """Display instructions for attaching to the tmux session."""
+        print(f"\nTo view the streams, attach to tmux session:")
+        print(f"  tmux attach -t {self.session_name}")
+        print(f"\nTmux navigation:")
+        print(f"  Ctrl+b n : next window")
+        print(f"  Ctrl+b p : previous window")
+        print(f"  Ctrl+b [0-9] : select window by number")
+        print(f"  Ctrl+b d : detach from session")
+        print(f"  Ctrl+b & : kill current window")
+
+    def kill_session(self):
+        """Kill the entire tmux session."""
+        subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
+        print(f"✓ Killed tmux session '{self.session_name}'")
 
 
 class VirtualRealSenseNode(Node):
@@ -103,10 +190,12 @@ class VirtualRealSenseNode(Node):
         # UDP socket for IMU data
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind to localhost by default for security, allow override via environment variable
+        # RealSense network streaming requires accepting remote connections
+        # Security note: For production, set local_ip to specific interface IP
+        # For local testing only: set local_ip to 127.0.0.1
         bind_address = self.receiver_config.get(
             "local_ip", "0.0.0.0"
-        )  # nosec B104 - intentional for remote streaming
+        )  # nosec B104 - required for remote streaming
         self.socket.bind((bind_address, imu_port))
         self.socket.settimeout(1.0)
 
@@ -136,6 +225,11 @@ class VirtualRealSenseNode(Node):
 
         self.get_logger().info(f'Virtual RealSense camera "{camera_name}" initialized')
         self.get_logger().info(f"Listening for IMU data on {bind_address}:{imu_port}")
+        if bind_address == "0.0.0.0":
+            self.get_logger().warn(
+                "IMU receiver is listening on all interfaces. "
+                "Set local_ip in config.yaml to restrict access."
+            )
 
     def _create_publishers(self):
         """Create all ROS2 publishers for camera streams and IMU."""
@@ -445,10 +539,10 @@ class VirtualRealSenseNode(Node):
 
 
 class VideoStreamReceiver:
-    """Manages video stream reception and ROS2 publishing with optional visualization.
+    """Manages video stream reception and ROS2 publishing using tmux.
 
     This class handles multiple video streams (depth, color, infrared) and
-    publishes them to appropriate ROS2 topics using gscam.
+    publishes them to appropriate ROS2 topics using gscam in separate tmux windows.
     """
 
     def __init__(
@@ -471,8 +565,8 @@ class VideoStreamReceiver:
         self.show_views = show_views
         self.view_scale = view_scale
 
-        self.processes: list = []
-        self.threads: list = []
+        self.tmux_manager = TmuxSessionManager()
+        self._shutdown_event = threading.Event()
 
     def start_stream(
         self,
@@ -491,33 +585,198 @@ class VideoStreamReceiver:
             single_width = width // 2
 
             # infra1
-            thread1 = threading.Thread(
-                target=self._run_receiver_with_y8i_split,
-                args=(port, "infra1", encoding, width, height, intrinsics),
-                daemon=True,
+            self._start_single_stream_in_tmux(
+                port,
+                "infra1",
+                encoding,
+                single_width,
+                height,
+                intrinsics,
+                is_y8i=True,
+                y8i_width=width,
             )
-            self.threads.append(thread1)
-            thread1.start()
             time.sleep(0.5)
 
             # infra2
-            thread2 = threading.Thread(
-                target=self._run_receiver_with_y8i_split,
-                args=(port, "infra2", encoding, width, height, intrinsics),
-                daemon=True,
+            self._start_single_stream_in_tmux(
+                port,
+                "infra2",
+                encoding,
+                single_width,
+                height,
+                intrinsics,
+                is_y8i=True,
+                y8i_width=width,
             )
-            self.threads.append(thread2)
-            thread2.start()
             time.sleep(0.5)
         else:
-            thread = threading.Thread(
-                target=self._run_receiver,
-                args=(port, stream_name, encoding, width, height, intrinsics),
-                daemon=True,
+            self._start_single_stream_in_tmux(
+                port, stream_name, encoding, width, height, intrinsics
             )
-            self.threads.append(thread)
-            thread.start()
             time.sleep(0.5)
+
+    def _start_single_stream_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+        is_y8i: bool = False,
+        y8i_width: int = None,
+    ):
+        """Start a single stream receiver in a tmux window."""
+
+        # Get calibration file
+        calib_file = self._get_calibration_file_path(stream_name, width, height)
+
+        if calib_file:
+            info_file_url = f"file://{calib_file}"
+            tmp_file_path = None
+        else:
+            print(
+                f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
+            )
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
+            self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
+            info_file_url = f"file://{tmp_file.name}"
+            tmp_file_path = tmp_file.name
+            tmp_file.close()
+
+        # Build GStreamer pipeline
+        if is_y8i:
+            gst_config = self._build_y8i_pipeline(port, stream_name, y8i_width, height)
+        else:
+            gst_config = self._build_pipeline(port, stream_name, width, height)
+
+        # Determine topics and encoding
+        if stream_name == "depth":
+            image_topic = f"/{self.camera_name}/depth/image_rect_raw"
+            info_topic = f"/{self.camera_name}/depth/camera_info"
+            frame_id = f"{self.camera_name}_depth_optical_frame"
+            image_encoding = "16UC1"
+        elif stream_name == "color":
+            image_topic = f"/{self.camera_name}/color/image_raw"
+            info_topic = f"/{self.camera_name}/color/camera_info"
+            frame_id = f"{self.camera_name}_color_optical_frame"
+            image_encoding = "bgr8"
+        elif stream_name.startswith("infra"):
+            image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
+            info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
+            frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
+            image_encoding = "mono8"
+        else:
+            return
+
+        # Build gscam command
+        gscam_cmd_parts = [
+            "ros2 run gscam gscam_node",
+            "--ros-args",
+            f"-p gscam_config:='{gst_config}'",
+            f"-p camera_name:={self.camera_name}_{stream_name}",
+            f"-p camera_info_url:={info_file_url}",
+            f"-p frame_id:={frame_id}",
+            "-p sync_sink:=false",
+            f"-p image_encoding:={image_encoding}",
+            f"-r camera/image_raw:={image_topic}",
+            f"-r camera/camera_info:={info_topic}",
+        ]
+
+        gscam_cmd = " ".join(gscam_cmd_parts)
+
+        # Add cleanup of temp file if needed
+        if tmp_file_path:
+            gscam_cmd = f"trap 'rm -f {tmp_file_path}' EXIT; {gscam_cmd}"
+
+        # Create window name
+        window_name = f"{stream_name}_{port}"
+
+        print(f"\n[{stream_name}] Starting on port {port}")
+        print(f"  Topic: {image_topic}")
+        print(f"  Encoding: {encoding.upper()}")
+
+        # Run in tmux
+        self.tmux_manager.create_window(window_name, gscam_cmd)
+
+    def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
+        """Build GStreamer pipeline for standard streams."""
+        if stream_name == "depth":
+            # Depth stream: H264 -> GRAY16_LE
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
+                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! queue max-size-buffers=2 leaky=downstream "
+                f"! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE"
+            )
+        elif stream_name == "color":
+            # Color stream: H264 -> BGR
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
+                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoconvert n-threads=4 ! video/x-raw,format=BGR"
+            )
+        elif stream_name.startswith("infra"):
+            # Infrared stream: H264 -> GRAY8
+            pipeline = (
+                f"udpsrc port={port} buffer-size=2097152 "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
+                f"! rtpjitterbuffer latency=100 "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+                f"! videoconvert ! video/x-raw,format=GRAY8"
+            )
+        else:
+            return ""
+
+        # Add visualization if enabled
+        if self.show_views:
+            display_width = int(width * self.view_scale)
+            display_height = int(height * self.view_scale)
+            pipeline += (
+                f" ! tee name=t "
+                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                f"t. ! queue"
+            )
+
+        return pipeline
+
+    def _build_y8i_pipeline(self, port: int, stream_name: str, y8i_width: int, height: int) -> str:
+        """Build GStreamer pipeline for Y8I streams (infra1/infra2)."""
+        single_width = y8i_width // 2
+
+        pipeline = (
+            f"udpsrc port={port} buffer-size=2097152 "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=99" '
+            f"! rtpjitterbuffer latency=100 "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
+            f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
+        )
+
+        # Add videocrop to split left/right
+        if stream_name == "infra1":
+            pipeline += f" ! videocrop right={single_width}"
+        else:  # infra2
+            pipeline += f" ! videocrop left={single_width}"
+
+        # Add visualization if enabled
+        if self.show_views:
+            display_width = int(single_width * self.view_scale)
+            display_height = int(height * self.view_scale)
+            pipeline += (
+                f" ! tee name=t "
+                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
+                f"t. ! queue"
+            )
+
+        return pipeline
 
     def _get_calibration_file_path(
         self,
@@ -525,15 +784,7 @@ class VideoStreamReceiver:
         width: int,
         height: int,
     ) -> str | None:
-        """Get the path to the calibration file for the given stream and resolution.
-
-        Looks for calibration files in src/config/ directory with format:
-        - color_camera_640x480.yaml
-        - depth_camera_640x480.yaml
-        - infrared_camera_640x480.yaml
-
-        Returns None if file doesn't exist.
-        """
+        """Get the path to the calibration file for the given stream and resolution."""
         # Map stream names to file prefixes
         stream_mapping = {
             "depth": "depth",
@@ -561,253 +812,6 @@ class VideoStreamReceiver:
                 return str(filepath.absolute())
 
         return None
-
-    def _run_receiver(
-        self,
-        port: int,
-        stream_name: str,
-        encoding: str,
-        width: int,
-        height: int,
-        intrinsics: CameraIntrinsics | None,
-    ):
-        """Run a receiver for a single video stream."""
-        # First, try to load calibration from existing files
-        calib_file = self._get_calibration_file_path(stream_name, width, height)
-
-        if calib_file:
-            info_file_url = f"file://{calib_file}"
-            tmp_file = None
-        else:
-            print(
-                f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
-            )
-            tmp_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
-            )
-            self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
-            info_file_url = f"file://{tmp_file.name}"
-
-        # Build GStreamer pipeline using tested configuration
-        if stream_name == "depth":
-            # Depth stream: H264 -> GRAY16_LE
-            gst_config = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" '
-                f"! rtpjitterbuffer latency=100 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! queue max-size-buffers=2 leaky=downstream "
-                f"! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE"
-            )
-            image_topic = f"/{self.camera_name}/depth/image_rect_raw"
-            info_topic = f"/{self.camera_name}/depth/camera_info"
-            frame_id = f"{self.camera_name}_depth_optical_frame"
-            image_encoding = "16UC1"
-
-        elif stream_name == "color":
-            # Color stream: H264 -> BGR
-            gst_config = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=98" '
-                f"! rtpjitterbuffer latency=120 drop-on-latency=true "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! videoconvert n-threads=4 ! video/x-raw,format=BGR"
-            )
-            image_topic = f"/{self.camera_name}/color/image_raw"
-            info_topic = f"/{self.camera_name}/color/camera_info"
-            frame_id = f"{self.camera_name}_color_optical_frame"
-            image_encoding = "bgr8"
-
-        elif stream_name.startswith("infra"):
-            # Infrared stream: H264 -> GRAY8
-            gst_config = (
-                f"udpsrc port={port} buffer-size=2097152 "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=97" '
-                f"! rtpjitterbuffer latency=100 "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-                f"! videoconvert ! video/x-raw,format=GRAY8"
-            )
-            image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
-            info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
-            frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
-            image_encoding = "mono8"
-        else:
-            return
-
-        # Add visualization branch if enabled
-        if self.show_views:
-            display_width = int(width * self.view_scale)
-            display_height = int(height * self.view_scale)
-
-            # Add tee and visualization sink
-            viz_pipeline = (
-                f" ! tee name=t "
-                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                f"t. ! queue"
-            )
-            gst_config += viz_pipeline
-
-        # Build gscam command
-        gscam_cmd = [
-            "ros2",
-            "run",
-            "gscam",
-            "gscam_node",
-            "--ros-args",
-            "-p",
-            f"gscam_config:={gst_config}",
-            "-p",
-            f"camera_name:={self.camera_name}_{stream_name}",
-            "-p",
-            f"camera_info_url:={info_file_url}",
-            "-p",
-            f"frame_id:={frame_id}",
-            "-p",
-            "sync_sink:=false",
-            "-p",
-            f"image_encoding:={image_encoding}",
-            "-r",
-            f"camera/image_raw:={image_topic}",
-            "-r",
-            f"camera/camera_info:={info_topic}",
-        ]
-
-        display_status = "with display" if self.show_views else ""
-        print(f"\n[{stream_name}] Starting on port {port} {display_status}")
-        print(f"  Topic: {image_topic}")
-        print(f"  Encoding: {encoding.upper()}")
-
-        proc = subprocess.Popen(gscam_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.processes.append((stream_name, proc))
-
-        # Monitor output
-        try:
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, b""):
-                    if line:
-                        line_str = line.decode("utf-8", errors="ignore").strip()
-                        if "ERROR" in line_str or "started" in line_str.lower():
-                            print(f"  [{stream_name}] {line_str}")
-        except KeyboardInterrupt:
-            pass
-        finally:
-            if tmp_file:
-                os.unlink(tmp_file.name)
-
-    def _run_receiver_with_y8i_split(
-        self,
-        port: int,
-        stream_name: str,  # "infra1" or "infra2"
-        encoding: str,
-        y8i_width: int,  # Full Y8I width (e.g., 1280)
-        height: int,
-        intrinsics: CameraIntrinsics | None,
-    ):
-        """Run receiver for Y8I stream and split into infra1/infra2."""
-        single_width = y8i_width // 2
-
-        # First, try to load calibration from existing files
-        calib_file = self._get_calibration_file_path(stream_name, single_width, height)
-
-        if calib_file:
-            info_file_url = f"file://{calib_file}"
-            tmp_file = None
-        else:
-            print(
-                f"  ⚠ No calibration file found for {stream_name} {single_width}x{height}, using defaults"
-            )
-            tmp_file = tempfile.NamedTemporaryFile(
-                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
-            )
-            self._create_camera_info_file(
-                tmp_file.name, stream_name, single_width, height, intrinsics
-            )
-            info_file_url = f"file://{tmp_file.name}"
-
-        # Build GStreamer pipeline for Y8I with splitting
-        gst_config = (
-            f"udpsrc port={port} buffer-size=2097152 "
-            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=99" '
-            f"! rtpjitterbuffer latency=100 "
-            f"! rtph264depay ! h264parse ! avdec_h264 max-threads=4 "
-            f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
-        )
-
-        # Add videocrop to split left/right
-        # Y8I format is 1280x800 containing two 640x800 images interleaved column-wise
-        if stream_name == "infra1":
-            # Keep left half, crop RIGHT half
-            gst_config += f" ! videocrop right={single_width}"
-        else:  # infra2
-            # Keep right half, crop LEFT half
-            gst_config += f" ! videocrop left={single_width}"
-
-        # Determine topics
-        image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
-        info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
-        frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
-        image_encoding = "mono8"
-
-        # Add visualization branch if enabled
-        if self.show_views:
-            display_width = int(single_width * self.view_scale)
-            display_height = int(height * self.view_scale)
-
-            viz_pipeline = (
-                f" ! tee name=t "
-                f"t. ! queue ! videoscale ! video/x-raw,width={display_width},height={display_height} "
-                f"! videoconvert ! autovideosink sync=false name=viz_{stream_name} "
-                f"t. ! queue"
-            )
-            gst_config += viz_pipeline
-
-        # Build gscam command
-        gscam_cmd = [
-            "ros2",
-            "run",
-            "gscam",
-            "gscam_node",
-            "--ros-args",
-            "-p",
-            f"gscam_config:={gst_config}",
-            "-p",
-            f"camera_name:={self.camera_name}_{stream_name}",
-            "-p",
-            f"camera_info_url:={info_file_url}",
-            "-p",
-            f"frame_id:={frame_id}",
-            "-p",
-            "sync_sink:=false",
-            "-p",
-            f"image_encoding:={image_encoding}",
-            "-r",
-            f"camera/image_raw:={image_topic}",
-            "-r",
-            f"camera/camera_info:={info_topic}",
-        ]
-
-        display_status = "with display" if self.show_views else ""
-        print(f"\n[{stream_name}] Starting on port {port} (from Y8I) {display_status}")
-        print(f"  Topic: {image_topic}")
-        print(f"  Encoding: {encoding.upper()}")
-
-        proc = subprocess.Popen(gscam_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        self.processes.append((stream_name, proc))
-
-        # Monitor output
-        try:
-            if proc.stdout:
-                for line in iter(proc.stdout.readline, b""):
-                    if line:
-                        line_str = line.decode("utf-8", errors="ignore").strip()
-                        if "ERROR" in line_str or "started" in line_str.lower():
-                            print(f"  [{stream_name}] {line_str}")
-        except KeyboardInterrupt:
-            pass
-        finally:
-            if tmp_file:
-                os.unlink(tmp_file.name)
 
     def _create_camera_info_file(
         self,
@@ -853,17 +857,23 @@ projection_matrix:
         with open(filepath, "w") as f:
             f.write(content)
 
+    def wait(self):
+        """Wait until shutdown is requested."""
+        try:
+            self.tmux_manager.attach_info()
+            print("\nAll receivers running. Press Ctrl+C to stop.\n")
+            self._shutdown_event.wait()
+        except KeyboardInterrupt:
+            pass
+
     def stop_all(self):
-        """Stop all video receivers."""
-        print("\nStopping video streams...")
-        for stream_name, proc in self.processes:
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-                print(f"  ✓ Stopped {stream_name}")
-            except Exception:
-                proc.kill()
-                print(f"  ✗ Force killed {stream_name}")
+        """Stop all video receivers and tmux session."""
+        self._shutdown_event.set()
+        print("\n\nStopping all receivers...")
+        try:
+            self.tmux_manager.kill_session()
+        except Exception as e:
+            print(f"tmux cleanup warning: {e}")
 
 
 def main():
@@ -880,6 +890,7 @@ def main():
     parser.add_argument("--base-port", type=int, help="Override base port")
     parser.add_argument("--imu-port", type=int, help="Override IMU port")
     parser.add_argument("--camera-name", help="Override camera name")
+    parser.add_argument("--local-ip", help="Local IP address to bind to (default: 0.0.0.0)")
     parser.add_argument("--show-views", action="store_true", help="Display received video streams")
     parser.add_argument("--view-scale", type=float, help="Display window scale factor")
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU receiver")
@@ -938,6 +949,7 @@ def main():
     print(f"{'='*70}")
     print(f"Camera Name: {camera_cfg['camera_name']}")
     print(f"IMU Port: {network_cfg['imu_port']}")
+    print(f"Local IP: {receiver_cfg['local_ip']}")
     print("\nVideo Streams:")
     for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
         print(f"  {stream:10s} - Port {port} ({enc.upper()})")
@@ -959,7 +971,7 @@ def main():
     ros_thread.start()
     time.sleep(1)
 
-    # Start video receivers
+    # Start video receivers in tmux
     video_receiver = VideoStreamReceiver(
         camera_name=camera_cfg["camera_name"],
         config_loader=config_loader,
@@ -975,7 +987,11 @@ def main():
         )
         video_receiver.start_stream(port, stream, encoding, stream_width, stream_height, intrinsics)
 
-    print("\n✓ All receivers started")
+    time.sleep(1)
+    print(f"\n{'='*70}")
+    print("ALL RECEIVERS STARTED")
+    print(f"{'='*70}")
+
     print("\nPublishing ROS2 topics:")
     print(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
     print(f"  /{camera_cfg['camera_name']}/color/image_raw")
@@ -993,12 +1009,10 @@ def main():
     if receiver_cfg.get("publish_odom"):
         print(f"  /{camera_cfg['camera_name']}/odom")
     print(f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames")
-    print("\nPress Ctrl+C to stop\n")
 
-    # Main loop
+    # Wait for shutdown
     try:
-        while True:
-            time.sleep(1)
+        video_receiver.wait()
     except KeyboardInterrupt:
         print("\n\nShutting down...")
 
