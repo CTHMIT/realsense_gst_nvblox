@@ -5,6 +5,11 @@ RealSense Virtual Camera Launch File for isaac_ros_nvblox
 This launch file receives RealSense streams over network and publishes them
 to ROS2 topics compatible with isaac_ros_nvblox.
 
+包含所有 ROS2 功能:
+- Video stream reception (via gscam)
+- IMU data reception and publishing
+- TF tree publishing (camera frames + odom)
+- Odometry publishing
 """
 
 from launch_ros.actions import Node
@@ -19,7 +24,9 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 def generate_launch_description():
     """Generate launch description for RealSense virtual camera."""
 
-    # Launch arguments
+    # ========================================================================
+    # LAUNCH ARGUMENTS
+    # ========================================================================
     camera_name_arg = DeclareLaunchArgument(
         "camera_name", default_value="camera0", description="Camera name for topics and frames"
     )
@@ -40,6 +47,10 @@ def generate_launch_description():
         "infra2_port",
         default_value="5030",
         description="Port for infra2 stream (Y8I, same as infra1)",
+    )
+
+    imu_port_arg = DeclareLaunchArgument(
+        "imu_port", default_value="5050", description="Port for IMU data"
     )
 
     depth_width_arg = DeclareLaunchArgument(
@@ -63,7 +74,7 @@ def generate_launch_description():
     )
 
     infra_height_arg = DeclareLaunchArgument(
-        "infra_height", default_value="800", description="Infrared image height"
+        "infra_height", default_value="480", description="Infrared image height"
     )
 
     use_depth_float_arg = DeclareLaunchArgument(
@@ -76,12 +87,35 @@ def generate_launch_description():
         "enable_infra", default_value="false", description="Enable infrared streams"
     )
 
+    enable_imu_arg = DeclareLaunchArgument(
+        "enable_imu", default_value="true", description="Enable IMU receiver"
+    )
+
+    publish_odom_arg = DeclareLaunchArgument(
+        "publish_odom", default_value="true", description="Publish odometry messages"
+    )
+
+    odom_frame_arg = DeclareLaunchArgument(
+        "odom_frame", default_value="odom", description="Odometry frame ID"
+    )
+
+    base_link_frame_arg = DeclareLaunchArgument(
+        "base_link_frame", default_value="base_link", description="Base link frame ID"
+    )
+
+    local_ip_arg = DeclareLaunchArgument(
+        "local_ip",
+        default_value="0.0.0.0",
+        description="Local IP address to bind IMU receiver to",
+    )
+
     # LaunchConfiguration
     camera_name = LaunchConfiguration("camera_name")
     depth_port = LaunchConfiguration("depth_port")
     color_port = LaunchConfiguration("color_port")
     infra1_port = LaunchConfiguration("infra1_port")
     infra2_port = LaunchConfiguration("infra2_port")
+    imu_port = LaunchConfiguration("imu_port")
     depth_width = LaunchConfiguration("depth_width")
     depth_height = LaunchConfiguration("depth_height")
     color_width = LaunchConfiguration("color_width")
@@ -90,6 +124,11 @@ def generate_launch_description():
     infra_height = LaunchConfiguration("infra_height")
     use_depth_float = LaunchConfiguration("use_depth_float")
     enable_infra = LaunchConfiguration("enable_infra")
+    enable_imu = LaunchConfiguration("enable_imu")
+    publish_odom = LaunchConfiguration("publish_odom")
+    odom_frame = LaunchConfiguration("odom_frame")
+    base_link_frame = LaunchConfiguration("base_link_frame")
+    local_ip = LaunchConfiguration("local_ip")
 
     pkg_share = FindPackageShare("gst_realsense_launch")
 
@@ -118,7 +157,6 @@ def generate_launch_description():
     # ========================================================================
     # DEPTH CAMERA NODE
     # ========================================================================
-    # Receives H.264 encoded depth stream and outputs 16UC1 format
     depth_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
@@ -132,9 +170,9 @@ def generate_launch_description():
                     " buffer-size=2097152 ",
                     'caps="application/x-rtp,media=video,clock-rate=90000,'
                     'encoding-name=H264,payload=96" ',
-                    "! rtpjitterbuffer latency=100 drop-on-latency=true ",
+                    "! rtpjitterbuffer latency=200 drop-on-latency=true ",
                     "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
-                    "! queue max-size-buffers=2 leaky=downstream ",
+                    "! queue max-size-buffers=4 leaky=downstream ",
                     "! videoconvert n-threads=4 ! video/x-raw,format=GRAY16_LE",
                 ],
                 "camera_name": [camera_name, "_depth"],
@@ -154,9 +192,8 @@ def generate_launch_description():
     )
 
     # ========================================================================
-    # DEPTH TO FLOAT CONVERTER (for nvblox)
+    # DEPTH TO FLOAT CONVERTER
     # ========================================================================
-    # Converts 16UC1 depth to 32FC1 format required by nvblox
     depth_to_float_node = Node(
         package="depth_image_proc",
         executable="convert_metric_node",
@@ -166,7 +203,7 @@ def generate_launch_description():
         remappings=[
             ("image_raw", "depth/image_rect_raw"),
             ("camera_info", "depth/camera_info"),
-            ("image", "depth/image"),  # 32FC1 output for nvblox
+            ("image", "depth/image"),
         ],
         output="screen",
     )
@@ -174,7 +211,6 @@ def generate_launch_description():
     # ========================================================================
     # COLOR CAMERA NODE
     # ========================================================================
-    # Receives H.264 encoded color stream and outputs RGB8 format
     color_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
@@ -188,7 +224,7 @@ def generate_launch_description():
                     " buffer-size=2097152 ",
                     'caps="application/x-rtp,media=video,clock-rate=90000,'
                     'encoding-name=H264,payload=98" ',
-                    "! rtpjitterbuffer latency=120 drop-on-latency=true ",
+                    "! rtpjitterbuffer latency=200 drop-on-latency=true ",
                     "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
                     "! videoconvert n-threads=4 ! video/x-raw,format=RGB",
                 ],
@@ -211,7 +247,6 @@ def generate_launch_description():
     # ========================================================================
     # INFRARED 1 CAMERA NODE (LEFT)
     # ========================================================================
-    # Receives Y8I stereo stream and extracts left camera
     infra1_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
@@ -226,10 +261,9 @@ def generate_launch_description():
                     " buffer-size=2097152 ",
                     'caps="application/x-rtp,media=video,clock-rate=90000,'
                     'encoding-name=H264,payload=99" ',
-                    "! rtpjitterbuffer latency=100 ",
+                    "! rtpjitterbuffer latency=200 ",
                     "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
                     "! videoconvert ! video/x-raw,format=GRAY8 ",
-                    # Split Y8I: crop right half to keep left camera
                     "! videocrop right=",
                     infra_width,
                 ],
@@ -252,7 +286,6 @@ def generate_launch_description():
     # ========================================================================
     # INFRARED 2 CAMERA NODE (RIGHT)
     # ========================================================================
-    # Receives Y8I stereo stream and extracts right camera
     infra2_gscam_node = Node(
         package="gscam",
         executable="gscam_node",
@@ -267,10 +300,9 @@ def generate_launch_description():
                     " buffer-size=2097152 ",
                     'caps="application/x-rtp,media=video,clock-rate=90000,'
                     'encoding-name=H264,payload=99" ',
-                    "! rtpjitterbuffer latency=100 ",
+                    "! rtpjitterbuffer latency=200 ",
                     "! rtph264depay ! h264parse ! avdec_h264 max-threads=4 ",
                     "! videoconvert ! video/x-raw,format=GRAY8 ",
-                    # Split Y8I: crop left half to keep right camera
                     "! videocrop left=",
                     infra_width,
                 ],
@@ -291,13 +323,52 @@ def generate_launch_description():
     )
 
     # ========================================================================
+    # IMU RECEIVER NODE
+    # ========================================================================
+    imu_receiver_node = Node(
+        package="gst_realsense_launch",
+        executable="imu_receiver_node.py",
+        name="imu_receiver",
+        namespace=camera_name,
+        condition=IfCondition(enable_imu),
+        parameters=[
+            {
+                "imu_port": imu_port,
+                "local_ip": local_ip,
+                "frame_id": [camera_name, "_imu_optical_frame"],
+            }
+        ],
+        remappings=[
+            ("imu", "imu"),
+        ],
+        output="screen",
+    )
+
+    # ========================================================================
+    # TF AND ODOMETRY PUBLISHER NODE
+    # ========================================================================
+    tf_odom_publisher_node = Node(
+        package="gst_realsense_launch",
+        executable="tf_odom_publisher_node.py",
+        name="tf_odom_publisher",
+        namespace=camera_name,
+        parameters=[
+            {
+                "camera_name": camera_name,
+                "publish_odom": publish_odom,
+                "odom_frame": odom_frame,
+                "base_link_frame": base_link_frame,
+            }
+        ],
+        remappings=[
+            ("odom", "odom"),
+        ],
+        output="screen",
+    )
+
+    # ========================================================================
     # STATIC TRANSFORM PUBLISHERS
     # ========================================================================
-    # Publish static transforms for RealSense camera structure
-
-    # camera_link (base frame)
-    # This would typically come from robot_state_publisher or your TF tree
-
     # camera_link -> depth_frame
     depth_frame_tf = Node(
         package="tf2_ros",
@@ -306,11 +377,11 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
             "0",
             "0",
             "0",
-            "1",  # rotation (quaternion)
+            "0",
+            "1",
             [camera_name, "_link"],
             [camera_name, "_depth_frame"],
         ],
@@ -324,11 +395,11 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
+            "0",
             "-0.5",
             "0.5",
             "-0.5",
-            "0.5",  # rotation (quaternion)
+            "0.5",
             [camera_name, "_depth_frame"],
             [camera_name, "_depth_optical_frame"],
         ],
@@ -342,11 +413,11 @@ def generate_launch_description():
         arguments=[
             "0.015",
             "0",
-            "0",  # translation (15mm offset)
             "0",
             "0",
             "0",
-            "1",  # rotation (quaternion)
+            "0",
+            "1",
             [camera_name, "_link"],
             [camera_name, "_color_frame"],
         ],
@@ -360,11 +431,11 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
+            "0",
             "-0.5",
             "0.5",
             "-0.5",
-            "0.5",  # rotation (quaternion)
+            "0.5",
             [camera_name, "_color_frame"],
             [camera_name, "_color_optical_frame"],
         ],
@@ -379,11 +450,11 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
             "0",
             "0",
             "0",
-            "1",  # rotation (quaternion)
+            "0",
+            "1",
             [camera_name, "_link"],
             [camera_name, "_infra1_frame"],
         ],
@@ -398,11 +469,11 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
+            "0",
             "-0.5",
             "0.5",
             "-0.5",
-            "0.5",  # rotation (quaternion)
+            "0.5",
             [camera_name, "_infra1_frame"],
             [camera_name, "_infra1_optical_frame"],
         ],
@@ -417,11 +488,11 @@ def generate_launch_description():
         arguments=[
             "0.050",
             "0",
-            "0",  # translation (50mm stereo baseline)
             "0",
             "0",
             "0",
-            "1",  # rotation (quaternion)
+            "0",
+            "1",
             [camera_name, "_link"],
             [camera_name, "_infra2_frame"],
         ],
@@ -436,17 +507,38 @@ def generate_launch_description():
         arguments=[
             "0",
             "0",
-            "0",  # translation
+            "0",
             "-0.5",
             "0.5",
             "-0.5",
-            "0.5",  # rotation (quaternion)
+            "0.5",
             [camera_name, "_infra2_frame"],
             [camera_name, "_infra2_optical_frame"],
         ],
     )
 
-    # Build launch description
+    # camera_link -> imu_optical_frame
+    imu_optical_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="imu_optical_tf",
+        condition=IfCondition(enable_imu),
+        arguments=[
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "1",
+            [camera_name, "_link"],
+            [camera_name, "_imu_optical_frame"],
+        ],
+    )
+
+    # ========================================================================
+    # BUILD LAUNCH DESCRIPTION
+    # ========================================================================
     return LaunchDescription(
         [
             # Arguments
@@ -455,6 +547,7 @@ def generate_launch_description():
             color_port_arg,
             infra1_port_arg,
             infra2_port_arg,
+            imu_port_arg,
             depth_width_arg,
             depth_height_arg,
             color_width_arg,
@@ -463,12 +556,20 @@ def generate_launch_description():
             infra_height_arg,
             use_depth_float_arg,
             enable_infra_arg,
+            enable_imu_arg,
+            publish_odom_arg,
+            odom_frame_arg,
+            base_link_frame_arg,
+            local_ip_arg,
             # Camera nodes
             depth_gscam_node,
             depth_to_float_node,
             color_gscam_node,
             infra1_gscam_node,
             infra2_gscam_node,
+            # ROS2 功能節點
+            imu_receiver_node,
+            tf_odom_publisher_node,
             # Static transforms
             depth_frame_tf,
             depth_optical_tf,
@@ -478,5 +579,6 @@ def generate_launch_description():
             infra1_optical_tf,
             infra2_frame_tf,
             infra2_optical_tf,
+            imu_optical_tf,
         ]
     )

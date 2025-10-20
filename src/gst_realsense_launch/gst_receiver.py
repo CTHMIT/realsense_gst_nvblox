@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
-"""RealSense Virtual Camera Receiver with Visualization.
+"""RealSense GStreamer Receiver (Pure GStreamer - No ROS2)
 
-Receives video streams and IMU data, reconstructs a complete virtual RealSense
-camera, and publishes all data to ROS2 topics compatible with isaac_ros_nvblox.
+Receives video streams via GStreamer and manages them using tmux.
+All ROS2 functionality is handled by the launch file.
 
 Features:
 - Video stream reception (depth, color, IR1, IR2)
-- IMU data reception and publishing
-- TF tree publishing (camera frames + odom)
-- Odometry publishing (for navigation stack)
-- Optional live visualization of received streams
-- Full compatibility with isaac_ros_nvblox
-- Tmux-based stream management (like sender)
+- Tmux-based stream management
+- Optional live visualization
 """
 
 import argparse
-import json
-import os
-import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple
 
 from utils.logger import LOGGER
 
@@ -36,26 +28,7 @@ except ImportError:
     np = None
     LOGGER.info("Warning: OpenCV not available. --show-views will be disabled.")
 
-# Type hints only during type checking
-if TYPE_CHECKING:
-    import numpy.typing as npt
-
-try:
-    import rclpy
-    from geometry_msgs.msg import TransformStamped
-    from nav_msgs.msg import Odometry
-    from rclpy.node import Node
-    from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import Imu
-    from std_msgs.msg import Header
-    from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
-except ImportError:
-    LOGGER.info("Error: ROS2 not found. Source your ROS2 installation:")
-    LOGGER.info("  source /opt/ros/humble/setup.bash")
-    sys.exit(1)
-
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
-from gst_realsense_launch.rs_core import StreamStrategyFactory
 
 
 class TmuxSessionManager:
@@ -88,7 +61,6 @@ class TmuxSessionManager:
     def _create_session(self):
         """Create tmux session if it doesn't exist."""
         try:
-            # Create new detached session with a dummy command
             subprocess.run(
                 ["tmux", "new-session", "-d", "-s", self.session_name],
                 check=True,
@@ -100,38 +72,17 @@ class TmuxSessionManager:
             raise
 
     def create_window(self, window_name: str, command: str):
-        """Create a new tmux window and run command in it.
-
-        Args:
-            window_name: Name for the tmux window
-            command: Command to execute in the window
-        """
+        """Create a new tmux window and run command in it."""
         try:
-            # Create new window (tmux will auto-assign window index)
-            result = subprocess.run(
-                [
-                    "tmux",
-                    "new-window",
-                    "-t",
-                    self.session_name,
-                    "-n",
-                    window_name,
-                ],
+            subprocess.run(
+                ["tmux", "new-window", "-t", self.session_name, "-n", window_name],
                 check=True,
                 capture_output=True,
                 text=True,
             )
 
-            # Send command to the window
             subprocess.run(
-                [
-                    "tmux",
-                    "send-keys",
-                    "-t",
-                    f"{self.session_name}:{window_name}",
-                    command,
-                    "C-m",  # Enter key
-                ],
+                ["tmux", "send-keys", "-t", f"{self.session_name}:{window_name}", command, "C-m"],
                 check=True,
                 capture_output=True,
             )
@@ -154,7 +105,6 @@ class TmuxSessionManager:
         LOGGER.info(f"  Ctrl+b p : previous window")
         LOGGER.info(f"  Ctrl+b [0-9] : select window by number")
         LOGGER.info(f"  Ctrl+b d : detach from session")
-        LOGGER.info(f"  Ctrl+b & : kill current window")
 
     def kill_session(self):
         """Kill the entire tmux session and ensure all processes are terminated."""
@@ -163,11 +113,10 @@ class TmuxSessionManager:
             return
 
         try:
-            # Step 1: List all windows and their panes
             result = subprocess.run(
                 ["tmux", "list-panes", "-t", self.session_name, "-F", "#{pane_pid}"],
                 capture_output=True,
-                text=True,  # ✅ 添加這個確保返回 str
+                text=True,
                 timeout=5,
             )
 
@@ -175,38 +124,28 @@ class TmuxSessionManager:
                 pids = result.stdout.strip().split("\n")
                 LOGGER.info(f"Found {len(pids)} processes in tmux session")
 
-                # Step 2: Send SIGTERM to all processes
                 for pid in pids:
                     if pid and pid.isdigit():
                         try:
-                            # Send SIGTERM first (graceful)
                             subprocess.run(["kill", "-TERM", pid], timeout=2, check=False)
                             LOGGER.debug(f"  Sent SIGTERM to PID {pid}")
                         except Exception as e:
                             LOGGER.debug(f"  Could not terminate PID {pid}: {e}")
 
-                # Step 3: Wait a bit for graceful shutdown
                 time.sleep(2)
 
-                # Step 4: Force kill any remaining processes
                 for pid in pids:
                     if pid and pid.isdigit():
                         try:
-                            # Check if process still exists
                             check = subprocess.run(
-                                ["ps", "-p", pid],
-                                capture_output=True,
-                                timeout=1,
-                                check=False,
+                                ["ps", "-p", pid], capture_output=True, timeout=1, check=False
                             )
                             if check.returncode == 0:
-                                # Process still alive, force kill
                                 subprocess.run(["kill", "-KILL", pid], timeout=1, check=False)
                                 LOGGER.debug(f"  Force killed PID {pid}")
                         except Exception as e:
                             LOGGER.debug(f"  Could not check/kill PID {pid}: {e}")
 
-            # Step 5: Kill the tmux session itself
             result = subprocess.run(
                 ["tmux", "kill-session", "-t", self.session_name],
                 capture_output=True,
@@ -217,473 +156,24 @@ class TmuxSessionManager:
 
             if result.returncode == 0:
                 LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
-            else:
-                LOGGER.warning(f"Could not kill tmux session (may already be gone)")
 
-            # Step 6: Verify session is gone
             time.sleep(0.5)
             if not self._session_exists():
                 LOGGER.info("✓ Tmux session cleanup verified")
-            else:
-                LOGGER.warning("⚠ Tmux session may still exist")
 
-        except subprocess.TimeoutExpired:
-            LOGGER.error("Timeout while trying to kill tmux session")
-            # Last resort: force kill tmux server
-            try:
-                subprocess.run(
-                    ["pkill", "-9", "-f", f"tmux.*{self.session_name}"],
-                    timeout=2,
-                    check=False,
-                )
-            except Exception as e:
-                LOGGER.error(f"Could not force kill tmux: {e}")
         except Exception as e:
             LOGGER.error(f"Error during tmux cleanup: {e}")
 
     def _session_exists(self) -> bool:
         """Check if the tmux session exists."""
         result = subprocess.run(
-            ["tmux", "has-session", "-t", self.session_name],
-            capture_output=True,
+            ["tmux", "has-session", "-t", self.session_name], capture_output=True
         )
         return result.returncode == 0
 
 
-class VirtualRealSenseNode(Node):
-    """ROS2 Node that creates a virtual RealSense camera.
-
-    This node receives network streams and IMU data, then publishes them
-    to standard ROS2 topics that mimic a real RealSense camera. It's fully
-    compatible with isaac_ros_nvblox and other ROS2 perception packages.
-    """
-
-    def __init__(
-        self,
-        camera_name: str,
-        imu_port: int,
-        config_loader: ConfigLoader,
-        receiver_config: dict,
-    ):
-        """Initialize the virtual RealSense camera node.
-
-        Args:
-            camera_name: The name of the camera.
-            imu_port: The port to listen for IMU data on.
-            config_loader: The configuration loader.
-            receiver_config: The receiver configuration.
-        """
-        super().__init__("virtual_realsense_camera")
-
-        self.camera_name = camera_name
-        self.imu_port = imu_port
-        self.config_loader = config_loader
-        self.receiver_config = receiver_config
-
-        # QoS profile matching realsense2_camera driver
-        self.qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-
-        # Create publishers
-        self._create_publishers()
-
-        # TF broadcasters
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.static_tf_broadcaster = StaticTransformBroadcaster(self)
-
-        # UDP socket for IMU data
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # RealSense network streaming requires accepting remote connections
-        # Security note: For production, set local_ip to specific interface IP
-        # For local testing only: set local_ip to 127.0.0.1
-        bind_address = self.receiver_config.get(
-            "local_ip", "0.0.0.0"
-        )  # nosec B104 - required for remote streaming
-        self.socket.bind((bind_address, imu_port))
-        self.socket.settimeout(1.0)
-
-        # Calibration data
-        self.intrinsics: dict = {}
-        self.extrinsics: dict = {}
-
-        # Odometry state (for isaac_ros_nvblox integration)
-        self.odom_x: float = 0.0
-        self.odom_y: float = 0.0
-        self.odom_theta: float = 0.0
-        self.last_odom_time = self.get_clock().now()
-
-        # Start receiver thread
-        self.running = True
-        self.receiver_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self.receiver_thread.start()
-
-        # TF and odometry timers
-        self.tf_timer = self.create_timer(1.0 / 30.0, self._publish_tf)
-
-        if self.receiver_config.get("publish_odom", True):
-            self.odom_timer = self.create_timer(1.0 / 50.0, self._publish_odometry)
-
-        # Publish static transforms
-        self._publish_static_transforms()
-
-        self.get_logger().info(f'Virtual RealSense camera "{camera_name}" initialized')
-        self.get_logger().info(f"Listening for IMU data on {bind_address}:{imu_port}")
-        if bind_address == "0.0.0.0":
-            self.get_logger().warn(
-                "IMU receiver is listening on all interfaces. "
-                "Set local_ip in config.yaml to restrict access."
-            )
-
-    def _create_publishers(self):
-        """Create all ROS2 publishers for camera streams and IMU."""
-        # IMU publisher
-        self.imu_pub = self.create_publisher(Imu, f"/{self.camera_name}/imu", self.qos)
-
-        # Odometry publisher (for navigation)
-        if self.receiver_config.get("publish_odom", True):
-            self.odom_pub = self.create_publisher(Odometry, f"/{self.camera_name}/odom", self.qos)
-
-        self.get_logger().info("Publishers created for camera topics")
-
-    def _receive_loop(self):
-        """Receive UDP packets with IMU and calibration data."""
-        while self.running:
-            try:
-                data, addr = self.socket.recvfrom(65536)
-                message = json.loads(data.decode("utf-8"))
-
-                msg_type = message.get("type")
-
-                if msg_type == "imu":
-                    self._handle_imu_data(message)
-                elif msg_type == "calibration":
-                    self._handle_calibration_data(message)
-
-            except TimeoutError:
-                continue
-            except json.JSONDecodeError as e:
-                self.get_logger().warn(f"Invalid JSON: {e}")
-            except Exception as e:
-                self.get_logger().error(f"Error receiving data: {e}")
-
-    def _handle_imu_data(self, data: dict):
-        """Process and publish IMU data."""
-        try:
-            imu_msg = Imu()
-            imu_msg.header = Header()
-            imu_msg.header.stamp = self.get_clock().now().to_msg()
-            imu_msg.header.frame_id = f"{self.camera_name}_imu_optical_frame"
-
-            # Linear acceleration
-            accel = data.get("accel", {})
-            imu_msg.linear_acceleration.x = accel.get("x", 0.0)
-            imu_msg.linear_acceleration.y = accel.get("y", 0.0)
-            imu_msg.linear_acceleration.z = accel.get("z", 0.0)
-
-            # Angular velocity
-            gyro = data.get("gyro", {})
-            imu_msg.angular_velocity.x = gyro.get("x", 0.0)
-            imu_msg.angular_velocity.y = gyro.get("y", 0.0)
-            imu_msg.angular_velocity.z = gyro.get("z", 0.0)
-
-            # Covariance (uncertainty estimates)
-            imu_msg.linear_acceleration_covariance = [
-                0.01,
-                0.0,
-                0.0,
-                0.0,
-                0.01,
-                0.0,
-                0.0,
-                0.0,
-                0.01,
-            ]
-            imu_msg.angular_velocity_covariance = [0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]
-            imu_msg.orientation_covariance[0] = -1.0  # No orientation
-
-            self.imu_pub.publish(imu_msg)
-
-        except Exception as e:
-            self.get_logger().error(f"Error publishing IMU: {e}")
-
-    def _handle_calibration_data(self, data: dict):
-        """Store camera calibration data."""
-        self.intrinsics = data.get("intrinsics", {})
-        self.extrinsics = data.get("extrinsics", {})
-        self.get_logger().info("Received camera calibration data")
-
-    def _publish_static_transforms(self):
-        """Publish static transforms for camera structure.
-
-        Creates the standard RealSense frame tree that's expected by
-        ROS2 perception algorithms.
-        """
-        timestamp = self.get_clock().now().to_msg()
-        transforms = []
-
-        # Camera base frames (physical sensor positions)
-        base_frames = [
-            ("depth_frame", [0.0, 0.0, 0.0]),
-            ("color_frame", [0.015, 0.0, 0.0]),  # 15mm offset
-            ("infra1_frame", [0.0, 0.0, 0.0]),
-            ("infra2_frame", [0.050, 0.0, 0.0]),  # 50mm stereo baseline
-        ]
-
-        for frame_name, translation in base_frames:
-            t = TransformStamped()
-            t.header.stamp = timestamp
-            t.header.frame_id = f"{self.camera_name}_link"
-            t.child_frame_id = f"{self.camera_name}_{frame_name}"
-            t.transform.translation.x = translation[0]
-            t.transform.translation.y = translation[1]
-            t.transform.translation.z = translation[2]
-            t.transform.rotation.w = 1.0
-            transforms.append(t)
-
-            # Optical frames (standard camera coordinate convention)
-            t_optical = TransformStamped()
-            t_optical.header.stamp = timestamp
-            t_optical.header.frame_id = f"{self.camera_name}_{frame_name}"
-            t_optical.child_frame_id = (
-                f'{self.camera_name}_{frame_name.replace("frame", "optical_frame")}'
-            )
-            # Rotation: X-right, Y-down, Z-forward
-            t_optical.transform.rotation.x = -0.5
-            t_optical.transform.rotation.y = 0.5
-            t_optical.transform.rotation.z = -0.5
-            t_optical.transform.rotation.w = 0.5
-            transforms.append(t_optical)
-
-        # IMU optical frame
-        t_imu = TransformStamped()
-        t_imu.header.stamp = timestamp
-        t_imu.header.frame_id = f"{self.camera_name}_link"
-        t_imu.child_frame_id = f"{self.camera_name}_imu_optical_frame"
-        t_imu.transform.rotation.w = 1.0
-        transforms.append(t_imu)
-
-        self.static_tf_broadcaster.sendTransform(transforms)
-
-    def _publish_tf(self):
-        """Publish dynamic TF transforms.
-
-        Includes the odom->base_link->camera_link chain needed for
-        isaac_ros_nvblox and navigation.
-        """
-        timestamp = self.get_clock().now().to_msg()
-        transforms = []
-
-        # Odom to base_link (robot pose in world)
-        if self.receiver_config.get("publish_odom", True):
-            t_odom = TransformStamped()
-            t_odom.header.stamp = timestamp
-            t_odom.header.frame_id = self.receiver_config.get("odom_frame", "odom")
-            t_odom.child_frame_id = self.receiver_config.get("base_link_frame", "base_link")
-            t_odom.transform.translation.x = self.odom_x
-            t_odom.transform.translation.y = self.odom_y
-            t_odom.transform.translation.z = 0.0
-
-            # Convert theta to quaternion
-            quat = self._euler_to_quaternion(0, 0, self.odom_theta)
-            t_odom.transform.rotation.x = quat[0]
-            t_odom.transform.rotation.y = quat[1]
-            t_odom.transform.rotation.z = quat[2]
-            t_odom.transform.rotation.w = quat[3]
-            transforms.append(t_odom)
-
-        # Base_link to camera_link (camera mounting on robot)
-        t_base_cam = TransformStamped()
-        t_base_cam.header.stamp = timestamp
-        t_base_cam.header.frame_id = self.receiver_config.get("base_link_frame", "base_link")
-        t_base_cam.child_frame_id = f"{self.camera_name}_link"
-        # Default: camera mounted 0.1m forward, 0.2m up from base
-        t_base_cam.transform.translation.x = 0.1
-        t_base_cam.transform.translation.y = 0.0
-        t_base_cam.transform.translation.z = 0.2
-        t_base_cam.transform.rotation.w = 1.0
-        transforms.append(t_base_cam)
-
-        self.tf_broadcaster.sendTransform(transforms)
-
-    def _publish_odometry(self):
-        """Publish odometry message.
-
-        This provides robot pose and velocity information needed by
-        isaac_ros_nvblox for dynamic mapping and navigation.
-        """
-        odom_msg = Odometry()
-        odom_msg.header = Header()
-        odom_msg.header.stamp = self.get_clock().now().to_msg()
-        odom_msg.header.frame_id = self.receiver_config.get("odom_frame", "odom")
-        odom_msg.child_frame_id = self.receiver_config.get("base_link_frame", "base_link")
-
-        # Position
-        odom_msg.pose.pose.position.x = self.odom_x
-        odom_msg.pose.pose.position.y = self.odom_y
-        odom_msg.pose.pose.position.z = 0.0
-
-        # Orientation
-        quat = self._euler_to_quaternion(0, 0, self.odom_theta)
-        odom_msg.pose.pose.orientation.x = quat[0]
-        odom_msg.pose.pose.orientation.y = quat[1]
-        odom_msg.pose.pose.orientation.z = quat[2]
-        odom_msg.pose.pose.orientation.w = quat[3]
-
-        # Covariance (uncertainty in pose)
-        odom_msg.pose.covariance = [
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-        ]
-
-        # Velocity (currently static, can be updated based on IMU integration)
-        odom_msg.twist.twist.linear.x = 0.0
-        odom_msg.twist.twist.linear.y = 0.0
-        odom_msg.twist.twist.angular.z = 0.0
-
-        odom_msg.twist.covariance = [
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.01,
-        ]
-
-        self.odom_pub.publish(odom_msg)
-
-    @staticmethod
-    def _euler_to_quaternion(roll, pitch, yaw):
-        """Convert Euler angles to quaternion."""
-        import math
-
-        qx = math.sin(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) - math.cos(
-            roll / 2
-        ) * math.sin(pitch / 2) * math.sin(yaw / 2)
-        qy = math.cos(roll / 2) * math.sin(pitch / 2) * math.cos(yaw / 2) + math.sin(
-            roll / 2
-        ) * math.cos(pitch / 2) * math.sin(yaw / 2)
-        qz = math.cos(roll / 2) * math.cos(pitch / 2) * math.sin(yaw / 2) - math.sin(
-            roll / 2
-        ) * math.sin(pitch / 2) * math.cos(yaw / 2)
-        qw = math.cos(roll / 2) * math.cos(pitch / 2) * math.cos(yaw / 2) + math.sin(
-            roll / 2
-        ) * math.sin(pitch / 2) * math.sin(yaw / 2)
-        return [qx, qy, qz, qw]
-
-    def shutdown(self):
-        """Clean shutdown with proper resource cleanup."""
-        LOGGER.info("Shutting down VirtualRealSenseNode...")
-
-        # Step 1: Stop receiver thread
-        self.running = False
-        if self.receiver_thread and self.receiver_thread.is_alive():
-            LOGGER.info("  Stopping receiver thread...")
-            self.receiver_thread.join(timeout=3)
-            if self.receiver_thread.is_alive():
-                LOGGER.warning("  Receiver thread did not stop gracefully")
-
-        # Step 2: Stop timers
-        try:
-            if hasattr(self, "tf_timer"):
-                self.tf_timer.cancel()
-            if hasattr(self, "odom_timer"):
-                self.odom_timer.cancel()
-            LOGGER.info("  ✓ Timers stopped")
-        except Exception as e:
-            LOGGER.debug(f"  Error stopping timers: {e}")
-
-        # Step 3: Close socket
-        try:
-            if hasattr(self, "socket"):
-                self.socket.close()
-            LOGGER.info("  ✓ Socket closed")
-        except Exception as e:
-            LOGGER.debug(f"  Error closing socket: {e}")
-
-        # Step 4: Destroy publishers
-        try:
-            if hasattr(self, "imu_pub"):
-                self.destroy_publisher(self.imu_pub)
-            if hasattr(self, "odom_pub"):
-                self.destroy_publisher(self.odom_pub)
-            LOGGER.info("  ✓ Publishers destroyed")
-        except Exception as e:
-            LOGGER.debug(f"  Error destroying publishers: {e}")
-
-        LOGGER.info("✓ VirtualRealSenseNode shutdown complete")
-
-
 class VideoStreamReceiver:
-    """Manages video stream reception and ROS2 publishing using tmux."""
+    """Manages video stream reception using tmux and GStreamer."""
 
     def __init__(
         self,
@@ -712,12 +202,9 @@ class VideoStreamReceiver:
     ):
         """Start receiving a video stream and publishing to ROS2."""
 
-        # infra_stereo (Y8I): infra1 and infra2
         if stream_name == "infra_stereo":
-            # Y8I splitter - split into infra1 and infra2
             single_width = width // 2
 
-            # infra1 - gscam for ROS2
             self._start_single_stream_in_tmux(
                 port,
                 "infra1",
@@ -728,14 +215,12 @@ class VideoStreamReceiver:
                 is_y8i=True,
                 y8i_width=width,
             )
-            # infra1 - optional visualization
             if self.show_views:
                 self._start_visualization_in_tmux(
                     port, "infra1", single_width, height, is_y8i=True, y8i_width=width
                 )
             time.sleep(0.5)
 
-            # infra2 - gscam for ROS2
             self._start_single_stream_in_tmux(
                 port,
                 "infra2",
@@ -746,18 +231,15 @@ class VideoStreamReceiver:
                 is_y8i=True,
                 y8i_width=width,
             )
-            # infra2 - optional visualization
             if self.show_views:
                 self._start_visualization_in_tmux(
                     port, "infra2", single_width, height, is_y8i=True, y8i_width=width
                 )
             time.sleep(0.5)
         else:
-            # gscam for ROS2
             self._start_single_stream_in_tmux(
                 port, stream_name, encoding, width, height, intrinsics
             )
-            # Optional visualization
             if self.show_views:
                 self._start_visualization_in_tmux(port, stream_name, width, height)
             time.sleep(0.5)
@@ -773,9 +255,8 @@ class VideoStreamReceiver:
         is_y8i: bool = False,
         y8i_width: int = None,
     ):
-        """Start a single stream receiver in a tmux window."""
+        """Start a single stream receiver in a tmux window (gscam for ROS2)."""
 
-        # Get calibration file
         calib_file = self._get_calibration_file_path(stream_name, width, height)
 
         if calib_file:
@@ -793,16 +274,13 @@ class VideoStreamReceiver:
             tmp_file_path = tmp_file.name
             tmp_file.close()
 
-        # Build GStreamer pipeline
         if is_y8i:
             gst_config = self._build_y8i_pipeline(port, stream_name, y8i_width, height)
         else:
             gst_config = self._build_pipeline(port, stream_name, width, height)
 
-        # Get image encoding from config
         image_encodings = self.config_loader.get("receiver.image_encoding", {})
 
-        # Determine topics and encoding
         if stream_name == "depth":
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
@@ -821,7 +299,6 @@ class VideoStreamReceiver:
         else:
             return
 
-        # Build gscam command
         gscam_cmd_parts = [
             "ros2 run gscam gscam_node",
             "--ros-args",
@@ -832,7 +309,6 @@ class VideoStreamReceiver:
             "-p sync_sink:=false",
         ]
 
-        # 只有在 image_encoding 不是 None 時才添加
         if image_encoding:
             gscam_cmd_parts.append(f"-p image_encoding:={image_encoding}")
 
@@ -845,22 +321,17 @@ class VideoStreamReceiver:
 
         gscam_cmd = " ".join(gscam_cmd_parts)
 
-        # Add cleanup of temp file if needed
         if tmp_file_path:
             gscam_cmd = f"trap 'rm -f {tmp_file_path}' EXIT; {gscam_cmd}"
 
-        # Create window name
         window_name = f"{stream_name}_{port}"
 
         LOGGER.info(f"\n[{stream_name}] Starting on port {port}")
         LOGGER.info(f"  Topic: {image_topic}")
         LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect (mono16)'}")
-        LOGGER.info(f"  GStreamer Config: {gst_config[:100]}...")
 
-        # Run in tmux
         self.tmux_manager.create_window(window_name, gscam_cmd)
 
-        # 如果是深度流且啟用了轉換，啟動 depth_image_proc 節點
         if stream_name == "depth":
             self._start_depth_conversion_node(port, image_topic, info_topic)
 
@@ -876,7 +347,6 @@ class VideoStreamReceiver:
         output_topic = depth_config.get("output_topic", "depth/image")
         output_full_topic = f"/{self.camera_name}/{output_topic}"
 
-        # Build depth conversion command
         convert_cmd_parts = [
             "ros2 run depth_image_proc convert_metric_node",
             "--ros-args",
@@ -892,28 +362,21 @@ class VideoStreamReceiver:
         LOGGER.info(f"    Input: {depth_topic} (mono16)")
         LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
 
-        # 延遲啟動，確保 gscam 先啟動
         time.sleep(0.5)
         self.tmux_manager.create_window(window_name, convert_cmd)
 
     def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
-        """Build GStreamer pipeline for standard streams (ROS2 only, no visualization)."""
+        """Build GStreamer pipeline for standard streams."""
 
-        # Get streaming parameters from config
         buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
         max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
         n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
         max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
         leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
-
-        # Get payload types from config
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
-
-        # Get format conversion settings from config
         gst_formats = self.config_loader.get("receiver.gstreamer_format", {})
 
         if stream_name == "depth":
-            # Depth stream: H264 -> GRAY16_LE
             latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", True
@@ -931,7 +394,6 @@ class VideoStreamReceiver:
                 f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
             )
         elif stream_name == "color":
-            # Color stream: H264 -> RGB
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.color.drop_on_latency", True
@@ -949,7 +411,6 @@ class VideoStreamReceiver:
                 f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
             )
         elif stream_name.startswith("infra"):
-            # Infrared stream: H264 -> GRAY8
             latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.infra.drop_on_latency", True
@@ -972,10 +433,9 @@ class VideoStreamReceiver:
         return pipeline
 
     def _build_y8i_pipeline(self, port: int, stream_name: str, y8i_width: int, height: int) -> str:
-        """Build GStreamer pipeline for Y8I streams (ROS2 only, no visualization)."""
+        """Build GStreamer pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        # Get streaming parameters from config
         buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
         latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
         drop_on_latency = self.config_loader.get(
@@ -986,8 +446,6 @@ class VideoStreamReceiver:
         n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
         max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
         leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
-
-        # Get payload type from config
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
         payload = payload_types.get("infra_stereo_h264", 99)
 
@@ -1000,10 +458,9 @@ class VideoStreamReceiver:
             f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
         )
 
-        # Add videocrop to split left/right
         if stream_name == "infra1":
             pipeline += f" ! videocrop right={single_width}"
-        else:  # infra2
+        else:
             pipeline += f" ! videocrop left={single_width}"
 
         return pipeline
@@ -1021,7 +478,6 @@ class VideoStreamReceiver:
         display_width = int(width * self.view_scale)
         display_height = int(height * self.view_scale)
 
-        # Build visualization pipeline (independent of gscam)
         if is_y8i:
             viz_pipeline = self._build_visualization_pipeline_y8i(
                 port, stream_name, y8i_width, height, display_width, display_height
@@ -1032,8 +488,6 @@ class VideoStreamReceiver:
             )
 
         window_name = f"viz_{stream_name}_{port}"
-
-        # Create gst-launch command
         gst_cmd = f"gst-launch-1.0 -v {viz_pipeline}"
 
         LOGGER.info(f"  [VIZ] Starting visualization for {stream_name}")
@@ -1050,7 +504,6 @@ class VideoStreamReceiver:
     ) -> str:
         """Build independent visualization pipeline."""
 
-        # Get streaming parameters from config
         buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
         max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
         max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
@@ -1058,7 +511,6 @@ class VideoStreamReceiver:
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
 
         if stream_name == "depth":
-            # Depth visualization with normalization for better viewing
             latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", True
@@ -1078,7 +530,6 @@ class VideoStreamReceiver:
                 f"! autovideosink sync=false"
             )
         elif stream_name == "color":
-            # Color visualization
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.color.drop_on_latency", True
@@ -1097,7 +548,6 @@ class VideoStreamReceiver:
                 f"! autovideosink sync=false"
             )
         elif stream_name.startswith("infra"):
-            # Infrared visualization
             latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.infra.drop_on_latency", True
@@ -1132,7 +582,6 @@ class VideoStreamReceiver:
         """Build independent visualization pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        # Get streaming parameters from config
         buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
         latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
         drop_on_latency = self.config_loader.get(
@@ -1154,13 +603,11 @@ class VideoStreamReceiver:
             f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
         )
 
-        # Add videocrop to split left/right
         if stream_name == "infra1":
             pipeline += f" ! videocrop right={single_width}"
-        else:  # infra2
+        else:
             pipeline += f" ! videocrop left={single_width}"
 
-        # Add scaling and display
         pipeline += (
             f" ! videoscale ! video/x-raw,width={display_width},height={display_height} "
             f"! videoconvert "
@@ -1169,14 +616,8 @@ class VideoStreamReceiver:
 
         return pipeline
 
-    def _get_calibration_file_path(
-        self,
-        stream_name: str,
-        width: int,
-        height: int,
-    ) -> str | None:
+    def _get_calibration_file_path(self, stream_name: str, width: int, height: int) -> str | None:
         """Get the path to the calibration file for the given stream and resolution."""
-        # Map stream names to file prefixes
         stream_mapping = {
             "depth": "depth",
             "color": "color",
@@ -1187,7 +628,6 @@ class VideoStreamReceiver:
         stream_prefix = stream_mapping.get(stream_name, stream_name)
         resolution = f"{width}x{height}"
 
-        # Search paths for calibration files
         config_paths = [
             Path("src/config"),
             Path(__file__).parent.parent / "config",
@@ -1218,7 +658,6 @@ class VideoStreamReceiver:
             ppx, ppy = intrinsics.ppx, intrinsics.ppy
             coeffs = intrinsics.distortion
         else:
-            # Use defaults from config
             intrinsics = self.config_loader.create_default_intrinsics(width, height)
             fx, fy = intrinsics.fx, intrinsics.fy
             ppx, ppy = intrinsics.ppx, intrinsics.ppy
@@ -1258,41 +697,27 @@ projection_matrix:
             pass
 
     def stop_all(self):
-        """Stop all video receivers and tmux session with thorough cleanup."""
+        """Stop all video receivers and tmux session."""
         self._shutdown_event.set()
-        LOGGER.info("\n\n" + "=" * 70)
+        LOGGER.info("\n\n" + "=" * 40)
         LOGGER.info("INITIATING SHUTDOWN - Stopping all receivers")
-        LOGGER.info("=" * 70)
-
-        cleanup_successful = True
+        LOGGER.info("=" * 40)
 
         try:
-            # Step 1: Kill tmux session and all child processes
             if self.tmux_manager:
-                LOGGER.info("\n[1/3] Stopping GStreamer pipelines...")
+                LOGGER.info("\n[1/2] Stopping GStreamer pipelines...")
                 self.tmux_manager.kill_session()
                 time.sleep(1)
 
-            # Step 2: Clean up any orphaned gscam processes
-            LOGGER.info("\n[2/3] Checking for orphaned processes...")
+            LOGGER.info("\n[2/2] Checking for orphaned processes...")
             self._cleanup_orphaned_processes()
-
-            # Step 3: Release any locked resources
-            LOGGER.info("\n[3/3] Releasing resources...")
-            self._release_resources()
 
         except Exception as e:
             LOGGER.error(f"Error during cleanup: {e}")
-            cleanup_successful = False
 
-        LOGGER.info("\n" + "=" * 70)
-        if cleanup_successful:
-            LOGGER.info("✓ SHUTDOWN COMPLETE - All resources released")
-        else:
-            LOGGER.warning("⚠ SHUTDOWN COMPLETED WITH WARNINGS")
-            LOGGER.info("  Run this command to force cleanup:")
-            LOGGER.info(f"    pkill -9 -f 'gscam|depth_image_proc|{self.camera_name}'")
-        LOGGER.info("=" * 70 + "\n")
+        LOGGER.info("\n" + "=" * 40)
+        LOGGER.info("✓ SHUTDOWN COMPLETE")
+        LOGGER.info("=" * 40 + "\n")
 
     def _cleanup_orphaned_processes(self):
         """Clean up any orphaned gscam or depth_image_proc processes."""
@@ -1317,48 +742,12 @@ projection_matrix:
                     for pid in pids:
                         if pid and pid.isdigit():
                             try:
-                                subprocess.run(
-                                    ["kill", "-TERM", pid],
-                                    timeout=1,
-                                    check=False,
-                                )
+                                subprocess.run(["kill", "-TERM", pid], timeout=1, check=False)
                                 LOGGER.info(f"  Terminated orphaned process (PID {pid})")
-                                time.sleep(0.5)
-
-                                check = subprocess.run(
-                                    ["ps", "-p", pid],
-                                    capture_output=True,
-                                    timeout=1,
-                                    check=False,
-                                )
-                                if check.returncode == 0:
-                                    subprocess.run(
-                                        ["kill", "-KILL", pid],
-                                        timeout=1,
-                                        check=False,
-                                    )
-                                    LOGGER.info(f"  Force killed process (PID {pid})")
                             except Exception as e:
                                 LOGGER.debug(f"  Could not kill PID {pid}: {e}")
             except Exception as e:
                 LOGGER.debug(f"  Error checking pattern '{pattern}': {e}")
-
-    def _release_resources(self):
-        """Release any resources that might be locked."""
-        try:
-            temp_dir = Path(tempfile.gettempdir())
-            temp_files = temp_dir.glob(f"{self.camera_name}_*_*.yaml")
-
-            for temp_file in temp_files:
-                try:
-                    temp_file.unlink()
-                    LOGGER.debug(f"  Removed temp file: {temp_file}")
-                except Exception as e:
-                    LOGGER.debug(f"  Could not remove {temp_file}: {e}")
-        except Exception as e:
-            LOGGER.debug(f"  Error cleaning temp files: {e}")
-
-        LOGGER.info("  ✓ Resources released")
 
 
 def check_and_cleanup_existing_resources(camera_name: str):
@@ -1367,27 +756,16 @@ def check_and_cleanup_existing_resources(camera_name: str):
 
     issues_found = False
 
-    # Check for existing tmux session
-    result: subprocess.CompletedProcess[str] = subprocess.run(
+    result = subprocess.run(
         ["tmux", "has-session", "-t", "realsense_receiver"], capture_output=True, text=True
     )
     if result.returncode == 0:
         LOGGER.warning("  ⚠ Found existing tmux session 'realsense_receiver'")
         issues_found = True
+        subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
+        LOGGER.info("    ✓ Cleaned up existing session")
+        time.sleep(1)
 
-        # Ask user if they want to clean up
-        try:
-            response = input("    Clean up existing session? (y/n): ").lower()
-            if response == "y":
-                subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
-                LOGGER.info("    ✓ Cleaned up existing session")
-                time.sleep(1)
-        except:
-            LOGGER.info("    Automatically cleaning up...")
-            subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
-            time.sleep(1)
-
-    # Check for orphaned processes
     patterns = [
         f"gscam.*{camera_name}",
         "depth_image_proc",
@@ -1425,10 +803,8 @@ def check_and_cleanup_existing_resources(camera_name: str):
 
 
 def main():
-    """Run the RealSense virtual camera receiver."""
-    parser = argparse.ArgumentParser(
-        description="RealSense Virtual Camera Receiver for isaac_ros_nvblox"
-    )
+    """Run the RealSense GStreamer receiver."""
+    parser = argparse.ArgumentParser(description="RealSense GStreamer Stream Receiver")
     parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
     parser.add_argument(
         "--preset",
@@ -1436,45 +812,35 @@ def main():
         help="Use camera preset",
     )
     parser.add_argument("--base-port", type=int, help="Override base port")
-    parser.add_argument("--imu-port", type=int, help="Override IMU port")
     parser.add_argument("--camera-name", help="Override camera name")
-    parser.add_argument("--local-ip", help="Local IP address to bind to (default: 0.0.0.0)")
     parser.add_argument("--show-views", action="store_true", help="Display received video streams")
     parser.add_argument("--view-scale", type=float, help="Display window scale factor")
-    parser.add_argument("--no-imu", action="store_true", help="Disable IMU receiver")
-    parser.add_argument("--publish-odom", type=bool, help="Publish odometry")
     parser.add_argument("--width", type=int, help="Image width")
     parser.add_argument("--height", type=int, help="Image height")
 
     args = parser.parse_args()
 
     try:
-
-        # Load configuration
         config_loader = ConfigLoader(args.config)
 
-        # Get configurations
         network_cfg = config_loader.get_network_config(args)
         camera_cfg = config_loader.get_camera_config(args)
         receiver_cfg = config_loader.get_receiver_config(args)
-        config_loader.get_imu_config(args)
 
         check_and_cleanup_existing_resources(camera_cfg["camera_name"])
 
-        # Resolution
         width = args.width or 640
         height = args.height or 480
 
-        # Handle presets
         if args.preset:
             preset = config_loader.get_preset(args.preset)
             if preset:
                 streams = preset["streams"]
-                ports: list = []
-                stream_names: list = []
-                encodings: list = []
-                widths: list = []
-                heights: list = []
+                ports = []
+                stream_names = []
+                encodings = []
+                widths = []
+                heights = []
 
                 for s in streams:
                     port = network_cfg["base_port"] + s["port_offset"]
@@ -1483,7 +849,7 @@ def main():
                     encodings.append(s["encoding"])
 
                     if s["name"] == "infra_stereo":
-                        widths.append(width * 2)  # Y8I is double width
+                        widths.append(width * 2)
                     else:
                         widths.append(width)
                     heights.append(height)
@@ -1496,34 +862,15 @@ def main():
             LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
             sys.exit(1)
 
-        LOGGER.info(f"\n{'='*70}")
-        LOGGER.info("VIRTUAL REALSENSE CAMERA RECEIVER")
-        LOGGER.info(f"{'='*70}")
+        LOGGER.info(f"\n{'='*40}")
+        LOGGER.info("REALSENSE GSTREAMER RECEIVER")
+        LOGGER.info(f"{'='*40}")
         LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
-        LOGGER.info(f"IMU Port: {network_cfg['imu_port']}")
-        LOGGER.info(f"Local IP: {receiver_cfg['local_ip']}")
         LOGGER.info("\nVideo Streams:")
         for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
             LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
-        LOGGER.info(f"{'='*70}\n")
+        LOGGER.info(f"{'='*40}\n")
 
-        # Initialize ROS2
-        rclpy.init()
-
-        # Create virtual camera node
-        virtual_camera = VirtualRealSenseNode(
-            camera_name=camera_cfg["camera_name"],
-            imu_port=network_cfg["imu_port"],
-            config_loader=config_loader,
-            receiver_config=receiver_cfg,
-        )
-
-        # Spin node in background
-        ros_thread = threading.Thread(target=lambda: rclpy.spin(virtual_camera), daemon=True)
-        ros_thread.start()
-        time.sleep(1)
-
-        # Start video receivers in tmux
         video_receiver = VideoStreamReceiver(
             camera_name=camera_cfg["camera_name"],
             config_loader=config_loader,
@@ -1542,75 +889,29 @@ def main():
             )
 
         time.sleep(1)
-        LOGGER.info(f"\n{'='*70}")
+        LOGGER.info(f"\n{'='*40}")
         LOGGER.info("ALL RECEIVERS STARTED")
-        LOGGER.info(f"{'='*70}")
+        LOGGER.info(f"{'='*40}\n")
 
-        LOGGER.info("\nPublishing ROS2 topics:")
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/depth/image_rect_raw")
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/color/image_raw")
+        video_receiver.wait()
 
-        # Check if infra_stereo is present
-        if "infra_stereo" in stream_names:
-            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw (from Y8I left)")
-            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw (from Y8I right)")
-        else:
-            LOGGER.info(f"  /{camera_cfg['camera_name']}/infra1/image_rect_raw")
-            if "infra2" in stream_names:
-                LOGGER.info(f"  /{camera_cfg['camera_name']}/infra2/image_rect_raw")
-
-        LOGGER.info(f"  /{camera_cfg['camera_name']}/imu")
-        if receiver_cfg.get("publish_odom"):
-            LOGGER.info(f"  /{camera_cfg['camera_name']}/odom")
-        LOGGER.info(
-            f"\nTF tree: odom → base_link → {camera_cfg['camera_name']}_link → sensor frames"
-        )
-
-        # Wait for shutdown
-        try:
-            video_receiver.wait()
-        except KeyboardInterrupt:
-            LOGGER.info("\n\nShutting down...")
     except Exception as e:
-        LOGGER.error(f"\n❌ Fatal error: {e}")
+        LOGGER.error(f"\n✗ Fatal error: {e}")
         import traceback
 
         traceback.print_exc()
 
     finally:
-        # Ensure cleanup happens no matter what
         LOGGER.info("\nStarting cleanup sequence...")
-
-        # Cleanup video receiver (this includes tmux)
-        if video_receiver:
+        if "video_receiver" in locals():
             try:
                 video_receiver.stop_all()
             except Exception as e:
                 LOGGER.error(f"Error stopping video receiver: {e}")
 
-        # Cleanup virtual camera node
-        if virtual_camera:
-            try:
-                virtual_camera.shutdown()
-                virtual_camera.destroy_node()
-            except Exception as e:
-                LOGGER.error(f"Error shutting down virtual camera: {e}")
-
-        # Shutdown ROS2
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-                LOGGER.info("✓ ROS2 shutdown complete")
-        except Exception as e:
-            LOGGER.error(f"Error shutting down ROS2: {e}")
-
-        # Wait for ROS thread to finish
-        if ros_thread and ros_thread.is_alive():
-            ros_thread.join(timeout=2)
-
-        LOGGER.info("\n" + "=" * 70)
+        LOGGER.info("\n" + "=" * 40)
         LOGGER.info("✓ ALL CLEANUP COMPLETE")
-        LOGGER.info("=" * 70 + "\n")
+        LOGGER.info("=" * 40 + "\n")
 
 
 if __name__ == "__main__":
