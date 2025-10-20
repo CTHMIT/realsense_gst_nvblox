@@ -68,18 +68,8 @@ streaming:
       infra_stereo_h264: 99
 
   jitter_buffer:
-    depth:
-      latency: 200
-      drop_on_latency: false
-    color:
-      latency: 200
-      drop_on_latency: false
-    infra:
-      latency: 200
-      drop_on_latency: false
-    infra_stereo:
-      latency: 200
-      drop_on_latency: false
+    latency: 200
+    drop_on_latency: false
 
   queue:
     max_size_buffers: 4
