@@ -37,7 +37,7 @@ encoding:
   encoder: "auto"  # Options: auto, nvh264enc, x264enc
 
   h264:
-    bitrate: 8000  # kbps - used for color and infrared streams
+    bitrate: 16000  # kbps - used for color and infrared streams
     tune: "zerolatency"
     speed_preset: "ultrafast"
     key_int_max: 30
@@ -47,12 +47,9 @@ encoding:
     num_threads: 8
 
   depth_h264:
-    bitrate: 8000  # kbps - used specifically for depth stream
+    bitrate: 16000  # kbps - used specifically for depth stream
     use_h264: true  # If false, use JPEG2000 for depth (preserves 16-bit)
 
-# ============================================================================
-# STREAMING PARAMETERS - MUST BE IDENTICAL FOR SENDER AND RECEIVER
-# ============================================================================
 streaming:
   sequential_start: false
   startup_delay: 2
@@ -61,13 +58,12 @@ streaming:
   udp:
     sync: false
     async: false
-    buffer_size: 2097152  # 2MB buffer for all streams
+    buffer_size: 109715200  # 2MB buffer for all streams
 
   # RTP Configuration
   rtp:
-    mtu: 1200
+    mtu: 12000                    # Maximum Transmission Unit
     config_interval: 1
-    # Payload type mappings - CRITICAL: Must match between sender and receiver
     payload_types:
       depth_h264: 96
       depth_jpeg2000: 112
@@ -75,45 +71,36 @@ streaming:
       ir_h264: 97
       infra_stereo_h264: 99
 
-  # Jitter Buffer Configuration (receiver side)
-  # These values control how the receiver handles network jitter
   jitter_buffer:
     depth:
-      latency: 200              # ms - increased for better stability
-      drop_on_latency: true
+      latency: 200
+      drop_on_latency: false
     color:
-      latency: 200              # ms - increased for better stability
-      drop_on_latency: true
+      latency: 200
+      drop_on_latency: false
     infra:
-      latency: 200              # ms - same as depth/color for consistency
-      drop_on_latency: true
+      latency: 200
+      drop_on_latency: false
     infra_stereo:
-      latency: 200              # ms - same as other streams
-      drop_on_latency: true
+      latency: 200
+      drop_on_latency: false
 
-  # Queue Configuration (both sender and receiver)
   queue:
-    max_size_buffers: 4         # Increased from 2 to 4 for better buffering
-    leaky: "downstream"         # Drop old frames when queue is full
+    max_size_buffers: 4
+    leaky: "downstream"
 
   # Processing Configuration (both sender and receiver)
   processing:
-    max_threads: 4              # Maximum threads for H.264 decoding
-    n_threads: 4                # Threads for videoconvert operations
+    max_threads: 4
+    n_threads: 4
 
-# ============================================================================
-# IMU CONFIGURATION
-# ============================================================================
 imu:
   enabled: true
   publish_rate: 200.0  # Hz - ROS2 publish rate
 
-# ============================================================================
-# RECEIVER SPECIFIC CONFIGURATION
-# ============================================================================
 receiver:
   show_views: false      # Display video streams in separate windows
-  view_scale: 0.5        # Scale factor for visualization windows (0.0-1.0)
+  view_scale: 1.0        # Scale factor for visualization windows (0.0-1.0)
   publish_odom: true     # Publish odometry for navigation stack
   odom_frame: "odom"
   base_link_frame: "base_link"
