@@ -256,7 +256,6 @@ class ConfigLoader:
     def get_receiver_config(self, args) -> dict:
         """Get receiver configuration with overrides."""
         return {
-            "local_ip": self.get("network.local_ip", None, getattr(args, "local_ip", None)),
             "show_views": self.get(
                 "receiver.show_views", False, getattr(args, "show_views", False)
             ),
@@ -266,6 +265,7 @@ class ConfigLoader:
             ),
             "odom_frame": self.get("receiver.odom_frame", "odom"),
             "base_link_frame": self.get("receiver.base_link_frame", "base_link"),
+            "local_ip": self.get("network.local_ip", "0.0.0.0", getattr(args, "local_ip", None)),
         }
 
     def create_default_intrinsics(self, width: int, height: int) -> CameraIntrinsics:
