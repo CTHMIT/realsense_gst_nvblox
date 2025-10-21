@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import Optional
 
 from gst_realsense_launch.rs_common import (
@@ -538,6 +539,126 @@ class StreamManager:
 
         self._run_pipeline_in_tmux(stream_config, pipeline, stream_type)
 
+    def add_depth_split_stream(
+        self,
+        stream_config: StreamConfig,
+        encoder_preference: str,
+        bitrate: int,
+        codec: str = "h264",
+    ):
+        """Add depth stream in split mode (high + low 8-bit streams)."""
+
+        if self.tmux_manager is None:
+            self.tmux_manager = TmuxSessionManager()
+
+        use_h265 = codec.lower() == "h265"
+
+        # 創建編碼器 - 注意這裡要處理 encoder_preference
+        # 如果指定了 h265，但 encoder_preference 是 nvh264enc，要改用對應的 h265 encoder
+        actual_encoder_preference = encoder_preference
+        if use_h265:
+            if encoder_preference == "nvh264enc":
+                actual_encoder_preference = "nvh265enc"
+            elif encoder_preference == "x264enc":
+                actual_encoder_preference = "x265enc"
+            elif encoder_preference == "auto":
+                actual_encoder_preference = "auto"
+
+        try:
+            encoder = EncoderFactory.create_encoder(
+                actual_encoder_preference, "depth", use_h264_for_depth=True, use_h265=use_h265
+            )
+        except RuntimeError as e:
+            LOGGER.error(f"Failed to create encoder: {e}")
+            if use_h265:
+                LOGGER.warning("Falling back to H.264 encoder")
+                encoder = EncoderFactory.create_encoder(
+                    encoder_preference, "depth", use_h264_for_depth=True, use_h265=False
+                )
+                codec = "h264"
+                use_h265 = False
+            else:
+                raise
+
+        # 使用 DepthSplitStreamStrategy
+        strategy = StreamStrategyFactory.create_strategy(
+            "depth", self.config_loader, split_mode=True
+        )
+
+        # 獲取 port
+        high_port = self.config_loader.get_port_for_stream("depth_high", stream_config.port + 1)
+        low_port = self.config_loader.get_port_for_stream("depth_low", stream_config.port + 2)
+
+        # 構建高位元組 pipeline
+        pipeline_high = strategy.build_sender_pipeline(
+            device=stream_config.device,
+            width=stream_config.width,
+            height=stream_config.height,
+            fps=stream_config.fps,
+            fourcc=stream_config.fourcc,
+            encoder=encoder,
+            host=self.config_loader.get("network.server_ip"),
+            port=high_port,
+            bitrate=bitrate,
+            is_high_byte=True,
+        )
+
+        # 構建低位元組 pipeline
+        pipeline_low = strategy.build_sender_pipeline(
+            device=stream_config.device,
+            width=stream_config.width,
+            height=stream_config.height,
+            fps=stream_config.fps,
+            fourcc=stream_config.fourcc,
+            encoder=encoder,
+            host=self.config_loader.get("network.server_ip"),
+            port=low_port,
+            bitrate=bitrate,
+            is_high_byte=False,
+        )
+
+        # 記錄資訊
+        LOGGER.info(
+            f"[{stream_config.device}] Starting DEPTH (SPLIT MODE) on ports {high_port}, {low_port}"
+        )
+        LOGGER.info(f"  Format: {stream_config.fourcc}")
+        LOGGER.info(
+            f"  Resolution: {stream_config.width}x{stream_config.height}@{stream_config.fps}fps"
+        )
+        LOGGER.info(f"  Encoding: {codec.upper()} (split mode)")
+        LOGGER.info(f"  Bitrate: {bitrate}kbps per stream")
+
+        # 使用 dataclasses.replace 替代 _replace
+        # 或者直接創建新的 StreamConfig
+        high_config = StreamConfig(
+            name="depth_high",
+            port=high_port,
+            encoding=stream_config.encoding,
+            width=stream_config.width,
+            height=stream_config.height,
+            fps=stream_config.fps,
+            device=stream_config.device,
+            fourcc=stream_config.fourcc,
+            verbose=stream_config.verbose,
+        )
+
+        low_config = StreamConfig(
+            name="depth_low",
+            port=low_port,
+            encoding=stream_config.encoding,
+            width=stream_config.width,
+            height=stream_config.height,
+            fps=stream_config.fps,
+            device=stream_config.device,
+            fourcc=stream_config.fourcc,
+            verbose=stream_config.verbose,
+        )
+
+        # 在 tmux 中運行兩個 pipeline
+        self._run_pipeline_in_tmux(high_config, pipeline_high, "depth_high")
+        time.sleep(0.3)
+        self._run_pipeline_in_tmux(low_config, pipeline_low, "depth_low")
+
     def _run_pipeline_in_tmux(self, config: StreamConfig, pipeline_str: str, stream_type: str):
         """Run GStreamer pipeline in a tmux window."""
         label = format_stream_label(stream_type, None)
@@ -616,6 +737,42 @@ class StreamManager:
             LOGGER.info("=" * 70)
             LOGGER.info("✓ All streams stopped. Clean exit.")
             LOGGER.info("=" * 70 + "\n")
+
+
+def check_encoder_availability():
+    """Check and report available encoders."""
+    encoders = {
+        "nvh264enc": "NVIDIA H.264 (hardware)",
+        "x264enc": "x264 H.264 (software)",
+        "nvh265enc": "NVIDIA H.265 (hardware)",
+        "x265enc": "x265 H.265 (software)",
+    }
+
+    available = []
+    missing = []
+
+    for encoder, description in encoders.items():
+        result = subprocess.run(
+            ["gst-inspect-1.0", encoder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode == 0:
+            available.append(f"  ✓ {encoder}: {description}")
+        else:
+            missing.append(f"  ✗ {encoder}: {description}")
+
+    if available:
+        LOGGER.info("Available encoders:")
+        for enc in available:
+            LOGGER.info(enc)
+
+    if missing:
+        LOGGER.warning("Missing encoders:")
+        for enc in missing:
+            LOGGER.warning(enc)
+        LOGGER.info("\nTo install missing encoders:")
+        LOGGER.info("  sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly")
+
+    return len(available) > 0
 
 
 def find_best_mode(
@@ -726,7 +883,9 @@ def main():
     parser.add_argument("--resolution", help="Override resolution (WIDTHxHEIGHT)")
     parser.add_argument("--fps", type=int, help="Override target FPS")
     parser.add_argument(
-        "--encoder", choices=["auto", "nvh264enc", "x264enc"], help="Override encoder preference"
+        "--encoder",
+        choices=["auto", "nvh264enc", "x264enc", "nvh265enc", "x265enc"],
+        help="Override encoder preference",
     )
     parser.add_argument("--bitrate", type=int, help="Override H.264 bitrate (kbps)")
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
@@ -739,6 +898,8 @@ def main():
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
+
+    check_encoder_availability()
 
     # Load configuration
     config_loader = ConfigLoader(args.config)
@@ -821,7 +982,14 @@ def main():
                 network_cfg["imu_port"],
             )
 
+    # Get encoding configuration
     actual_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
+
+    # Get depth configuration (只在這裡宣告一次)
+    depth_mode = config_loader.get("encoding.depth.mode", "legacy")
+    depth_codec = config_loader.get("encoding.depth.codec", "h264")
+    depth_split_bitrate = config_loader.get("encoding.depth.split_bitrate", 8000)
+    depth_legacy_bitrate = config_loader.get("encoding.depth.legacy_bitrate", 16000)
 
     # Use preset configuration if available
     if args.preset:
@@ -830,23 +998,29 @@ def main():
         if preset:
             if args.verbose:
                 LOGGER.info(f"Using {args.preset.upper()} preset configuration:")
+                LOGGER.info(f"  Depth mode: {depth_mode}")
+                LOGGER.info(f"  Depth codec: {depth_codec}")
 
+            # Build camera type mapping
             camera_by_type = {}
             for cam in cameras:
                 stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
                 camera_by_type[stream_type] = cam
 
+            # Process each stream in preset
             for stream_def in preset["streams"]:
                 stream_name = stream_def["name"]
                 encoding = stream_def["encoding"]
                 port_offset = stream_def["port_offset"]
 
+                # Step 1: Find the camera for this stream
                 cam = None
                 if stream_name == "depth":
                     cam = camera_by_type.get("depth")
                 elif stream_name == "color":
                     cam = camera_by_type.get("color")
                 elif stream_name == "infra_stereo":
+                    # Try to find Y8I camera
                     for c in cameras:
                         if c.modes and c.modes[0].fourcc.strip().upper() == "Y8I":
                             cam = c
@@ -860,6 +1034,7 @@ def main():
                     LOGGER.info(f"  No camera found for {stream_name}, skipping")
                     continue
 
+                # Step 2: Determine target format and size
                 if stream_name == "infra_stereo":
                     target_format = camera_cfg.get("infra_format", "Y8I")
                     mode_target_size = (target_size[0] * 2, target_size[1])
@@ -879,6 +1054,7 @@ def main():
                         stream_name.replace("infra", "infra").replace("1", "").replace("2", "")
                     )
 
+                # Step 3: Find best mode for this camera
                 mode = find_best_mode(cam, mode_target_size, actual_stream_type, target_format)
 
                 if not mode:
@@ -888,6 +1064,7 @@ def main():
                 fps = get_best_fps(mode, camera_cfg["fps"])
                 port = network_cfg["base_port"] + port_offset
 
+                # Step 4: Create stream configuration
                 stream_cfg = StreamConfig(
                     name=stream_name,
                     port=port,
@@ -900,9 +1077,37 @@ def main():
                     verbose=args.verbose,
                 )
 
-                manager.add_stream(
-                    stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
-                )
+                # Step 5: Add stream based on type and mode
+                if stream_name == "depth":
+                    if depth_mode == "split":
+                        LOGGER.info(f"Using DEPTH SPLIT mode with {depth_codec.upper()}")
+                        manager.add_depth_split_stream(
+                            stream_cfg,
+                            encoding_cfg["encoder"],
+                            depth_split_bitrate,
+                            depth_codec,
+                        )
+                    else:
+                        LOGGER.info(f"Using DEPTH LEGACY mode with {encoding.upper()}")
+                        # Legacy mode 使用配置中的 bitrate
+                        manager.add_stream(
+                            stream_cfg,
+                            actual_stream_type,
+                            encoding_cfg["encoder"],
+                            depth_legacy_bitrate,
+                        )
+                else:
+                    # 其他 stream (color, infra, etc.)
+                    manager.add_stream(
+                        stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
+                    )
+
+        else:
+            LOGGER.error(f"Preset '{args.preset}' not found in configuration")
+            sys.exit(1)
+    else:
+        LOGGER.error("No preset specified. Use --preset option")
+        sys.exit(1)
 
     time.sleep(1)
     LOGGER.info(f"{'='*40}")

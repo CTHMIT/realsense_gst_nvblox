@@ -17,9 +17,51 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
+
+import numpy as np
 
 from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
+from node.depth_merger_node import DepthMergerNode
 from utils.logger import LOGGER
+
+
+class DepthMergeProcessor:
+    """處理兩個 8-bit depth streams 並合併為 16-bit."""
+
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.high_byte_buffer: np.ndarray | None = None
+        self.low_byte_buffer: np.ndarray | None = None
+        self.last_high_time = 0.0
+        self.last_low_time = 0.0
+
+    def update_high_byte(self, data: np.ndarray, timestamp: float):
+        """更新高位元組數據."""
+        self.high_byte_buffer = data
+        self.last_high_time = timestamp
+
+    def update_low_byte(self, data: np.ndarray, timestamp: float):
+        """更新低位元組數據."""
+        self.low_byte_buffer = data
+        self.last_low_time = timestamp
+
+    def get_merged_depth(self) -> np.ndarray | None:
+        """合併高低位元組為 16-bit depth 影像."""
+        if self.high_byte_buffer is None or self.low_byte_buffer is None:
+            return None
+
+        # 檢查時間同步 (允許 100ms 誤差)
+        time_diff = abs(self.last_high_time - self.last_low_time)
+        if time_diff > 0.1:
+            LOGGER.warning(f"Depth high/low byte time mismatch: {time_diff*1000:.1f}ms")
+
+        # 合併: depth = (high << 8) | low
+        high_shifted = self.high_byte_buffer.astype(np.uint16) << 8
+        depth_16bit = high_shifted | self.low_byte_buffer.astype(np.uint16)
+
+        return depth_16bit
 
 
 class TmuxSessionManager:
@@ -181,6 +223,7 @@ class VideoStreamReceiver:
 
         self.tmux_manager = TmuxSessionManager()
         self._shutdown_event = threading.Event()
+        self.depth_merge_processor: DepthMergeProcessor | None = None
 
     def start_stream(
         self,
@@ -740,6 +783,178 @@ projection_matrix:
             except Exception as e:
                 LOGGER.debug(f"  Error checking pattern '{pattern}': {e}")
 
+    def start_depth_split_streams(
+        self,
+        high_port: int,
+        low_port: int,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None = None,
+    ):
+        """啟動 depth split 模式的接收器."""
+
+        LOGGER.info(f"[depth] Starting SPLIT MODE reception")
+        LOGGER.info(f"  High byte port: {high_port}")
+        LOGGER.info(f"  Low byte port: {low_port}")
+        LOGGER.info(f"  Encoding: {encoding.upper()}")
+
+        # 初始化 merge processor
+        self.depth_merge_processor = DepthMergeProcessor(width, height)
+
+        # 為高位元組和低位元組各啟動一個接收 pipeline
+        self._start_depth_byte_stream_in_tmux(
+            high_port, "depth_high", encoding, width, height, intrinsics
+        )
+
+        time.sleep(0.5)
+
+        self._start_depth_byte_stream_in_tmux(
+            low_port, "depth_low", encoding, width, height, intrinsics
+        )
+
+        time.sleep(0.5)
+
+        # 啟動 merger node 將兩個 8-bit 合併為 16-bit
+        self._start_depth_merger_node(width, height, intrinsics)
+
+    def _start_depth_byte_stream_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """啟動單個 8-bit depth stream 接收器 (不發布到 ROS2)."""
+
+        # 使用臨時 topic，稍後由 merger node 處理
+        temp_topic = f"/{self.camera_name}/{stream_name}/image_raw"
+        temp_info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
+
+        calib_file = self._get_calibration_file_path("depth", width, height)
+
+        if calib_file:
+            info_file_url = f"file://{calib_file}"
+            tmp_file_path = None
+        else:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
+            self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
+            info_file_url = f"file://{tmp_file.name}"
+            tmp_file_path = tmp_file.name
+            tmp_file.close()
+
+        # 建立 8-bit 接收 pipeline
+        gst_config = self._build_depth_split_pipeline(port, stream_name, encoding, width, height)
+
+        frame_id = f"{self.camera_name}_depth_optical_frame"
+
+        gscam_cmd_parts = [
+            "ros2 run gscam gscam_node",
+            "--ros-args",
+            f"-p gscam_config:='{gst_config}'",
+            f"-p camera_name:={self.camera_name}_{stream_name}",
+            f"-p camera_info_url:={info_file_url}",
+            f"-p frame_id:={frame_id}",
+            "-p sync_sink:=false",
+            "-p image_encoding:=mono8",
+            f"-r camera/image_raw:={temp_topic}",
+            f"-r camera/camera_info:={temp_info_topic}",
+        ]
+
+        gscam_cmd = " ".join(gscam_cmd_parts)
+
+        if tmp_file_path:
+            gscam_cmd = f"trap 'rm -f {tmp_file_path}' EXIT; {gscam_cmd}"
+
+        window_name = f"{stream_name}_{port}"
+
+        LOGGER.info(f"[{stream_name}] Starting on port {port}")
+        LOGGER.info(f"  Temp topic: {temp_topic}")
+
+        self.tmux_manager.create_window(window_name, gscam_cmd)
+
+    def _build_depth_split_pipeline(
+        self, port: int, stream_name: str, encoding: str, width: int, height: int
+    ) -> str:
+        """建立 depth split 接收 pipeline (輸出 GRAY8)."""
+
+        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.depth.drop_on_latency", False
+        )
+        drop_str = "true" if drop_on_latency else "false"
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+
+        if encoding.lower() == "h264":
+            pt_key = f"{stream_name}_h264"
+            pt = payload_types.get(pt_key, 114)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={pt}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8"
+            )
+        elif encoding.lower() == "h265":
+            pt_key = f"{stream_name}_h265"
+            pt = payload_types.get(pt_key, 116)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={pt}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph265depay ! h265parse ! avdec_h265 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8"
+            )
+        else:
+            pipeline = ""
+
+        return pipeline
+
+    def _start_depth_merger_node(
+        self, width: int, height: int, intrinsics: CameraIntrinsics | None
+    ):
+        """啟動 depth merger node 將兩個 8-bit 合併為 16-bit 並發布."""
+
+        # 建立 ROS2 node 啟動命令
+        merger_cmd_parts = [
+            "ros2 run gst_realsense_launch depth_merger_node.py",
+            "--ros-args",
+            f"-p camera_name:={self.camera_name}",
+            f"-p width:={width}",
+            f"-p height:={height}",
+        ]
+
+        merger_cmd = " ".join(merger_cmd_parts)
+        window_name = "depth_merger"
+
+        LOGGER.info(f"  [MERGER] Starting depth merger node")
+        LOGGER.info(
+            f"    Input: /{self.camera_name}/depth_high/image_raw, /{self.camera_name}/depth_low/image_raw"
+        )
+        LOGGER.info(f"    Output: /{self.camera_name}/depth/image_rect_raw (mono16)")
+
+        self.tmux_manager.create_window(window_name, merger_cmd)
+
+        # 啟動 depth conversion node (如果啟用)
+        time.sleep(1.0)
+        depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
+        info_topic = f"/{self.camera_name}/depth/camera_info"
+        self._start_depth_conversion_node(0, depth_topic, info_topic)
+
 
 def check_and_cleanup_existing_resources(camera_name: str):
     """Check for and clean up any existing resources before starting."""
@@ -823,6 +1038,16 @@ def main():
         width = args.width or 640
         height = args.height or 480
 
+        depth_mode = config_loader.get("encoding.depth.mode", "legacy")
+        depth_codec = config_loader.get("encoding.depth.codec", "h264")
+
+        video_receiver = VideoStreamReceiver(
+            camera_name=camera_cfg["camera_name"],
+            config_loader=config_loader,
+            show_views=receiver_cfg.get("show_views", False),
+            view_scale=receiver_cfg.get("view_scale", 0.5),
+        )
+
         if args.preset:
             preset = config_loader.get_preset(args.preset)
             if preset:
@@ -834,16 +1059,40 @@ def main():
                 heights = []
 
                 for s in streams:
-                    port = network_cfg["base_port"] + s["port_offset"]
-                    ports.append(port)
-                    stream_names.append(s["name"])
-                    encodings.append(s["encoding"])
+                    if s["name"] == "depth":
+                        port = network_cfg["base_port"] + s["port_offset"]
 
-                    if s["name"] == "infra_stereo":
-                        widths.append(width * 2)
+                        if depth_mode == "split":
+                            LOGGER.info(f"Using DEPTH SPLIT mode")
+                            high_port = config_loader.get_port_for_stream("depth_high", port + 1)
+                            low_port = config_loader.get_port_for_stream("depth_low", port + 2)
+
+                            intrinsics = config_loader.create_default_intrinsics(width, height)
+                            video_receiver.start_depth_split_streams(
+                                high_port,
+                                low_port,
+                                depth_codec,
+                                width,
+                                height,
+                                intrinsics,
+                            )
+                        else:
+                            LOGGER.info(f"Using DEPTH LEGACY mode")
+                            intrinsics = config_loader.create_default_intrinsics(width, height)
+                            video_receiver.start_stream(
+                                port, "depth", s["encoding"], width, height, intrinsics
+                            )
                     else:
-                        widths.append(width)
-                    heights.append(height)
+                        port = network_cfg["base_port"] + s["port_offset"]
+                        ports.append(port)
+                        stream_names.append(s["name"])
+                        encodings.append(s["encoding"])
+
+                        if s["name"] == "infra_stereo":
+                            widths.append(width * 2)
+                        else:
+                            widths.append(width)
+                        heights.append(height)
 
                 LOGGER.info(f"Using {args.preset.upper()} preset")
             else:
@@ -861,13 +1110,6 @@ def main():
         for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
             LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
         LOGGER.info(f"{'='*40}")
-
-        video_receiver = VideoStreamReceiver(
-            camera_name=camera_cfg["camera_name"],
-            config_loader=config_loader,
-            show_views=receiver_cfg.get("show_views", False),
-            view_scale=receiver_cfg.get("view_scale", 0.5),
-        )
 
         for port, stream, encoding, stream_width, stream_height in zip(
             ports, stream_names, encodings, widths, heights, strict=False
