@@ -34,6 +34,9 @@ setup(
             "gst_receiver = gst_realsense_launch.gst_receiver:main",
             "rs_camera_info_parser = gst_realsense_launch.rs_camera_info_parser:main",
             "network_diagnostics = gst_realsense_launch.network_diagnostics:main",
+            "depth_merger_node.py = node.depth_merger_node:main",
+            "imu_receiver_node.py = node.imu_receiver_node:main",
+            "tf_odom_publisher_node.py = node.tf_odom_publisher_node:main",
         ],
     },
 )
