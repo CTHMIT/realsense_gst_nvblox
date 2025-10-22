@@ -6,12 +6,12 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from gst_realsense_launch.gst_realsense_launch.gst_receiver import (
+from gst_realsense_launch.startup.gst_receiver import (
     TmuxSessionManager,
     VideoStreamReceiver,
     check_and_cleanup_existing_resources,
 )
-from gst_realsense_launch.gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
+from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
 
 
 class TestTmuxSessionManager:
