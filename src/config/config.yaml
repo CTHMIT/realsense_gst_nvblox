@@ -73,7 +73,7 @@ streaming:
   udp:
     sync: false
     async: false
-    buffer_size: 30000000 # in bytes (30 MB)
+    buffer_size: 10000000 # in bytes (30 MB)
 
   # RTP Configuration
   rtp:

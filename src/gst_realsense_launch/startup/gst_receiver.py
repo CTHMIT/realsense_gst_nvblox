@@ -11,25 +11,22 @@ Features:
 """
 
 import argparse
+import getpass
+import os
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Tuple
 
 import numpy as np
 
-# Fixed imports - use relative path from startup directory
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-try:
-    from rs_common import CameraIntrinsics, ConfigLoader
-except ImportError:
-    # Try parent directory
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from startup.rs_common import CameraIntrinsics, ConfigLoader
+from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
 
 try:
     from utils.logger import LOGGER
@@ -41,7 +38,7 @@ except ImportError:
 
 
 class DepthMergeProcessor:
-    """處理兩個 8-bit depth streams 並合併為 16-bit."""
+    """8-bit depth streams to 16-bit."""
 
     def __init__(self, width: int, height: int):
         self.width = width
@@ -767,6 +764,58 @@ projection_matrix:
         except KeyboardInterrupt:
             pass
 
+    def kill_gst_launch(
+        self, timeout: float = 2.0, include_root: bool = False
+    ) -> tuple[list[int], list[int]]:
+        """
+        Kill all running gst-launch-1.0 processes.
+        """
+        user = getpass.getuser()
+
+        def list_targets() -> list[int]:
+            out = subprocess.check_output(["ps", "-eo", "pid,user,comm"], text=True)
+            pids: list[int] = []
+            for i, line in enumerate(out.splitlines()):
+                if i == 0 or not line.strip():
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid_str, owner, comm = parts
+                if comm == "gst-launch-1.0" and (include_root or owner == user):
+                    try:
+                        pids.append(int(pid_str))
+                    except ValueError:
+                        pass
+            return pids
+
+        initial = list_targets()
+        if not initial:
+            return ([], [])
+
+        for pid in initial:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+        time.sleep(timeout)
+
+        remaining = set(list_targets()).intersection(initial)
+        for pid in list(remaining):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except PermissionError:
+                # 沒權限時保留在 remaining
+                pass
+
+        killed = [pid for pid in initial if pid not in remaining]
+        return (killed, sorted(list(remaining)))
+
     def stop_all(self):
         """Stop all video receivers and tmux session."""
         self._shutdown_event.set()
@@ -775,6 +824,7 @@ projection_matrix:
         LOGGER.info("=" * 40)
 
         try:
+            self.kill_gst_launch()
             if self.tmux_manager:
                 LOGGER.info("[1/2] Stopping GStreamer pipelines...")
                 self.tmux_manager.kill_session()
@@ -1092,6 +1142,11 @@ def check_and_cleanup_existing_resources(camera_name: str):
     return True
 
 
+def signal_handler(signum, frame):
+    LOGGER.info(f"⚠ Received signal {signum}")
+    sys.exit(0)
+
+
 def main():
     """Run the RealSense GStreamer receiver."""
     parser = argparse.ArgumentParser(description="RealSense GStreamer Stream Receiver")
@@ -1232,11 +1287,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import signal
-
-    def signal_handler(signum, frame):
-        LOGGER.info(f"⚠ Received signal {signum}")
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

@@ -8,6 +8,7 @@ visibility and debugging capabilities.
 
 import argparse
 import atexit
+import getpass
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from typing import Optional
+from typing import List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -556,8 +557,6 @@ class StreamManager:
 
         use_h265 = codec.lower() == "h265"
 
-        # 創建編碼器 - 注意這裡要處理 encoder_preference
-        # 如果指定了 h265，但 encoder_preference 是 nvh264enc，要改用對應的 h265 encoder
         actual_encoder_preference = encoder_preference
         if use_h265:
             if encoder_preference == "nvh264enc":
@@ -703,7 +702,60 @@ class StreamManager:
         except KeyboardInterrupt:
             LOGGER.info("Received KeyboardInterrupt. Shutting down...")
         finally:
+            self.kill_gst_launch()
             self.stop_all()
+
+    def kill_gst_launch(
+        self, timeout: float = 2.0, include_root: bool = False
+    ) -> tuple[list[int], list[int]]:
+        """
+        Kill all running gst-launch-1.0 processes.
+        """
+        user = getpass.getuser()
+
+        def list_targets() -> list[int]:
+            out = subprocess.check_output(["ps", "-eo", "pid,user,comm"], text=True)
+            pids: list[int] = []
+            for i, line in enumerate(out.splitlines()):
+                if i == 0 or not line.strip():
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid_str, owner, comm = parts
+                if comm == "gst-launch-1.0" and (include_root or owner == user):
+                    try:
+                        pids.append(int(pid_str))
+                    except ValueError:
+                        pass
+            return pids
+
+        initial = list_targets()
+        if not initial:
+            return ([], [])
+
+        for pid in initial:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+        time.sleep(timeout)
+
+        remaining = set(list_targets()).intersection(initial)
+        for pid in list(remaining):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except PermissionError:
+                # 沒權限時保留在 remaining
+                pass
+
+        killed = [pid for pid in initial if pid not in remaining]
+        return (killed, sorted(list(remaining)))
 
     def stop_all(self):
         """Stop all running streams, IMU senders, and tmux session (idempotent)."""
@@ -715,7 +767,7 @@ class StreamManager:
             self._stopped = True
             self._shutdown.set()
 
-            LOGGER.info("\n" + "=" * 40)
+            LOGGER.info("=" * 40)
             LOGGER.info("SHUTTING DOWN - Stopping all streams...")
             LOGGER.info("=" * 40)
 
@@ -739,7 +791,7 @@ class StreamManager:
 
             LOGGER.info("=" * 70)
             LOGGER.info("✓ All streams stopped. Clean exit.")
-            LOGGER.info("=" * 70 + "\n")
+            LOGGER.info("=" * 70)
 
 
 def check_encoder_availability():
@@ -772,8 +824,8 @@ def check_encoder_availability():
         LOGGER.warning("Missing encoders:")
         for enc in missing:
             LOGGER.warning(enc)
-        LOGGER.info("\nTo install missing encoders:")
-        LOGGER.info("  sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly")
+        LOGGER.warning("To install missing encoders:")
+        LOGGER.warning("  sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly")
 
     return len(available) > 0
 
