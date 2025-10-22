@@ -60,7 +60,7 @@ encoding:
 
   # Depth encoding configuration
   depth:
-    mode: "split"  # Options: "legacy" (16-bit H.264/H.265), "split" (two 8-bit streams)
+    mode: "legacy"  # Options: "legacy" (16-bit H.264/H.265), "split" (two 8-bit streams)
     codec: "h264"  # Options: "h264", "h265" (only for legacy mode)
     split_bitrate: 8000  # kbps per stream (high/low) in split mode
     legacy_bitrate: 16000  # kbps for 16-bit stream in legacy mode
@@ -73,7 +73,7 @@ streaming:
   udp:
     sync: false
     async: false
-    buffer_size: 3000000000  # 30MB buffer for all streams
+    buffer_size: 30000000 # in bytes (150 MB)
 
   # RTP Configuration
   rtp:

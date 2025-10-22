@@ -21,9 +21,23 @@ from typing import Optional
 
 import numpy as np
 
-from gst_realsense_launch.node.depth_merger_node import DepthMergerNode
-from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
-from utils.logger import LOGGER
+# Fixed imports - use relative path from startup directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from rs_common import CameraIntrinsics, ConfigLoader
+except ImportError:
+    # Try parent directory
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from startup.rs_common import CameraIntrinsics, ConfigLoader
+
+try:
+    from utils.logger import LOGGER
+except ImportError:
+    import logging
+
+    LOGGER = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
 
 
 class DepthMergeProcessor:
@@ -45,7 +59,7 @@ class DepthMergeProcessor:
     def update_low_byte(self, data: np.ndarray, timestamp: float):
         """更新低位元組數據."""
         self.low_byte_buffer = data
-        self.last_low_time = timestamp
+        self.low_time = timestamp
 
     def get_merged_depth(self) -> np.ndarray | None:
         """合併高低位元組為 16-bit depth 影像."""
@@ -396,13 +410,18 @@ class VideoStreamReceiver:
         LOGGER.info(f"    Input: {depth_topic} (mono16)")
         LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
 
-        time.sleep(0.5)
+        time.sleep(1.0)
         self.tmux_manager.create_window(window_name, convert_cmd)
 
     def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
-        """Build GStreamer pipeline for standard streams."""
+        """Build GStreamer pipeline for receiving video streams."""
 
-        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        # FIXED: Use safe buffer size (30MB instead of 1.5GB)
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000),
+            30000000,  # 30MB - safe for gint
+        )
+
         max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
         n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
         max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
@@ -413,7 +432,7 @@ class VideoStreamReceiver:
         if stream_name == "depth":
             latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
             drop_on_latency = self.config_loader.get(
-                "streaming.jitter_buffer.depth.drop_on_latency", True
+                "streaming.jitter_buffer.depth.drop_on_latency", False
             )
             drop_str = "true" if drop_on_latency else "false"
             payload = payload_types.get("depth_h264", 96)
@@ -430,7 +449,7 @@ class VideoStreamReceiver:
         elif stream_name == "color":
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
             drop_on_latency = self.config_loader.get(
-                "streaming.jitter_buffer.color.drop_on_latency", True
+                "streaming.jitter_buffer.color.drop_on_latency", False
             )
             drop_str = "true" if drop_on_latency else "false"
             payload = payload_types.get("color_h264", 98)
@@ -470,7 +489,11 @@ class VideoStreamReceiver:
         """Build GStreamer pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        # FIXED: Use safe buffer size
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
         latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
         drop_on_latency = self.config_loader.get(
             "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
@@ -538,7 +561,11 @@ class VideoStreamReceiver:
     ) -> str:
         """Build independent visualization pipeline."""
 
-        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        # FIXED: Use safe buffer size
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
         max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
         max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
         leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
@@ -613,10 +640,14 @@ class VideoStreamReceiver:
         display_width: int,
         display_height: int,
     ) -> str:
-        """Build independent visualization pipeline for Y8I streams."""
+        """Build visualization pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
+        # FIXED: Use safe buffer size
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
         latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
         drop_on_latency = self.config_loader.get(
             "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
@@ -652,8 +683,11 @@ class VideoStreamReceiver:
 
     def _get_calibration_file_path(self, stream_name: str, width: int, height: int) -> str | None:
         """Get the path to the calibration file for the given stream and resolution."""
+        # FIXED: Match actual calibration file naming (camera_<type>_<resolution>.yaml)
         stream_mapping = {
             "depth": "depth",
+            "depth_high": "depth_high",
+            "depth_low": "depth_low",
             "color": "color",
             "infra1": "infrared",
             "infra2": "infrared",
@@ -665,10 +699,13 @@ class VideoStreamReceiver:
         config_paths = [
             Path("src/config"),
             Path(__file__).parent.parent / "config",
+            Path(__file__).parent / "config",
+            Path("config"),
             Path.home() / ".config" / "realsense",
         ]
 
-        filename = f"{stream_prefix}_camera_{resolution}.yaml"
+        # FIXED: Use correct naming pattern camera_<type>_<resolution>.yaml
+        filename = f"{self.camera_name}_{stream_prefix}_{resolution}.yaml"
 
         for config_dir in config_paths:
             filepath = config_dir / filename
@@ -746,42 +783,48 @@ projection_matrix:
             LOGGER.info("[2/2] Checking for orphaned processes...")
             self._cleanup_orphaned_processes()
 
-        except Exception as e:
-            LOGGER.error(f"Error during cleanup: {e}")
+            LOGGER.info("=" * 40)
+            LOGGER.info("✓ SHUTDOWN COMPLETE")
+            LOGGER.info("=" * 40)
 
-        LOGGER.info("=" * 40)
-        LOGGER.info("✓ SHUTDOWN COMPLETE")
-        LOGGER.info("=" * 40)
+        except Exception as e:
+            LOGGER.error(f"Error during shutdown: {e}")
 
     def _cleanup_orphaned_processes(self):
-        """Clean up any orphaned gscam or depth_image_proc processes."""
-        process_patterns = [
+        """Clean up any orphaned ROS2/gscam processes."""
+        patterns = [
             f"gscam.*{self.camera_name}",
-            f"depth_image_proc.*{self.camera_name}",
+            "depth_image_proc",
             "convert_metric_node",
+            "depth_merger_node",
         ]
 
-        for pattern in process_patterns:
+        for pattern in patterns:
             try:
                 result = subprocess.run(
                     ["pgrep", "-f", pattern],
                     capture_output=True,
                     text=True,
-                    timeout=2,
+                    timeout=5,
                     check=False,
                 )
 
-                if result.returncode == 0 and result.stdout:
+                if result.returncode == 0:
                     pids = result.stdout.strip().split("\n")
+                    LOGGER.info(f"  Found {len(pids)} orphaned processes matching '{pattern}'")
+
                     for pid in pids:
                         if pid and pid.isdigit():
                             try:
-                                subprocess.run(["kill", "-TERM", pid], timeout=1, check=False)
-                                LOGGER.info(f"  Terminated orphaned process (PID {pid})")
+                                subprocess.run(["kill", "-TERM", pid], timeout=2, check=False)
+                                LOGGER.info(f"    ✓ Terminated PID {pid}")
                             except Exception as e:
-                                LOGGER.debug(f"  Could not kill PID {pid}: {e}")
+                                LOGGER.debug(f"    Could not terminate PID {pid}: {e}")
+
             except Exception as e:
-                LOGGER.debug(f"  Error checking pattern '{pattern}': {e}")
+                LOGGER.debug(f"  Error checking for pattern '{pattern}': {e}")
+
+        time.sleep(1)
 
     def start_depth_split_streams(
         self,
@@ -790,10 +833,9 @@ projection_matrix:
         encoding: str,
         width: int,
         height: int,
-        intrinsics: CameraIntrinsics | None = None,
+        intrinsics: CameraIntrinsics,
     ):
-        """啟動 depth split 模式的接收器."""
-
+        """Start depth split mode reception (8-bit high + 8-bit low = 16-bit depth)."""
         LOGGER.info(f"[depth] Starting SPLIT MODE reception")
         LOGGER.info(f"  High byte port: {high_port}")
         LOGGER.info(f"  Low byte port: {low_port}")
@@ -833,7 +875,8 @@ projection_matrix:
         temp_topic = f"/{self.camera_name}/{stream_name}/image_raw"
         temp_info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
 
-        calib_file = self._get_calibration_file_path("depth", width, height)
+        # FIXED: Look for stream-specific calibration files
+        calib_file = self._get_calibration_file_path(stream_name, width, height)
 
         if calib_file:
             info_file_url = f"file://{calib_file}"
@@ -882,11 +925,28 @@ projection_matrix:
     ) -> str:
         """建立 depth split 接收 pipeline (輸出 GRAY8)."""
 
-        buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
-        latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
-        drop_on_latency = self.config_loader.get(
-            "streaming.jitter_buffer.depth.drop_on_latency", False
+        # FIXED: Use safe buffer size
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
+
+        # FIXED: Use stream-specific jitter buffer settings
+        if stream_name == "depth_high":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_high.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth_high.drop_on_latency", False
+            )
+        elif stream_name == "depth_low":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_low.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth_low.drop_on_latency", False
+            )
+        else:
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth.drop_on_latency", False
+            )
+
         drop_str = "true" if drop_on_latency else "false"
         max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
         n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
@@ -929,9 +989,32 @@ projection_matrix:
     ):
         """啟動 depth merger node 將兩個 8-bit 合併為 16-bit 並發布."""
 
-        # 建立 ROS2 node 啟動命令
+        # FIXED: Run depth_merger_node.py directly with python3 instead of ros2 run
+        # Find the depth_merger_node.py script
+        script_paths = [
+            Path(__file__).parent / "depth_merger_node.py",
+            Path(__file__).parent.parent / "node" / "depth_merger_node.py",
+            Path("src/gst_realsense_launch/node/depth_merger_node.py"),
+            Path("depth_merger_node.py"),
+        ]
+
+        script_path = None
+        for path in script_paths:
+            if path.exists():
+                script_path = path
+                break
+
+        if not script_path:
+            LOGGER.error("  ✗ Could not find depth_merger_node.py")
+            LOGGER.error(
+                "  Please ensure depth_merger_node.py is in the same directory as gst_receiver.py"
+            )
+            return
+
+        # 建立 Python 直接執行命令
         merger_cmd_parts = [
-            "ros2 run gst_realsense_launch depth_merger_node.py",
+            "python3",
+            str(script_path.absolute()),
             "--ros-args",
             f"-p camera_name:={self.camera_name}",
             f"-p width:={width}",
@@ -976,6 +1059,7 @@ def check_and_cleanup_existing_resources(camera_name: str):
         f"gscam.*{camera_name}",
         "depth_image_proc",
         "convert_metric_node",
+        "depth_merger_node",
     ]
 
     for pattern in patterns:

@@ -15,7 +15,8 @@ sudo apt-get install -y \
     libgstreamer-plugins-base1.0-dev \
     v4l-utils \
     iperf3 \
-    tmux
+    tmux \
+    ffmpeg
 
 echo "===== [3/4] Installing Intel RealSense SDK ====="
 sudo mkdir -p /etc/apt/keyrings

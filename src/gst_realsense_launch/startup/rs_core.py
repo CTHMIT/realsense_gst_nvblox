@@ -488,16 +488,12 @@ class DepthSplitStreamStrategy(StreamPipelineStrategy):
 
         fourcc_clean = fourcc.strip().ljust(4)
 
-        # Step 1: v4l2-ctl 捕獲 RAW 16-bit depth (Z16/GRAY16_LE)
         v4l2_cmd = (
             f"v4l2-ctl -d {shlex.quote(device)} "
             f"--set-fmt-video=width={width},height={height},pixelformat='{fourcc_clean}' "
             f"--set-parm={fps} --stream-mmap --stream-to=- 2>/dev/null"
         )
 
-        # Step 2: ffmpeg 使用 lut 濾鏡分離高低位元組
-        # 高位: val/256 (等同於 >> 8)
-        # 低位: mod(val,256) (等同於 & 0xFF)
         lut_expr = "val/256" if is_high_byte else "mod(val,256)"
 
         ffmpeg_cmd = (
@@ -507,7 +503,6 @@ class DepthSplitStreamStrategy(StreamPipelineStrategy):
             f"-f rawvideo -pix_fmt gray -"
         )
 
-        # Step 3: 確定 RTP payload type
         enc_name = encoder.get_encoding_name().upper()
 
         if self.config_loader:
@@ -519,7 +514,6 @@ class DepthSplitStreamStrategy(StreamPipelineStrategy):
 
         encoder_pipeline = encoder.get_pipeline_element(bitrate=bitrate, pt=pt, config=config)
 
-        # Step 4: GStreamer 編碼並透過 RTP 發送
         gst_cmd = (
             "gst-launch-1.0 -e -v fdsrc fd=0 "
             f"! videoparse format=gray8 width={width} height={height} framerate={fps}/1 "
@@ -530,7 +524,6 @@ class DepthSplitStreamStrategy(StreamPipelineStrategy):
             f"sync={udp_config['sync']} async={udp_config['async']}"
         )
 
-        # 完整管道: v4l2-ctl → ffmpeg (位元組分離) → GStreamer (編碼/RTP)
         full_pipeline = f"{v4l2_cmd} | {ffmpeg_cmd} | {gst_cmd}"
 
         byte_type = "HIGH" if is_high_byte else "LOW"
@@ -547,9 +540,6 @@ class DepthSplitStreamStrategy(StreamPipelineStrategy):
         encoding: str,
     ) -> str:
         """Build depth split receiver pipeline (8-bit GRAY8 output)."""
-
-        # 這個方法不應該被呼叫，因為 split mode 的接收在 gst_receiver.py 中特別處理
-        # 但為了完整性還是實現
 
         if self.config_loader:
             buffer_size = self.config_loader.get("streaming.udp.buffer_size", 2097152)
