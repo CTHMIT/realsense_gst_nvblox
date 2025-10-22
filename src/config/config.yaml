@@ -150,7 +150,7 @@ presets:
   d435i:
     streams:
       - name: "depth"
-        encoding: "jpeg2000" # jpeg2000 | h264 | h265
+        encoding: "h264" # jpeg2000 | h264 | h265
         port_offset: 20
       - name: "color"
         encoding: "h264"
