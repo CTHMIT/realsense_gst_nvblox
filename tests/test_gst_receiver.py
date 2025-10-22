@@ -108,7 +108,7 @@ class TestVideoStreamReceiver:
             "receiver.gstreamer_format": {"depth": "GRAY16_LE"},
         }.get(key, default)
 
-        pipeline = receiver._build_pipeline(5020, "depth", 640, 480)
+        pipeline = receiver._build_pipeline(5020, "depth", "h264", 640, 480)
 
         assert "udpsrc port=5020" in pipeline
         assert "buffer-size=2097152" in pipeline
@@ -130,7 +130,7 @@ class TestVideoStreamReceiver:
             "receiver.gstreamer_format": {"color": "RGB"},
         }.get(key, default)
 
-        pipeline = receiver._build_pipeline(5010, "color", 640, 480)
+        pipeline = receiver._build_pipeline(5010, "color", "h264", 640, 480)
 
         assert "udpsrc port=5010" in pipeline
         assert "encoding-name=H264" in pipeline
