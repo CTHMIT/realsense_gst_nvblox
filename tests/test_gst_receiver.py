@@ -247,6 +247,7 @@ class TestUtilityFunctions:
             MagicMock(returncode=1, stdout=""),  # pgrep gscam (not found)
             MagicMock(returncode=1, stdout=""),  # pgrep depth_image_proc
             MagicMock(returncode=1, stdout=""),  # pgrep convert_metric
+            MagicMock(returncode=1, stdout=""),  # pgrep depth_merger_node
         ]
 
         result = check_and_cleanup_existing_resources("test_camera")
@@ -261,6 +262,7 @@ class TestUtilityFunctions:
             MagicMock(returncode=1, stdout=""),  # pgrep gscam
             MagicMock(returncode=1, stdout=""),  # pgrep depth_image_proc
             MagicMock(returncode=1, stdout=""),  # pgrep convert_metric
+            MagicMock(returncode=1, stdout=""),  # pgrep depth_merger_node
         ]
 
         result = check_and_cleanup_existing_resources("test_camera")
