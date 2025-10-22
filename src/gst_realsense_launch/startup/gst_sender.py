@@ -19,9 +19,12 @@ import threading
 import time
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
+from pathlib import Path
 from typing import Optional
 
-from gst_realsense_launch.rs_common import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from gst_realsense_launch.startup.rs_common import (
     FOURCC_COLOR,
     FOURCC_DEPTH,
     FOURCC_IR,
@@ -33,7 +36,7 @@ from gst_realsense_launch.rs_common import (
     parse_resolution,
     validate_network_config,
 )
-from gst_realsense_launch.rs_core import EncoderFactory, StreamStrategyFactory
+from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
 from utils.logger import LOGGER
 
 try:
@@ -162,12 +165,12 @@ class RealSenseDetector:
 
                     if id_path or usb_path:
                         if len(devices) == 1:
-                            return devices[0].get_info(rs.camera_info.serial_number)
+                            return str(devices[0].get_info(rs.camera_info.serial_number))
 
                         LOGGER.info(
                             "Multiple RealSense devices detected. Using first device serial."
                         )
-                        return devices[0].get_info(rs.camera_info.serial_number)
+                        return str(devices[0].get_info(rs.camera_info.serial_number))
 
                 except Exception as e:
                     LOGGER.error(f"Could not get USB path for {dev}: {e}")
@@ -179,7 +182,7 @@ class RealSenseDetector:
             result = cls.run_cmd(["udevadm", "info", "--query=property", f"--name={dev}"])
             for line in result.stdout.splitlines():
                 if "ID_SERIAL_SHORT=" in line:
-                    return line.split("=", 1)[1].strip()
+                    return str(line.split("=", 1)[1].strip())
         except Exception:
             LOGGER.warning(f"Could not get serial from udev for {dev}")
 

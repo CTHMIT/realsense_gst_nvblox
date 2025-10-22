@@ -12,13 +12,12 @@ to ROS2 topics compatible with isaac_ros_nvblox.
 - Odometry publishing
 """
 
-from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-
 from launch import LaunchDescription  # type: ignore[attr-defined]
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():

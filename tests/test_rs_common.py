@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from gst_realsense_launch.rs_common import ConfigLoader, parse_resolution
+from gst_realsense_launch.gst_realsense_launch.rs_common import ConfigLoader, parse_resolution
 
 
 @pytest.fixture

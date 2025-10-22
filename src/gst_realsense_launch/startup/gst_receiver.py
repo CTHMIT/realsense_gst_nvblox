@@ -21,8 +21,8 @@ from typing import Optional
 
 import numpy as np
 
-from gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
-from node.depth_merger_node import DepthMergerNode
+from gst_realsense_launch.node.depth_merger_node import DepthMergerNode
+from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
 from utils.logger import LOGGER
 
 

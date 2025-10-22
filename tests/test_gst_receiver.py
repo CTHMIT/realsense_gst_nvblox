@@ -6,12 +6,12 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-from gst_realsense_launch.gst_receiver import (
+from gst_realsense_launch.gst_realsense_launch.gst_receiver import (
     TmuxSessionManager,
     VideoStreamReceiver,
     check_and_cleanup_existing_resources,
 )
-from gst_realsense_launch.rs_common import ConfigLoader
+from gst_realsense_launch.gst_realsense_launch.rs_common import CameraIntrinsics, ConfigLoader
 
 
 class TestTmuxSessionManager:
@@ -200,7 +200,6 @@ class TestVideoStreamReceiver:
     @patch("builtins.open", new_callable=mock_open)
     def test_create_camera_info_file(self, mock_file, receiver):
         """Test camera info file creation."""
-        from gst_realsense_launch.rs_common import CameraIntrinsics
 
         intrinsics = CameraIntrinsics(
             width=640,

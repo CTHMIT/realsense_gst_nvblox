@@ -1,6 +1,6 @@
 import pytest
 
-from gst_realsense_launch.gst_sender import DeviceInfo, Mode, find_best_mode
+from gst_realsense_launch.gst_realsense_launch.gst_sender import DeviceInfo, Mode, find_best_mode
 
 
 def test_sender_placeholder():
