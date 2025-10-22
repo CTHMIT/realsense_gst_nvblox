@@ -479,7 +479,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
                 LOGGER.info(f"  Using JPEG2000 codec for lossless 16-bit depth")
             elif encoding_lower == "h265":
@@ -501,7 +500,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
             else:
                 # H.264 for depth (default)
@@ -524,7 +522,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
         elif stream_name == "color":
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
@@ -550,7 +547,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
             else:
                 # H.264 for color (default)
@@ -571,7 +567,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
         elif stream_name.startswith("infra"):
             latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
@@ -597,7 +592,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
             else:
                 # H.264 for infrared (default)
@@ -617,7 +611,6 @@ class VideoStreamReceiver:
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
                     f"! video/x-raw,format={output_format},width={width},height={height} "
-                    f"! queue max-size-buffers=2 leaky=downstream"
                 )
         else:
             return ""
@@ -1159,7 +1152,6 @@ projection_matrix:
                 f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                 f"! videoconvert n-threads={n_threads} "
                 f"! video/x-raw,format=GRAY8,width={width},height={height} "
-                f"! queue max-size-buffers=2 leaky=downstream"
             )
         elif encoding.lower() == "h265":
             pt_key = f"{stream_name}_h265"
@@ -1173,7 +1165,6 @@ projection_matrix:
                 f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                 f"! videoconvert n-threads={n_threads} "
                 f"! video/x-raw,format=GRAY8,width={width},height={height} "
-                f"! queue max-size-buffers=2 leaky=downstream"
             )
         else:
             pipeline = ""
