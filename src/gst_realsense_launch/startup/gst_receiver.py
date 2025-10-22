@@ -322,7 +322,7 @@ class VideoStreamReceiver:
         if is_y8i:
             gst_config = self._build_y8i_pipeline(port, stream_name, y8i_width, height)
         else:
-            gst_config = self._build_pipeline(port, stream_name, width, height)
+            gst_config = self._build_pipeline(port, stream_name, encoding, width, height)
 
         image_encodings = self.config_loader.get("receiver.image_encoding", {})
 
@@ -380,6 +380,19 @@ class VideoStreamReceiver:
         if stream_name == "depth":
             self._start_depth_conversion_node(port, image_topic, info_topic)
 
+    def _check_nvdec_available(self) -> bool:
+        """Check if NVIDIA hardware decoder is available."""
+        try:
+            result = subprocess.run(
+                ["gst-inspect-1.0", "nvh264dec"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return result.returncode == 0
+        except:
+            return False
+
     def _start_depth_conversion_node(self, port: int, depth_topic: str, info_topic: str):
         """Start depth_image_proc convert_metric node for float32 conversion."""
 
@@ -410,8 +423,21 @@ class VideoStreamReceiver:
         time.sleep(1.0)
         self.tmux_manager.create_window(window_name, convert_cmd)
 
-    def _build_pipeline(self, port: int, stream_name: str, width: int, height: int) -> str:
-        """Build GStreamer pipeline for receiving video streams."""
+    def _build_pipeline(
+        self, port: int, stream_name: str, encoding: str, width: int, height: int
+    ) -> str:
+        """Build GStreamer pipeline for receiving video streams.
+
+        Optimized for NVIDIA hardware encoder compatibility with improved
+        format conversion and buffering for gscam.
+
+        Args:
+            port: UDP port number
+            stream_name: Stream type (depth, color, infra)
+            encoding: Codec type (h264, h265, jpeg2000)
+            width: Image width
+            height: Image height
+        """
 
         # FIXED: Use safe buffer size (30MB instead of 1.5GB)
         buffer_size = min(
@@ -426,57 +452,173 @@ class VideoStreamReceiver:
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
         gst_formats = self.config_loader.get("receiver.gstreamer_format", {})
 
+        # Check if NVIDIA decoder is available (optional optimization)
+        use_nvdec = self._check_nvdec_available()
+
+        # Normalize encoding name
+        encoding_lower = encoding.lower()
+
         if stream_name == "depth":
             latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", False
             )
             drop_str = "true" if drop_on_latency else "false"
-            payload = payload_types.get("depth_h264", 96)
             output_format = gst_formats.get("depth", "GRAY16_LE")
 
-            pipeline = (
-                f"udpsrc port={port} buffer-size={buffer_size} "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
-                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
-            )
+            if encoding_lower == "jpeg2000":
+                # JPEG2000 for lossless 16-bit depth preservation
+                # Z16 → GRAY16_LE → JPEG2000 → GRAY16_LE → mono16
+                payload = payload_types.get("depth_jpeg2000", 112)
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG2000,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtpj2kdepay ! openjpegdec "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
+                LOGGER.info(f"  Using JPEG2000 codec for lossless 16-bit depth")
+            elif encoding_lower == "h265":
+                # H.265 for depth
+                payload = payload_types.get("depth_h265", 113)
+
+                # Select decoder
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh265dec"
+                    LOGGER.info(f"  Using NVIDIA H.265 hardware decoder for {stream_name}")
+                else:
+                    decoder = f"avdec_h265 max-threads={max_threads}"
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph265depay ! h265parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
+            else:
+                # H.264 for depth (default)
+                payload = payload_types.get("depth_h264", 96)
+
+                # Select decoder - prefer software decoder for better compatibility with gscam
+                # NVIDIA decoder can be forced by setting environment variable USE_NVDEC=1
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh264dec"
+                    LOGGER.info(f"  Using NVIDIA hardware decoder for {stream_name}")
+                else:
+                    decoder = f"avdec_h264 max-threads={max_threads}"
+
+                # Enhanced pipeline with explicit format specs and better buffering
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph264depay ! h264parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
         elif stream_name == "color":
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.color.drop_on_latency", False
             )
             drop_str = "true" if drop_on_latency else "false"
-            payload = payload_types.get("color_h264", 98)
             output_format = gst_formats.get("color", "RGB")
 
-            pipeline = (
-                f"udpsrc port={port} buffer-size={buffer_size} "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
-                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
-            )
+            if encoding_lower == "h265":
+                payload = payload_types.get("color_h265", 118)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh265dec"
+                else:
+                    decoder = f"avdec_h265 max-threads={max_threads}"
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph265depay ! h265parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
+            else:
+                # H.264 for color (default)
+                payload = payload_types.get("color_h264", 98)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh264dec"
+                    LOGGER.info(f"  Using NVIDIA hardware decoder for {stream_name}")
+                else:
+                    decoder = f"avdec_h264 max-threads={max_threads}"
+
+                # Enhanced pipeline with explicit format specs and better buffering
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph264depay ! h264parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
         elif stream_name.startswith("infra"):
             latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.infra.drop_on_latency", True
             )
             drop_str = "true" if drop_on_latency else "false"
-            payload = payload_types.get("ir_h264", 97)
             output_format = gst_formats.get("infra", "GRAY8")
 
-            pipeline = (
-                f"udpsrc port={port} buffer-size={buffer_size} "
-                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
-                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} ! video/x-raw,format={output_format}"
-            )
+            if encoding_lower == "h265":
+                payload = payload_types.get("ir_h265", 119)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh265dec"
+                else:
+                    decoder = f"avdec_h265 max-threads={max_threads}"
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph265depay ! h265parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
+            else:
+                # H.264 for infrared (default)
+                payload = payload_types.get("ir_h264", 97)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh264dec"
+                else:
+                    decoder = f"avdec_h264 max-threads={max_threads}"
+
+                # Enhanced pipeline with explicit format specs and better buffering
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph264depay ! h264parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! queue max-size-buffers=2 leaky=downstream"
+                )
         else:
             return ""
 
@@ -1015,7 +1157,9 @@ projection_matrix:
                 f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
                 f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
                 f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8"
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format=GRAY8,width={width},height={height} "
+                f"! queue max-size-buffers=2 leaky=downstream"
             )
         elif encoding.lower() == "h265":
             pt_key = f"{stream_name}_h265"
@@ -1027,7 +1171,9 @@ projection_matrix:
                 f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
                 f"! rtph265depay ! h265parse ! avdec_h265 max-threads={max_threads} "
                 f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8"
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format=GRAY8,width={width},height={height} "
+                f"! queue max-size-buffers=2 leaky=downstream"
             )
         else:
             pipeline = ""

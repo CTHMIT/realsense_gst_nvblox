@@ -1,6 +1,6 @@
 image_width: 640
 image_height: 480
-camera_name: realsense_infrared_640x480
+camera_name: camera_infrared
 distortion_model: plumb_bob
 distortion_coefficients:
   rows: 1
