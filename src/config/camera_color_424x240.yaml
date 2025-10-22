@@ -1,6 +1,6 @@
 image_width: 424
 image_height: 240
-camera_name: realsense_color_424x240
+camera_name: camera_color
 distortion_model: plumb_bob
 distortion_coefficients:
   rows: 1

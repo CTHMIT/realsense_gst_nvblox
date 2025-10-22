@@ -135,21 +135,21 @@ def generate_launch_description():
     depth_camera_info_url = [
         "file://",
         PathJoinSubstitution(
-            [pkg_share, "config", ["depth_camera_", depth_width, "x", depth_height, ".yaml"]]
+            [pkg_share, "config", ["camera_depth_", depth_width, "x", depth_height, ".yaml"]]
         ),
     ]
 
     color_camera_info_url = [
         "file://",
         PathJoinSubstitution(
-            [pkg_share, "config", ["color_camera_", color_width, "x", color_height, ".yaml"]]
+            [pkg_share, "config", ["camera_color_", color_width, "x", color_height, ".yaml"]]
         ),
     ]
 
     infrared_camera_info_url = [
         "file://",
         PathJoinSubstitution(
-            [pkg_share, "config", ["infrared_camera_", infra_width, "x", infra_height, ".yaml"]]
+            [pkg_share, "config", ["camera_infrared_", infra_width, "x", infra_height, ".yaml"]]
         ),
     ]
 
