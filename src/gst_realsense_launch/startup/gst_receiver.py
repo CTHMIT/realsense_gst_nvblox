@@ -36,12 +36,11 @@ except ImportError:
     logging.basicConfig(level=logging.INFO)
 
 if TYPE_CHECKING:
-    from gst_realsense_launch.startup.gst_depth_receiver_module import GStreamerDepthReceiverNode
+    from gst_depth_receiver_module import GStreamerDepthReceiverNode
 
 try:
-    from gst_realsense_launch.startup.gst_depth_receiver_module import (
+    from gst_depth_receiver_module import (
         GStreamerDepthReceiverNode,
-        check_gstreamer_python_available,
         create_depth_receiver_node,
     )
 

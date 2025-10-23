@@ -25,7 +25,9 @@ from typing import List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from gst_realsense_launch.startup.rs_common import (
+from utils.logger import LOGGER
+
+from .rs_common import (
     FOURCC_COLOR,
     FOURCC_DEPTH,
     FOURCC_IR,
@@ -37,8 +39,7 @@ from gst_realsense_launch.startup.rs_common import (
     parse_resolution,
     validate_network_config,
 )
-from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
-from utils.logger import LOGGER
+from .rs_core import EncoderFactory, StreamStrategyFactory
 
 try:
     import pyrealsense2 as rs

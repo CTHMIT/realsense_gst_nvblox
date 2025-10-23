@@ -26,9 +26,6 @@ except ImportError:
     ROS2_AVAILABLE = False
 
 from utils.gst_utils import (
-    GST_AVAILABLE,
-    GLib,
-    Gst,
     GstElement,
     GstFlowReturn,
     GstPipeline,
@@ -36,6 +33,12 @@ from utils.gst_utils import (
     require_plugins,
 )
 from utils.logger import LOGGER
+
+try:
+    Gst, GLib, GST_AVAILABLE = load_gst()
+except Exception as e:
+    GST_AVAILABLE = False
+    LOGGER.error(f"Failed to load GStreamer: {e}")
 
 
 class GStreamerDepthReceiverNode(Node):
@@ -73,12 +76,13 @@ class GStreamerDepthReceiverNode(Node):
         self.image_pub = self.create_publisher(Image, f"/{camera_name}/depth/image_rect_raw", 10)
         self.info_pub = self.create_publisher(CameraInfo, f"/{camera_name}/depth/camera_info", 10)
 
-        # Initialize GStreamer
-        if not GST_AVAILABLE:
+        # Verify GStreamer is available
+        if not GST_AVAILABLE or Gst is None:
             LOGGER.error("GStreamer Python bindings not available!")
             raise RuntimeError("Install: sudo apt install python3-gi python3-gst-1.0")
 
-        Gst.init(None)
+        # GStreamer is already initialized by load_gst() at module level
+        # No need to call Gst.init(None) again
         self.pipeline: GstPipeline | None = None
         self.appsink: GstElement | None = None
         self.loop = None
@@ -111,33 +115,34 @@ class GStreamerDepthReceiverNode(Node):
 
         drop_str = "true" if drop_on_latency else "false"
 
-        # Build decoder string based on encoding
+        # Build caps and decoder based on encoding
         if self.encoding == "jpeg2000":
             payload = payload_types.get("depth_jpeg2000", 112)
-            decoder_str = (
-                f"application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG2000,payload={payload} "
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            caps_str = f"application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG2000,payload={payload}"
+            decoder_elements = (
+                f"rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
                 f"! rtpj2kdepay ! openjpegdec"
             )
         elif self.encoding == "h265":
             payload = payload_types.get("depth_h265", 113)
-            decoder_str = (
-                f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload} "
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            caps_str = f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}"
+            decoder_elements = (
+                f"rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
                 f"! rtph265depay ! h265parse ! avdec_h265 max-threads={max_threads}"
             )
         else:  # h264 (default)
             payload = payload_types.get("depth_h264", 96)
-            decoder_str = (
-                f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload} "
-                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            caps_str = f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}"
+            decoder_elements = (
+                f"rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
                 f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads}"
             )
 
         # Complete pipeline
         pipeline_str = (
             f"udpsrc port={self.port} buffer-size={buffer_size} "
-            f'caps="{decoder_str}" '
+            f'caps="{caps_str}" '
+            f"! {decoder_elements} "
             f"! queue max-size-buffers=4 leaky=downstream "
             f"! videoconvert n-threads=4 "
             f"! video/x-raw,format=GRAY16_LE,width={self.width},height={self.height},framerate=30/1 "
@@ -270,6 +275,8 @@ class GStreamerDepthReceiverNode(Node):
 
 def check_gstreamer_python_available() -> bool:
     """Check if GStreamer Python bindings are available."""
+    LOGGER.info(f"GStreamer available: {GST_AVAILABLE}")
+    LOGGER.info(f"ROS2 available: {ROS2_AVAILABLE}")
     return GST_AVAILABLE and ROS2_AVAILABLE
 
 
@@ -285,7 +292,6 @@ def create_depth_receiver_node(
     """Factory function to create depth receiver node."""
 
     try:
-        load_gst()
         require_plugins(
             "udpsrc",
             "rtpjitterbuffer",
@@ -296,11 +302,11 @@ def create_depth_receiver_node(
             "appsink",
         )
     except RuntimeError as e:
-        LOGGER.error("❌ GStreamer not available: %s", e)
+        LOGGER.error("GStreamer not available: %s", e)
         return None
 
     if not check_gstreamer_python_available():
-        LOGGER.error("❌ GStreamer Python bindings not available!")
+        LOGGER.error("GStreamer Python bindings not available!")
         LOGGER.error("   Install with: sudo apt install python3-gi python3-gst-1.0")
         return None
 
@@ -322,4 +328,7 @@ def create_depth_receiver_node(
 
     except Exception as e:
         LOGGER.error(f"Failed to create depth receiver node: {e}")
+        import traceback
+
+        traceback.print_exc()
         return None

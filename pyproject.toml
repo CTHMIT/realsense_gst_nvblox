@@ -13,6 +13,10 @@ dependencies = [
     "setuptools>=80.9.0",
     "numpy<2",
     "opencv-python>=4.11.0.86",
+    "meson-python>=0.18.0",
+    "meson>=1.9.1",
+    "ninja>=1.13.0",
+    "pycairo>=1.28.0",
 ]
 
 requires-python = ">=3.10"

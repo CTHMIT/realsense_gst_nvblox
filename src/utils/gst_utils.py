@@ -1,38 +1,39 @@
-# gst_utils.py
+# src/utils/gst_utils.py
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Tuple, TypeAlias
 
 GST_AVAILABLE: bool = False
 Gst: Any | None = None
 GLib: Any | None = None
 
 
-def load_gst() -> None:
-    """Idempotent 初始化 GStreamer。"""
+def load_gst() -> tuple[Any, Any, bool]:
+    """Idempotent init GStreamer"""
     global GST_AVAILABLE, Gst, GLib
     if GST_AVAILABLE:
-        return
+        return Gst, GLib, GST_AVAILABLE
     try:
-        import gi  # noqa: WPS433
+        import gi
 
-        gi.require_version("Gst", "1.0")  # 必須先呼叫
+        gi.require_version("Gst", "1.0")
         from gi.repository import GLib as _GLib
-        from gi.repository import Gst as _Gst  # noqa: WPS433
+        from gi.repository import Gst as _Gst
 
         _Gst.init(None)
         Gst, GLib = _Gst, _GLib
         GST_AVAILABLE = True
+        return Gst, GLib, GST_AVAILABLE
+
     except Exception as e:
         GST_AVAILABLE = False
-        raise RuntimeError(
-            "GStreamer (PyGObject) not available. Install python3-gi and GI typelibs.\n"
-            "Ubuntu: sudo apt install python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0"
-        ) from e
+        LOGGER.error("GStreamer (PyGObject) not available. Install python3-gi and GI typelibs.")
+        LOGGER.error(f"Error details: {e}")
+        return None, None, GST_AVAILABLE
 
 
 def require_plugins(*names: str) -> None:
-    """檢查必需的 GStreamer 外掛是否存在；缺少即丟錯。"""
+    """check that the given GStreamer plugins are available"""
     load_gst()
     assert Gst is not None
     missing = [n for n in names if Gst.ElementFactory.find(n) is None]
@@ -47,6 +48,16 @@ if TYPE_CHECKING:
     GstElement: TypeAlias = GstType.Element
     GstFlowReturn: TypeAlias = GstType.FlowReturn
 else:
-    GstPipeline = Any  # 執行期/測試環境沒有 GI 時使用
+    GstPipeline = Any
     GstElement = Any
     GstFlowReturn = int
+
+
+if __name__ == "__main__":
+    from utils.logger import LOGGER
+
+    Gst, GLib, GST_AVAILABLE = load_gst()
+    if GST_AVAILABLE:
+        LOGGER.info("GStreamer successfully loaded.")
+    else:
+        LOGGER.error("GStreamer failed to load.")
