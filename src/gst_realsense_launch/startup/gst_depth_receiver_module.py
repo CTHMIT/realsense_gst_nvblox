@@ -11,19 +11,9 @@ Why this is needed:
 """
 
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
-
-try:
-    import gi
-
-    gi.require_version("Gst", "1.0")
-    from gi.repository import GLib, Gst
-
-    GST_AVAILABLE = True
-except ImportError:
-    GST_AVAILABLE = False
 
 try:
     import rclpy
@@ -35,7 +25,35 @@ try:
 except ImportError:
     ROS2_AVAILABLE = False
 
+from utils.gst_utils import (
+    GST_AVAILABLE,
+    GLib,
+    Gst,
+    GstElement,
+    GstFlowReturn,
+    GstPipeline,
+    load_gst,
+    require_plugins,
+)
 from utils.logger import LOGGER
+
+load_gst()
+require_plugins(
+    "udpsrc",
+    "rtpjitterbuffer",
+    "rtph264depay",
+    "h264parse",
+    "avdec_h264",
+    "videoconvert",
+    "appsink",
+)
+
+pipe = Gst.parse_launch("videotestsrc ! videoconvert ! fakesink")
+bus = pipe.get_bus()
+bus.add_signal_watch()
+pipe.set_state(Gst.State.PLAYING)
+loop = GLib.MainLoop()
+loop.run()
 
 
 class GStreamerDepthReceiverNode(Node):
@@ -79,8 +97,8 @@ class GStreamerDepthReceiverNode(Node):
             raise RuntimeError("Install: sudo apt install python3-gi python3-gst-1.0")
 
         Gst.init(None)
-        self.pipeline: Gst.Pipeline | None = None
-        self.appsink: Gst.Element | None = None
+        self.pipeline: GstPipeline | None = None
+        self.appsink: GstElement | None = None
         self.loop = None
 
         # Build and start pipeline
@@ -170,7 +188,7 @@ class GStreamerDepthReceiverNode(Node):
 
         LOGGER.info("✓ Pipeline started successfully")
 
-    def _on_new_sample(self, appsink) -> Gst.FlowReturn:
+    def _on_new_sample(self, appsink) -> GstFlowReturn:
         """Callback when new sample (frame) is available."""
         sample = appsink.emit("pull-sample")
         if not sample:
