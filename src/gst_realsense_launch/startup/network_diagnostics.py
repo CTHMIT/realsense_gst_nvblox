@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, TypedDict
 
-from gst_realsense_launch.utils.logger import LOGGER
+from utils.logger import LOGGER
 
 try:
     import yaml
