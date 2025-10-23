@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""RealSense GStreamer Receiver (Pure GStreamer - No ROS2)
+"""RealSense GStreamer Receiver
 
 Receives video streams via GStreamer and manages them using tmux.
-All ROS2 functionality is handled by the launch file.
 
 Features:
 - Video stream reception (depth, color, IR1, IR2)
@@ -49,26 +48,25 @@ class DepthMergeProcessor:
         self.last_low_time = 0.0
 
     def update_high_byte(self, data: np.ndarray, timestamp: float):
-        """更新高位元組數據."""
+        """high-bit data."""
         self.high_byte_buffer = data
         self.last_high_time = timestamp
 
     def update_low_byte(self, data: np.ndarray, timestamp: float):
-        """更新低位元組數據."""
+        """low-bit data."""
         self.low_byte_buffer = data
         self.low_time = timestamp
 
     def get_merged_depth(self) -> np.ndarray | None:
-        """合併高低位元組為 16-bit depth 影像."""
+        """Get merged 16-bit depth data."""
         if self.high_byte_buffer is None or self.low_byte_buffer is None:
             return None
 
-        # 檢查時間同步 (允許 100ms 誤差)
         time_diff = abs(self.last_high_time - self.last_low_time)
         if time_diff > 0.1:
             LOGGER.warning(f"Depth high/low byte time mismatch: {time_diff*1000:.1f}ms")
 
-        # 合併: depth = (high << 8) | low
+        # merge: depth = (high << 8) | low
         high_shifted = self.high_byte_buffer.astype(np.uint16) << 8
         depth_16bit = high_shifted | self.low_byte_buffer.astype(np.uint16)
 
@@ -330,7 +328,7 @@ class VideoStreamReceiver:
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
             frame_id = f"{self.camera_name}_depth_optical_frame"
-            image_encoding = None
+            image_encoding = "16UC1"  # Use 16UC1 (OpenCV format) instead of mono16
         elif stream_name == "color":
             image_topic = f"/{self.camera_name}/color/image_raw"
             info_topic = f"/{self.camera_name}/color/camera_info"
@@ -373,7 +371,10 @@ class VideoStreamReceiver:
 
         LOGGER.info(f"[{stream_name}] Starting on port {port}")
         LOGGER.info(f"  Topic: {image_topic}")
-        LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect (mono16)'}")
+        if stream_name == "depth":
+            LOGGER.info(f"  Encoding: {image_encoding} (OpenCV format for 16-bit depth)")
+        else:
+            LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect'}")
 
         self.tmux_manager.create_window(window_name, gscam_cmd)
 
@@ -417,7 +418,7 @@ class VideoStreamReceiver:
         window_name = f"depth_convert_{port}"
 
         LOGGER.info(f"  [CONVERT] Starting depth to float32 conversion")
-        LOGGER.info(f"    Input: {depth_topic} (mono16)")
+        LOGGER.info(f"    Input: {depth_topic} (16UC1 format)")
         LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
 
         time.sleep(1.0)
@@ -439,7 +440,6 @@ class VideoStreamReceiver:
             height: Image height
         """
 
-        # FIXED: Use safe buffer size (30MB instead of 1.5GB)
         buffer_size = min(
             self.config_loader.get("streaming.udp.buffer_size", 30000000),
             30000000,  # 30MB - safe for gint
@@ -452,10 +452,8 @@ class VideoStreamReceiver:
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
         gst_formats = self.config_loader.get("receiver.gstreamer_format", {})
 
-        # Check if NVIDIA decoder is available (optional optimization)
         use_nvdec = self._check_nvdec_available()
 
-        # Normalize encoding name
         encoding_lower = encoding.lower()
 
         if stream_name == "depth":
@@ -468,7 +466,7 @@ class VideoStreamReceiver:
 
             if encoding_lower == "jpeg2000":
                 # JPEG2000 for lossless 16-bit depth preservation
-                # Z16 → GRAY16_LE → JPEG2000 → GRAY16_LE → mono16
+                # Z16 → GRAY16_LE → JPEG2000 → GRAY16_LE → auto-detect as 16UC1
                 payload = payload_types.get("depth_jpeg2000", 112)
 
                 pipeline = (
@@ -478,7 +476,8 @@ class VideoStreamReceiver:
                     f"! rtpj2kdepay ! openjpegdec "
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
+                    f"! appsink drop=true max-buffers=1"
                 )
                 LOGGER.info(f"  Using JPEG2000 codec for lossless 16-bit depth")
             elif encoding_lower == "h265":
@@ -499,7 +498,8 @@ class VideoStreamReceiver:
                     f"! rtph265depay ! h265parse ! {decoder} "
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
+                    f"! appsink drop=true max-buffers=1"
                 )
             else:
                 # H.264 for depth (default)
@@ -513,7 +513,8 @@ class VideoStreamReceiver:
                 else:
                     decoder = f"avdec_h264 max-threads={max_threads}"
 
-                # Enhanced pipeline with explicit format specs and better buffering
+                # Enhanced pipeline with explicit format specs and appsink for gscam
+                # The appsink with explicit caps helps gscam auto-detect the correct encoding
                 pipeline = (
                     f"udpsrc port={port} buffer-size={buffer_size} "
                     f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
@@ -521,7 +522,8 @@ class VideoStreamReceiver:
                     f"! rtph264depay ! h264parse ! {decoder} "
                     f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
                     f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
+                    f"! appsink drop=true max-buffers=1"
                 )
         elif stream_name == "color":
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
@@ -549,7 +551,7 @@ class VideoStreamReceiver:
                     f"! video/x-raw,format={output_format},width={width},height={height} "
                 )
             else:
-                # H.264 for color (default)
+                # H.264 for color
                 payload = payload_types.get("color_h264", 98)
 
                 if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
@@ -594,7 +596,7 @@ class VideoStreamReceiver:
                     f"! video/x-raw,format={output_format},width={width},height={height} "
                 )
             else:
-                # H.264 for infrared (default)
+                # H.264 for infrared
                 payload = payload_types.get("ir_h264", 97)
 
                 if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
@@ -621,7 +623,6 @@ class VideoStreamReceiver:
         """Build GStreamer pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        # FIXED: Use safe buffer size
         buffer_size = min(
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
@@ -693,7 +694,6 @@ class VideoStreamReceiver:
     ) -> str:
         """Build independent visualization pipeline."""
 
-        # FIXED: Use safe buffer size
         buffer_size = min(
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
@@ -775,7 +775,6 @@ class VideoStreamReceiver:
         """Build visualization pipeline for Y8I streams."""
         single_width = y8i_width // 2
 
-        # FIXED: Use safe buffer size
         buffer_size = min(
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
@@ -815,7 +814,6 @@ class VideoStreamReceiver:
 
     def _get_calibration_file_path(self, stream_name: str, width: int, height: int) -> str | None:
         """Get the path to the calibration file for the given stream and resolution."""
-        # FIXED: Match actual calibration file naming (camera_<type>_<resolution>.yaml)
         stream_mapping = {
             "depth": "depth",
             "depth_high": "depth_high",
@@ -836,7 +834,6 @@ class VideoStreamReceiver:
             Path.home() / ".config" / "realsense",
         ]
 
-        # FIXED: Use correct naming pattern camera_<type>_<resolution>.yaml
         filename = f"{self.camera_name}_{stream_prefix}_{resolution}.yaml"
 
         for config_dir in config_paths:
@@ -945,7 +942,6 @@ projection_matrix:
             except ProcessLookupError:
                 remaining.discard(pid)
             except PermissionError:
-                # 沒權限時保留在 remaining
                 pass
 
         killed = [pid for pid in initial if pid not in remaining]
@@ -1026,10 +1022,9 @@ projection_matrix:
         LOGGER.info(f"  Low byte port: {low_port}")
         LOGGER.info(f"  Encoding: {encoding.upper()}")
 
-        # 初始化 merge processor
+        # Init merge processor
         self.depth_merge_processor = DepthMergeProcessor(width, height)
 
-        # 為高位元組和低位元組各啟動一個接收 pipeline
         self._start_depth_byte_stream_in_tmux(
             high_port, "depth_high", encoding, width, height, intrinsics
         )
@@ -1042,7 +1037,7 @@ projection_matrix:
 
         time.sleep(0.5)
 
-        # 啟動 merger node 將兩個 8-bit 合併為 16-bit
+        #  merger node two 8-bit to 16-bit
         self._start_depth_merger_node(width, height, intrinsics)
 
     def _start_depth_byte_stream_in_tmux(
@@ -1056,11 +1051,9 @@ projection_matrix:
     ):
         """啟動單個 8-bit depth stream 接收器 (不發布到 ROS2)."""
 
-        # 使用臨時 topic，稍後由 merger node 處理
         temp_topic = f"/{self.camera_name}/{stream_name}/image_raw"
         temp_info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
 
-        # FIXED: Look for stream-specific calibration files
         calib_file = self._get_calibration_file_path(stream_name, width, height)
 
         if calib_file:
@@ -1075,7 +1068,6 @@ projection_matrix:
             tmp_file_path = tmp_file.name
             tmp_file.close()
 
-        # 建立 8-bit 接收 pipeline
         gst_config = self._build_depth_split_pipeline(port, stream_name, encoding, width, height)
 
         frame_id = f"{self.camera_name}_depth_optical_frame"
@@ -1108,14 +1100,12 @@ projection_matrix:
     def _build_depth_split_pipeline(
         self, port: int, stream_name: str, encoding: str, width: int, height: int
     ) -> str:
-        """建立 depth split 接收 pipeline (輸出 GRAY8)."""
+        """depth split pipeline (GRAY8)."""
 
-        # FIXED: Use safe buffer size
         buffer_size = min(
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
 
-        # FIXED: Use stream-specific jitter buffer settings
         if stream_name == "depth_high":
             latency = self.config_loader.get("streaming.jitter_buffer.depth_high.latency", 200)
             drop_on_latency = self.config_loader.get(
@@ -1174,10 +1164,8 @@ projection_matrix:
     def _start_depth_merger_node(
         self, width: int, height: int, intrinsics: CameraIntrinsics | None
     ):
-        """啟動 depth merger node 將兩個 8-bit 合併為 16-bit 並發布."""
+        """啟動 depth merger node 8-bit to 16-bit ."""
 
-        # FIXED: Run depth_merger_node.py directly with python3 instead of ros2 run
-        # Find the depth_merger_node.py script
         script_paths = [
             Path(__file__).parent / "depth_merger_node.py",
             Path(__file__).parent.parent / "node" / "depth_merger_node.py",
@@ -1198,7 +1186,6 @@ projection_matrix:
             )
             return
 
-        # 建立 Python 直接執行命令
         merger_cmd_parts = [
             "python3",
             str(script_path.absolute()),
@@ -1219,7 +1206,6 @@ projection_matrix:
 
         self.tmux_manager.create_window(window_name, merger_cmd)
 
-        # 啟動 depth conversion node (如果啟用)
         time.sleep(1.0)
         depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
         info_topic = f"/{self.camera_name}/depth/camera_info"

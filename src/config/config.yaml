@@ -4,7 +4,7 @@
 
 network:
   local_ip: "0.0.0.0"  # IP address for binding (receiver)
-  server_ip: "10.28.131.195"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
+  server_ip: "10.28.121.28"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
   base_port: 5000  # Base port for video streams
 
   # Stream port configuration
@@ -133,7 +133,7 @@ receiver:
 
   # ROS2 Image Encoding - CRITICAL: Must match GStreamer output format
   image_encoding:
-    depth: "mono16"       # 16-bit unsigned, 1 channel
+    depth: "16UC1"       # 16-bit unsigned, 1 channel
     color: "rgb8"        # 8-bit RGB (changed from bgr8 to rgb8)
     infra: "mono8"       # 8-bit monochrome
 
@@ -150,7 +150,7 @@ presets:
   d435i:
     streams:
       - name: "depth"
-        encoding: "h264" # jpeg2000 | h264 | h265
+        encoding: "jpeg2000" # jpeg2000 | h264 | h265
         port_offset: 20
       - name: "color"
         encoding: "h264"
