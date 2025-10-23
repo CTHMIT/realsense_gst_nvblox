@@ -183,7 +183,7 @@ class TestVideoStreamReceiver:
         calib_file = calib_dir / "depth_camera_640x480.yaml"
         calib_file.write_text("test calibration")
 
-        with patch("gst_realsense_launch.gst_receiver.Path") as mock_path:
+        with patch("gst_realsense_launch.startup.gst_receiver.Path") as mock_path:
             mock_path.return_value = tmp_path
             # Mock the glob to return our test directory
             with patch.object(Path, "exists", return_value=True):
