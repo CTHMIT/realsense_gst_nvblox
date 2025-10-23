@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Tuple, TypeAlias
 
+from utils.logger import LOGGER
+
 GST_AVAILABLE: bool = False
 Gst: Any | None = None
 GLib: Any | None = None
@@ -54,7 +56,6 @@ else:
 
 
 if __name__ == "__main__":
-    from utils.logger import LOGGER
 
     Gst, GLib, GST_AVAILABLE = load_gst()
     if GST_AVAILABLE:
