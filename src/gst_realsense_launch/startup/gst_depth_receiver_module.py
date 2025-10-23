@@ -37,24 +37,6 @@ from utils.gst_utils import (
 )
 from utils.logger import LOGGER
 
-load_gst()
-require_plugins(
-    "udpsrc",
-    "rtpjitterbuffer",
-    "rtph264depay",
-    "h264parse",
-    "avdec_h264",
-    "videoconvert",
-    "appsink",
-)
-
-pipe = Gst.parse_launch("videotestsrc ! videoconvert ! fakesink")
-bus = pipe.get_bus()
-bus.add_signal_watch()
-pipe.set_state(Gst.State.PLAYING)
-loop = GLib.MainLoop()
-loop.run()
-
 
 class GStreamerDepthReceiverNode(Node):
     """ROS2 node that receives 16-bit depth via GStreamer Python bindings.
@@ -301,6 +283,21 @@ def create_depth_receiver_node(
     intrinsics: Any,
 ) -> GStreamerDepthReceiverNode | None:
     """Factory function to create depth receiver node."""
+
+    try:
+        load_gst()
+        require_plugins(
+            "udpsrc",
+            "rtpjitterbuffer",
+            "rtph264depay",
+            "h264parse",
+            "avdec_h264",
+            "videoconvert",
+            "appsink",
+        )
+    except RuntimeError as e:
+        LOGGER.error("❌ GStreamer not available: %s", e)
+        return None
 
     if not check_gstreamer_python_available():
         LOGGER.error("❌ GStreamer Python bindings not available!")
