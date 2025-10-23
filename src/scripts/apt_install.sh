@@ -12,7 +12,6 @@ sudo apt-get install -y \
     libxt-dev \
     libgirepository1.0-dev \
     python3-gi \
-    python3-gi-cAIro \
     gir1.2-gtk-3.0 \
     python3-gst-1.0 \
     gir1.2-gstreamer-1.0 \

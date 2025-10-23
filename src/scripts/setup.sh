@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- paths ---
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# ===== paths =====
+REPO_ROOT="$(pwd)"
+echo "==> Changing to repo root: $REPO_ROOT"
 cd "$REPO_ROOT"
 
 echo "==> Repo: $REPO_ROOT"
+[[ -f pyproject.toml ]] || { echo "ERROR: pyproject.toml not found in repo root"; exit 1; }
 
-# --- APT: GI / GStreamer / 基本工具 ---
-if [[ -x "scripts/apt_install.sh" ]]; then
+# ===== apt (GI/GStreamer) =====
+
+if [[ -x "$REPO_ROOT/src/scripts/apt_install.sh" ]]; then
   echo "==> Running scripts/apt_install.sh ..."
-  sudo bash scripts/apt_install.sh
+  sudo bash "$REPO_ROOT/src/scripts/apt_install.sh"
 else
   echo "==> Installing system packages (GI + GStreamer) ..."
   sudo apt update
@@ -22,63 +25,101 @@ else
     build-essential python3-venv
 fi
 
-# --- PDM 檢查 ---
+
+# ===== pdm =====
 if ! command -v pdm >/dev/null 2>&1; then
-  echo "==> Installing PDM for current user ..."
+  echo "==> Installing PDM ..."
   python3 -m pip install --user -U pdm
   export PATH="$HOME/.local/bin:$PATH"
 fi
+echo "==> PDM: $(pdm --version || true)"
 
-echo "==> PDM version: $(pdm --version || true)"
+# ===== helpers =====
+venv_python() { echo "$REPO_ROOT/.venv/bin/python"; }
+pdm_use_repo_venv() { pdm use -f "$(venv_python)"; }
 
-# --- 建立/使用 .venv（含 system-site-packages，才能看到 python3-gi）---
-VENV_DIR="$REPO_ROOT/.venv"
-if [[ ! -d "$VENV_DIR" ]]; then
-  echo "==> Creating venv at .venv (with system site-packages) ..."
-  python3 -m venv "$VENV_DIR" --system-site-packages
-fi
-VENV_PY="$VENV_DIR/bin/python"
-
-echo "==> Pointing PDM to $VENV_PY"
-pdm use -f "$VENV_PY"
-
-# --- 以 PDM 同步專案依賴 ---
-echo "==> pdm install (project deps) ..."
-pdm install
-
-# --- 安裝專案本身（editable），把 gst_realsense_launch 與 utils 裝進 venv ---
-echo "==> pip install -e . (editable) ..."
-pdm run pip install -e .
-
-# --- 驗證 GI / GStreamer 可用 ---
-echo "==> Verifying GI / GStreamer ..."
-pdm run python - <<'PY'
+gi_check() {
+  pdm run python - <<'PY' || return 1
 import sys
 try:
     import gi
-    gi.require_version("Gst", "1.0")
+    gi.require_version("Gst","1.0")
     from gi.repository import Gst
     Gst.init(None)
-    print("OK: GI/GStreamer usable in", sys.executable)
+    print("GI_OK in", sys.executable)
+    raise SystemExit(0)
 except Exception as e:
-    print("ERROR: GI/GStreamer not usable in", sys.executable)
-    print(e)
+    print("GI_FAIL:", e)
     raise SystemExit(1)
 PY
+}
 
-echo "==> Checking common GStreamer plugins (best effort) ..."
+project_import_check() {
+  pdm run python - <<'PY' || return 1
+try:
+    import utils, gst_realsense_launch  # editable install / PYTHONPATH
+    print("IMPORT_OK:", utils.__file__, "|", gst_realsense_launch.__file__)
+    raise SystemExit(0)
+except Exception as e:
+    print("IMPORT_FAIL:", e)
+    raise SystemExit(1)
+PY
+}
+
+# ===== venv (auto-detect) =====
+VENV_DIR="$REPO_ROOT/.venv"
+NEED_RECREATE=0
+
+if [[ -d "$VENV_DIR" ]]; then
+  echo "==> Found existing .venv"
+
+  # try to use it
+  pdm_use_repo_venv
+  if gi_check; then
+    echo "    GI/GStreamer OK in current .venv (will keep)"
+  else
+    echo "    GI check failed (will recreate .venv)"
+    NEED_RECREATE=1
+  fi
+
+else
+  echo "==> No .venv found (will create)"
+fi
+
+if [[ $NEED_RECREATE -eq 1 ]]; then
+  echo "==> Recreating .venv (with system-site-packages)"
+  rm -rf "$VENV_DIR"
+  python3 -m venv "$VENV_DIR" --system-site-packages
+  pdm_use_repo_venv
+fi
+
+# ===== deps sync =====
+echo "==> pdm install (deps) ..."
+pdm install
+
+# ===== editable install (always ensure project is importable) =====
+if ! project_import_check; then
+  echo "==> pip install -e <repo> (editable) ..."
+  pdm run pip install -e "$REPO_ROOT"
+  project_import_check || { echo "ERROR: project import still failing"; exit 1; }
+fi
+
+# ===== final GI check (must pass) =====
+echo "==> Verifying GI/GStreamer in final env ..."
+gi_check
+
+# ===== plugin check (best-effort) =====
+echo "==> Checking common GStreamer plugins ..."
 for p in udpsrc rtpjitterbuffer rtph264depay h264parse avdec_h264 videoconvert appsink; do
   if gst-inspect-1.0 "$p" >/dev/null 2>&1; then
     echo "  [+] $p"
   else
-    echo "  [!] $p missing (check your GStreamer installation)"
+    echo "  [!] $p missing"
   fi
 done
 
 echo "==> Done."
 echo "Next:"
-echo "  1) Export PYTHONPATH (若未設置 __init__ 自動注入)："
-echo "     export PYTHONPATH=\"$REPO_ROOT/src\""
-echo "  2) Run:"
-echo "     pdm run python -m gst_realsense_launch.startup.gst_sender --preset d435i --verbose"
-echo "     pdm run python -m gst_realsense_launch.startup.nvblox_receiver --preset d435i"
+echo "  export PYTHONPATH=\"$REPO_ROOT/src\""
+echo "  pdm run python -m gst_realsense_launch.startup.gst_sender --preset d435i --verbose"
+echo "  pdm run python -m gst_realsense_launch.startup.gst_receiver --preset d435i"
