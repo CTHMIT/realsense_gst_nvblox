@@ -30,7 +30,8 @@ fi
 if ! command -v pdm >/dev/null 2>&1; then
   echo "==> Installing PDM ..."
   python3 -m pip install --user -U pdm
-  export PATH="$HOME/.local/bin:$PATH"
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+  source ~/.bashrc
 fi
 echo "==> PDM: $(pdm --version || true)"
 

@@ -9,4 +9,5 @@ __all__ = [
     "gst_depth_receiver_module",
     "network_diagnostics",
     "depth_receiver_module",
+    "run_depth_receiver",
 ]

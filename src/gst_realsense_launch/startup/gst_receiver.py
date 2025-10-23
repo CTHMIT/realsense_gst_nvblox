@@ -25,7 +25,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
+from rs_common import CameraIntrinsics, ConfigLoader
 
 try:
     from utils.logger import LOGGER
@@ -47,7 +47,7 @@ try:
     GST_PYTHON_AVAILABLE = True
 except ImportError:
     GST_PYTHON_AVAILABLE = False
-    LOGGER.warning("⚠ GStreamer Python bindings not available - depth streaming will be limited")
+    LOGGER.warning("GStreamer Python bindings not available - depth streaming will be limited")
 
 
 class DepthMergeProcessor:
@@ -333,7 +333,7 @@ class VideoStreamReceiver:
             tmp_file_path = None
         else:
             LOGGER.info(
-                f"  ⚠ No calibration file found for {stream_name} {width}x{height}, using defaults"
+                f"No calibration file found for {stream_name} {width}x{height}, using defaults"
             )
             tmp_file = tempfile.NamedTemporaryFile(
                 mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
@@ -415,10 +415,13 @@ class VideoStreamReceiver:
         height: int,
         intrinsics: CameraIntrinsics | None,
     ):
-        """Start depth stream using GStreamer Python bindings (bypasses gscam).
+        """Start depth stream using GStreamer Python bindings in tmux (bypasses gscam).
 
         This method is used specifically for 16-bit depth streams because
         gscam does not support 16UC1 or mono16 encodings.
+
+        Instead of running in a thread, the depth receiver now runs in a tmux window
+        for consistency with other streams.
         """
         if not GST_PYTHON_AVAILABLE:
             LOGGER.error("❌ Cannot start depth stream: GStreamer Python not available")
@@ -433,41 +436,72 @@ class VideoStreamReceiver:
         LOGGER.info(f"  Resolution: {width}x{height}")
         LOGGER.info(f"  Topic: /{self.camera_name}/depth/image_rect_raw")
         LOGGER.info(f"  Format: 16UC1 (16-bit depth)")
-        LOGGER.info(f"  Method: GStreamer Python (bypassing gscam)")
+        LOGGER.info(f"  Method: GStreamer Python in tmux (bypassing gscam)")
 
-        # Create the depth receiver node
-        self.depth_receiver_node = create_depth_receiver_node(
-            port=port,
-            width=width,
-            height=height,
-            camera_name=self.camera_name,
-            encoding=encoding,
-            config_loader=self.config_loader,
-            intrinsics=intrinsics,
-        )
+        # Get the path to the standalone depth receiver script
+        script_dir = Path(__file__).resolve().parent
+        depth_receiver_script = script_dir / "run_depth_receiver.py"
 
-        if not self.depth_receiver_node:
-            LOGGER.error("❌ Failed to create depth receiver node")
+        # Check if script exists
+        if not depth_receiver_script.exists():
+            LOGGER.error(f"❌ Depth receiver script not found: {depth_receiver_script}")
+            LOGGER.error(
+                "   Make sure run_depth_receiver.py is in the same directory as gst_receiver.py"
+            )
             return
 
-        # Start ROS2 spin in a separate thread
-        import rclpy
+        # Build command with all necessary arguments
+        cmd_parts = [
+            f"python3 {depth_receiver_script}",
+            f"--port {port}",
+            f"--width {width}",
+            f"--height {height}",
+            f"--camera-name {self.camera_name}",
+            f"--encoding {encoding}",
+        ]
 
-        def spin_node():
-            try:
-                rclpy.spin(self.depth_receiver_node)
-            except Exception as e:
-                LOGGER.error(f"Error in depth receiver node: {e}")
+        # Add config file path if available
+        if hasattr(self.config_loader, "config_file"):
+            cmd_parts.append(f"--config {self.config_loader.config_file}")
 
-        self.depth_receiver_thread = threading.Thread(target=spin_node, daemon=True)
-        self.depth_receiver_thread.start()
+        # Add intrinsics if provided
+        if intrinsics:
+            cmd_parts.extend(
+                [
+                    f"--fx {intrinsics.fx}",
+                    f"--fy {intrinsics.fy}",
+                    f"--ppx {intrinsics.ppx}",
+                    f"--ppy {intrinsics.ppy}",
+                ]
+            )
+            if intrinsics.distortion:
+                distortion_str = " ".join(str(d) for d in intrinsics.distortion)
+                cmd_parts.append(f"--distortion {distortion_str}")
 
-        LOGGER.info("✓ Depth receiver node started successfully")
+        # Build final command
+        depth_cmd = " ".join(cmd_parts)
+        window_name = f"depth_{port}"
 
-        # Start depth conversion node
+        LOGGER.info(f"  Creating tmux window: {window_name}")
+        LOGGER.debug(f"  Command: {depth_cmd}")
+
+        # Create tmux window and run the depth receiver
+        try:
+            self.tmux_manager.create_window(window_name, depth_cmd)
+            LOGGER.info("✓ Depth receiver started in tmux")
+        except Exception as e:
+            LOGGER.error(f"❌ Failed to start depth receiver in tmux: {e}")
+            return
+
+        # Wait a moment for the node to initialize
+        time.sleep(1.0)
+
+        # Start depth conversion node (if needed)
         depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
         info_topic = f"/{self.camera_name}/depth/camera_info"
         self._start_depth_conversion_node(port, depth_topic, info_topic)
+
+        LOGGER.info("✓ Depth stream setup complete")
 
     def _check_nvdec_available(self) -> bool:
         """Check if NVIDIA hardware decoder is available."""
@@ -1325,7 +1359,7 @@ def check_and_cleanup_existing_resources(camera_name: str):
         ["tmux", "has-session", "-t", "realsense_receiver"], capture_output=True, text=True
     )
     if result.returncode == 0:
-        LOGGER.warning("  ⚠ Found existing tmux session 'realsense_receiver'")
+        LOGGER.warning("Found existing tmux session 'realsense_receiver'")
         issues_found = True
         subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
         LOGGER.info("    ✓ Cleaned up existing session")
@@ -1347,7 +1381,7 @@ def check_and_cleanup_existing_resources(camera_name: str):
         )
         if result.returncode == 0:
             pids = result.stdout.strip().split("\n")
-            LOGGER.warning(f"  ⚠ Found {len(pids)} orphaned processes matching '{pattern}'")
+            LOGGER.warning(f"Found {len(pids)} orphaned processes matching '{pattern}'")
             issues_found = True
 
             for pid in pids:
@@ -1369,7 +1403,7 @@ def check_and_cleanup_existing_resources(camera_name: str):
 
 
 def signal_handler(signum, frame):
-    LOGGER.info(f"⚠ Received signal {signum}")
+    LOGGER.warning(f"Received signal {signum}")
     sys.exit(0)
 
 
@@ -1422,11 +1456,15 @@ def main():
                 encodings = []
                 widths = []
                 heights = []
+                depth_already_started = False  # Track if depth was already started
 
                 for s in streams:
-                    if s["name"] == "depth":
-                        port = network_cfg["base_port"] + s["port_offset"]
+                    port = network_cfg["base_port"] + s["port_offset"]
+                    ports.append(port)
+                    stream_names.append(s["name"])
+                    encodings.append(s["encoding"])
 
+                    if s["name"] == "depth":
                         if depth_mode == "split":
                             LOGGER.info(f"Using DEPTH SPLIT mode")
                             high_port = config_loader.get_port_for_stream("depth_high", port + 1)
@@ -1441,18 +1479,19 @@ def main():
                                 height,
                                 intrinsics,
                             )
+                            depth_already_started = True
                         else:
                             LOGGER.info(f"Using DEPTH LEGACY mode")
                             intrinsics = config_loader.create_default_intrinsics(width, height)
                             video_receiver.start_stream(
                                 port, "depth", s["encoding"], width, height, intrinsics
                             )
-                    else:
-                        port = network_cfg["base_port"] + s["port_offset"]
-                        ports.append(port)
-                        stream_names.append(s["name"])
-                        encodings.append(s["encoding"])
+                            depth_already_started = True
 
+                        # Add width/height for depth stream
+                        widths.append(width)
+                        heights.append(height)
+                    else:
                         if s["name"] == "infra_stereo":
                             widths.append(width * 2)
                         else:
@@ -1479,6 +1518,10 @@ def main():
         for port, stream, encoding, stream_width, stream_height in zip(
             ports, stream_names, encodings, widths, heights, strict=False
         ):
+            # Skip depth stream if it was already started
+            if stream == "depth" and depth_already_started:
+                continue
+
             intrinsics = config_loader.create_default_intrinsics(
                 stream_width if stream != "infra_stereo" else stream_width // 2, stream_height
             )

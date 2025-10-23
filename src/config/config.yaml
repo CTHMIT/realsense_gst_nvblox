@@ -4,7 +4,7 @@
 
 network:
   local_ip: "0.0.0.0"  # IP address for binding (receiver)
-  server_ip: "10.28.121.28"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
+  server_ip: "172.20.10.10" # "10.28.121.28"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
   base_port: 5000  # Base port for video streams
 
   # Stream port configuration
