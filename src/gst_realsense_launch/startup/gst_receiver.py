@@ -19,7 +19,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 
@@ -34,6 +34,21 @@ except ImportError:
 
     LOGGER = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO)
+
+if TYPE_CHECKING:
+    from gst_realsense_launch.startup.gst_depth_receiver_module import GStreamerDepthReceiverNode
+
+try:
+    from gst_realsense_launch.startup.gst_depth_receiver_module import (
+        GStreamerDepthReceiverNode,
+        check_gstreamer_python_available,
+        create_depth_receiver_node,
+    )
+
+    GST_PYTHON_AVAILABLE = True
+except ImportError:
+    GST_PYTHON_AVAILABLE = False
+    LOGGER.warning("⚠ GStreamer Python bindings not available - depth streaming will be limited")
 
 
 class DepthMergeProcessor:
@@ -233,6 +248,10 @@ class VideoStreamReceiver:
         self.tmux_manager = TmuxSessionManager()
         self._shutdown_event = threading.Event()
         self.depth_merge_processor: DepthMergeProcessor | None = None
+        self.depth_receiver_node: Optional["GStreamerDepthReceiverNode"] = (
+            None  # For GStreamer Python-based depth receiver
+        )
+        self.depth_receiver_thread: threading.Thread | None = None
 
     def start_stream(
         self,
@@ -244,6 +263,14 @@ class VideoStreamReceiver:
         intrinsics: CameraIntrinsics | None = None,
     ):
         """Start receiving a video stream and publishing to ROS2."""
+
+        # Special handling for depth streams - use GStreamer Python instead of gscam
+        if stream_name == "depth":
+            self._start_depth_stream_python(port, encoding, width, height, intrinsics)
+            if self.show_views:
+                self._start_visualization_in_tmux(port, stream_name, width, height)
+            time.sleep(0.5)
+            return
 
         if stream_name == "infra_stereo":
             single_width = width // 2
@@ -380,6 +407,68 @@ class VideoStreamReceiver:
 
         if stream_name == "depth":
             self._start_depth_conversion_node(port, image_topic, info_topic)
+
+    def _start_depth_stream_python(
+        self,
+        port: int,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """Start depth stream using GStreamer Python bindings (bypasses gscam).
+
+        This method is used specifically for 16-bit depth streams because
+        gscam does not support 16UC1 or mono16 encodings.
+        """
+        if not GST_PYTHON_AVAILABLE:
+            LOGGER.error("❌ Cannot start depth stream: GStreamer Python not available")
+            LOGGER.error("   Install with: sudo apt install python3-gi python3-gst-1.0")
+            LOGGER.error("   Falling back to gscam (will fail for 16-bit depth)")
+            # Fallback to gscam (will likely fail, but at least we try)
+            self._start_single_stream_in_tmux(port, "depth", encoding, width, height, intrinsics)
+            return
+
+        LOGGER.info(f"[depth] Starting GStreamer Python receiver on port {port}")
+        LOGGER.info(f"  Encoding: {encoding}")
+        LOGGER.info(f"  Resolution: {width}x{height}")
+        LOGGER.info(f"  Topic: /{self.camera_name}/depth/image_rect_raw")
+        LOGGER.info(f"  Format: 16UC1 (16-bit depth)")
+        LOGGER.info(f"  Method: GStreamer Python (bypassing gscam)")
+
+        # Create the depth receiver node
+        self.depth_receiver_node = create_depth_receiver_node(
+            port=port,
+            width=width,
+            height=height,
+            camera_name=self.camera_name,
+            encoding=encoding,
+            config_loader=self.config_loader,
+            intrinsics=intrinsics,
+        )
+
+        if not self.depth_receiver_node:
+            LOGGER.error("❌ Failed to create depth receiver node")
+            return
+
+        # Start ROS2 spin in a separate thread
+        import rclpy
+
+        def spin_node():
+            try:
+                rclpy.spin(self.depth_receiver_node)
+            except Exception as e:
+                LOGGER.error(f"Error in depth receiver node: {e}")
+
+        self.depth_receiver_thread = threading.Thread(target=spin_node, daemon=True)
+        self.depth_receiver_thread.start()
+
+        LOGGER.info("✓ Depth receiver node started successfully")
+
+        # Start depth conversion node
+        depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
+        info_topic = f"/{self.camera_name}/depth/camera_info"
+        self._start_depth_conversion_node(port, depth_topic, info_topic)
 
     def _check_nvdec_available(self) -> bool:
         """Check if NVIDIA hardware decoder is available."""
@@ -955,14 +1044,29 @@ projection_matrix:
         LOGGER.info("=" * 40)
 
         try:
+            # Stop GStreamer Python depth receiver if running
+            if self.depth_receiver_node:
+                LOGGER.info("[0/3] Stopping GStreamer Python depth receiver...")
+                try:
+                    self.depth_receiver_node.stop()
+                    self.depth_receiver_node.destroy_node()
+                    if self.depth_receiver_thread and self.depth_receiver_thread.is_alive():
+                        self.depth_receiver_thread.join(timeout=2)
+                    LOGGER.info("  ✓ Depth receiver stopped")
+                except Exception as e:
+                    LOGGER.error(f"  ✗ Error stopping depth receiver: {e}")
+
             self.kill_gst_launch()
             if self.tmux_manager:
-                LOGGER.info("[1/2] Stopping GStreamer pipelines...")
+                LOGGER.info("[1/3] Stopping GStreamer pipelines...")
                 self.tmux_manager.kill_session()
                 time.sleep(1)
 
-            LOGGER.info("[2/2] Checking for orphaned processes...")
+            LOGGER.info("[2/3] Checking for orphaned processes...")
             self._cleanup_orphaned_processes()
+
+            LOGGER.info("[3/3] Final cleanup...")
+            time.sleep(0.5)
 
             LOGGER.info("=" * 40)
             LOGGER.info("✓ SHUTDOWN COMPLETE")

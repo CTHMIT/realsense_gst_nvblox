@@ -1,5 +1,7 @@
 # GStreamer RealSense Launch
-
+This repository is NOT open source. The code is publicly viewable for reading
+and evaluation only. Any use, build, modification, or distribution requires
+a written license from Wistron. Contact: michael_hsu@wistron.com
 
 ## 📈 Project Status
 

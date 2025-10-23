@@ -1,21 +1,73 @@
-MIT License
+Wistron Public View-Only License (WPVOL) v1.0
+SPDX-License-Identifier: LicenseRef-WPVOL-1.0
 
-Copyright (c) 2024 cthsu
+Copyright (c) 2024–2025 Wistron Corporation.
+All rights reserved.
+Contact: michael_hsu@wistron.com
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+THIS IS NOT AN OPEN-SOURCE LICENSE.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Definitions
+   “Software” means the source code, binaries, documentation, and any other
+   materials contained in or distributed with this repository.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. Internal License (Wistron Only)
+   Wistron Corporation and its employees are granted a non-transferable,
+   non-sublicensable, worldwide license to use, copy, modify, build, test, and
+   deploy the Software for internal business purposes. External distribution
+   or sublicensing by Wistron is not permitted without Licensor’s prior
+   written consent.
+
+3. Public View-Only Grant
+   Any member of the public is permitted to access and view the Software for
+   reading and evaluation purposes only.
+   The public is NOT permitted, without prior written permission from the
+   Licensor, to:
+     (a) use, run, execute, or compile the Software;
+     (b) copy, reproduce, modify, translate, or create derivative works;
+     (c) distribute, publish, host, or make the Software available in any form;
+     (d) incorporate the Software into any product, service, or research; or
+     (e) circumvent any technical or contractual restrictions in this License.
+
+4. External/Commercial Licensing
+   Any use beyond Section 3 requires a separate written license from the
+   Licensor. For licensing inquiries, contact: michael_hsu@wistron.com.
+
+5. Patents and Trademarks
+   No patent rights or trademark rights are granted under this License, whether
+   expressly, by implication, estoppel, or otherwise.
+
+6. Attribution and Notices
+   You must not remove or alter copyright, attribution, or license notices
+   contained in the Software.
+
+7. Confidentiality
+   This License does not authorize disclosure or use of any Wistron confidential
+   information that may be referenced by or embedded in the Software. Any such
+   information remains confidential and proprietary to Wistron.
+
+8. Warranty Disclaimer
+   THE SOFTWARE IS PROVIDED “AS IS” AND “AS AVAILABLE,” WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+   YOU ASSUME ALL RISKS ASSOCIATED WITH ACCESS OR VIEWING.
+
+9. Limitation of Liability
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT WILL THE LICENSOR OR ITS
+   CONTRIBUTORS BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL,
+   EXEMPLARY, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, REVENUE, DATA, OR USE,
+   EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+10. Termination
+   Any breach of this License immediately terminates your rights under it.
+   Upon termination, you must cease all access and delete all copies of the
+   Software in your possession or control.
+
+11. Miscellaneous
+   This License constitutes the entire agreement regarding its subject matter,
+   superseding any prior licenses included in this repository (including any
+   prior MIT text). If any provision is held unenforceable, the remaining
+   provisions remain in full force. No waiver is effective unless in writing.
+
+Licensor: Wistron Corporation
+Contact: michael_hsu@wistron.com
