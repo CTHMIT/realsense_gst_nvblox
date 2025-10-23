@@ -118,6 +118,8 @@ for p in udpsrc rtpjitterbuffer rtph264depay h264parse avdec_h264 videoconvert a
   fi
 done
 
+source "$REPO_ROOT/.venv/bin/activate"
+
 echo "==> Done."
 echo "Next:"
 echo "  export PYTHONPATH=\"$REPO_ROOT/src\""
