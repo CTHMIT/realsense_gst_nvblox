@@ -48,11 +48,12 @@ GST_AVAILABLE: bool = False
 GST_INITIALIZED: bool = False
 Gst: Any | None = None
 GLib: Any | None = None
+GstApp: Any | None = None
 
 
 def init_gstreamer():
     """Initialize GStreamer after ROS2 is initialized"""
-    global GST_AVAILABLE, GST_INITIALIZED, Gst, GLib
+    global GST_AVAILABLE, GST_INITIALIZED, Gst, GLib, GstApp
 
     if GST_INITIALIZED:
         return True
@@ -61,14 +62,17 @@ def init_gstreamer():
         import gi
 
         gi.require_version("Gst", "1.0")
+        gi.require_version("GstApp", "1.0")
         from gi.repository import GLib as _GLib
         from gi.repository import Gst as _Gst
+        from gi.repository import GstApp as _GstApp
 
         LOGGER.info("Initializing GStreamer...")
         _Gst.init(None)
 
         Gst = _Gst
         GLib = _GLib
+        GstApp = _GstApp
         GST_INITIALIZED = True
         LOGGER.info("GStreamer initialized successfully")
         return True
