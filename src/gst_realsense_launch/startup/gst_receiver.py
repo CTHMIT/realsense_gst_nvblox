@@ -36,12 +36,11 @@ except ImportError:
     logging.basicConfig(level=logging.INFO)
 
 if TYPE_CHECKING:
-    from gst_realsense_launch.startup.gst_depth_receiver_module import GStreamerDepthReceiverNode
+    from gst_realsense_launch.startup.h264_depth_receiver import DepthReceiverNode
 
 try:
-    from gst_realsense_launch.startup.gst_depth_receiver_module import (
-        GStreamerDepthReceiverNode,
-        create_depth_receiver_node,
+    from gst_realsense_launch.startup.h264_depth_receiver import (
+        DepthReceiverNode,
     )
 
     GST_PYTHON_AVAILABLE = True
@@ -247,7 +246,7 @@ class VideoStreamReceiver:
         self.tmux_manager = TmuxSessionManager()
         self._shutdown_event = threading.Event()
         self.depth_merge_processor: DepthMergeProcessor | None = None
-        self.depth_receiver_node: Optional["GStreamerDepthReceiverNode"] = (
+        self.depth_receiver_node: Optional["DepthReceiverNode"] = (
             None  # For GStreamer Python-based depth receiver
         )
         self.depth_receiver_thread: threading.Thread | None = None
@@ -265,7 +264,7 @@ class VideoStreamReceiver:
 
         # Special handling for depth streams - use GStreamer Python instead of gscam
         if stream_name == "depth":
-            self._start_depth_stream_python(port, encoding, width, height, intrinsics)
+            self._start_h264_depth_stream(port, encoding, width, height, intrinsics)
             if self.show_views:
                 self._start_visualization_in_tmux(port, stream_name, width, height)
             time.sleep(0.5)
@@ -407,7 +406,7 @@ class VideoStreamReceiver:
         if stream_name == "depth":
             self._start_depth_conversion_node(port, image_topic, info_topic)
 
-    def _start_depth_stream_python(
+    def _start_h264_depth_stream(
         self,
         port: int,
         encoding: str,
@@ -440,13 +439,13 @@ class VideoStreamReceiver:
 
         # Get the path to the standalone depth receiver script
         script_dir = Path(__file__).resolve().parent
-        depth_receiver_script = script_dir / "run_depth_receiver.py"
+        depth_receiver_script = script_dir / "h264_depth_receiver.py"
 
         # Check if script exists
         if not depth_receiver_script.exists():
             LOGGER.error(f"❌ Depth receiver script not found: {depth_receiver_script}")
             LOGGER.error(
-                "   Make sure run_depth_receiver.py is in the same directory as gst_receiver.py"
+                "   Make sure h264_depth_receiver.py is in the same directory as gst_receiver.py"
             )
             return
 
@@ -579,7 +578,7 @@ class VideoStreamReceiver:
         encoding_lower = encoding.lower()
 
         if stream_name == "depth":
-            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", False
             )
@@ -612,7 +611,7 @@ class VideoStreamReceiver:
             )
             LOGGER.info(f"  Depth pipeline: RTP → H.264 decode → GRAY16_LE → 16UC1")
         elif stream_name == "color":
-            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.color.drop_on_latency", False
             )
@@ -657,7 +656,7 @@ class VideoStreamReceiver:
                     f"! video/x-raw,format={output_format},width={width},height={height} "
                 )
         elif stream_name.startswith("infra"):
-            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.infra.drop_on_latency", True
             )
@@ -713,7 +712,7 @@ class VideoStreamReceiver:
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
 
-        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
+        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 50)
         drop_on_latency = self.config_loader.get(
             "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
         )
@@ -790,7 +789,7 @@ class VideoStreamReceiver:
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
 
         if stream_name == "depth":
-            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", True
             )
@@ -809,7 +808,7 @@ class VideoStreamReceiver:
                 f"! autovideosink sync=false"
             )
         elif stream_name == "color":
-            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.color.drop_on_latency", True
             )
@@ -827,7 +826,7 @@ class VideoStreamReceiver:
                 f"! autovideosink sync=false"
             )
         elif stream_name.startswith("infra"):
-            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.infra.drop_on_latency", True
             )
@@ -865,7 +864,7 @@ class VideoStreamReceiver:
             self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
         )
 
-        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 200)
+        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 50)
         drop_on_latency = self.config_loader.get(
             "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
         )
@@ -1208,17 +1207,17 @@ projection_matrix:
         )
 
         if stream_name == "depth_high":
-            latency = self.config_loader.get("streaming.jitter_buffer.depth_high.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_high.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth_high.drop_on_latency", False
             )
         elif stream_name == "depth_low":
-            latency = self.config_loader.get("streaming.jitter_buffer.depth_low.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_low.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth_low.drop_on_latency", False
             )
         else:
-            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
             drop_on_latency = self.config_loader.get(
                 "streaming.jitter_buffer.depth.drop_on_latency", False
             )
