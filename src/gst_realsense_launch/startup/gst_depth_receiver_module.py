@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""GStreamer Python Depth Receiver Module - H.264 Only
+"""GStreamer Python Depth Receiver Module
 
 This module provides a direct GStreamer-based depth receiver that bypasses gscam
-for 16-bit depth support. Simplified to support ONLY H.264 encoding.
+for 16-bit depth support. It integrates with the existing RealSense streaming architecture.
+
+IMPORTANT: Only H.264 encoding is supported (JPEG2000 and H.265 removed)
 
 Pipeline Flow:
-  UDP → RTP (payload=96) → H.264 decode → GRAY16_LE → ROS2 16UC1
+  Sender: Z16 → GRAY16_LE → I420 → x264enc → RTP (pt=96) → UDP
+  Receiver: UDP → RTP → H.264 decode → GRAY16_LE → ROS2 16UC1
 
 Why this is needed:
 - gscam only supports: rgb8, bgr8, rgba8, bgra8, mono8
 - gscam does NOT support: 16UC1, mono16 (required for depth)
 - This module uses GStreamer Python bindings to publish 16-bit depth directly
-
-Sender Pipeline (for reference):
-  Z16 → GRAY16_LE → I420 → x264enc → rtph264pay → UDP
 """
 
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -48,13 +48,15 @@ except Exception as e:
 
 
 class GStreamerDepthReceiverNode(Node):
-    """ROS2 node that receives 16-bit depth via GStreamer Python bindings (H.264 only).
+    """ROS2 node that receives 16-bit depth via GStreamer Python bindings.
 
     This node bypasses gscam limitations by directly pulling samples from
     GStreamer appsink and publishing them as ROS2 sensor_msgs/Image.
 
-    Supported encoding: H.264 only
-    Output format: 16UC1 (16-bit unsigned, single channel)
+    Supported encoding: H.264 ONLY (JPEG2000 and H.265 removed)
+    Pipeline: Z16 → GRAY16_LE → H.264 → GRAY16_LE → ROS2 16UC1
+
+    Matches sender: Z16 → GRAY16_LE → I420 → x264enc → RTP (pt=96) → UDP
     """
 
     def __init__(
@@ -63,6 +65,7 @@ class GStreamerDepthReceiverNode(Node):
         width: int,
         height: int,
         camera_name: str,
+        encoding: str,
         config_loader,
         intrinsics,
     ):
@@ -72,8 +75,16 @@ class GStreamerDepthReceiverNode(Node):
         self.width = width
         self.height = height
         self.camera_name = camera_name
+        self.encoding = encoding.lower()
         self.config_loader = config_loader
         self.intrinsics = intrinsics
+
+        # Validate encoding - only H.264 is supported
+        if self.encoding != "h264":
+            LOGGER.error(f"Unsupported encoding: {encoding}")
+            LOGGER.error("This receiver only supports H.264 encoding for depth")
+            LOGGER.error("Please use H.264 encoding in your sender")
+            raise ValueError(f"Unsupported encoding: {encoding}. Only 'h264' is supported.")
 
         self.frame_count = 0
         self.last_frame_time = time.time()
@@ -89,34 +100,28 @@ class GStreamerDepthReceiverNode(Node):
             raise RuntimeError("Install: sudo apt install python3-gi python3-gst-1.0")
 
         # GStreamer is already initialized by load_gst() at module level
+        # No need to call Gst.init(None) again
         self.pipeline: GstPipeline | None = None
         self.appsink: GstElement | None = None
         self.loop = None
 
         # Build and start pipeline
-        self._build_h264_pipeline()
+        self._build_pipeline()
         self._start_pipeline()
 
-        LOGGER.info(f"✓ GStreamer Depth Receiver Started (H.264)")
+        LOGGER.info(f"✓ GStreamer Depth Receiver Started")
         LOGGER.info(f"  Port: {port}")
+        LOGGER.info(f"  Encoding: H.264 only")
         LOGGER.info(f"  Resolution: {width}x{height}")
         LOGGER.info(f"  Topic: /{camera_name}/depth/image_rect_raw")
         LOGGER.info(f"  Format: 16UC1 (16-bit depth)")
+        LOGGER.info(f"  Pipeline: Z16 → GRAY16_LE → H.264 → GRAY16_LE → ROS2 16UC1")
 
-    def _build_h264_pipeline(self) -> None:
+    def _build_pipeline(self) -> None:
         """Build GStreamer pipeline for H.264 depth reception.
 
-        Pipeline breakdown:
-        1. udpsrc: Receive UDP packets
-        2. caps filter: Specify RTP H.264 format (payload=96)
-        3. rtpjitterbuffer: Handle network jitter
-        4. rtph264depay: Extract H.264 from RTP
-        5. h264parse: Parse H.264 stream
-        6. avdec_h264: Decode H.264 to raw video
-        7. queue: Buffer management
-        8. videoconvert: Format conversion
-        9. caps filter: Ensure GRAY16_LE output
-        10. appsink: Extract samples for ROS2 publishing
+        Optimized for: Z16 → GRAY16_LE → H.264 → GRAY16_LE → ROS2 16UC1
+        This matches the sender pipeline: Z16 → GRAY16_LE → I420 → x264enc → RTP
         """
 
         # Get configuration
@@ -130,27 +135,25 @@ class GStreamerDepthReceiverNode(Node):
             "streaming.jitter_buffer.depth.drop_on_latency", False
         )
         payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
-        payload = payload_types.get("depth_h264", 96)
 
         drop_str = "true" if drop_on_latency else "false"
 
-        # Build caps string for RTP H.264
+        # Only H.264 is supported for depth
+        # Build caps and decoder for H.264
+        payload = payload_types.get("depth_h264", 96)
         caps_str = (
-            f"application/x-rtp,"
-            f"media=video,"
-            f"clock-rate=90000,"
-            f"encoding-name=H264,"
-            f"payload={payload}"
+            f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}"
+        )
+        decoder_elements = (
+            f"rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads}"
         )
 
-        # Build complete pipeline for H.264
+        # Complete pipeline: UDP → RTP → H.264 decode → GRAY16_LE → appsink
         pipeline_str = (
             f"udpsrc port={self.port} buffer-size={buffer_size} "
             f'caps="{caps_str}" '
-            f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-            f"! rtph264depay "
-            f"! h264parse "
-            f"! avdec_h264 max-threads={max_threads} "
+            f"! {decoder_elements} "
             f"! queue max-size-buffers=4 leaky=downstream "
             f"! videoconvert n-threads=4 "
             f"! video/x-raw,format=GRAY16_LE,width={self.width},height={self.height},framerate=30/1 "
@@ -158,6 +161,7 @@ class GStreamerDepthReceiverNode(Node):
         )
 
         LOGGER.debug(f"Pipeline: {pipeline_str}")
+        LOGGER.info(f"  H.264 depth pipeline: RTP → H.264 decode → GRAY16_LE → 16UC1")
 
         # Create pipeline
         self.pipeline = Gst.parse_launch(pipeline_str)
@@ -184,14 +188,7 @@ class GStreamerDepthReceiverNode(Node):
         LOGGER.info("✓ Pipeline started successfully")
 
     def _on_new_sample(self, appsink) -> GstFlowReturn:
-        """Callback when new sample (frame) is available.
-
-        This method:
-        1. Extracts raw buffer from GStreamer
-        2. Converts to numpy array (GRAY16_LE)
-        3. Creates ROS2 Image message (16UC1)
-        4. Publishes image and camera info
-        """
+        """Callback when new sample (frame) is available."""
         sample = appsink.emit("pull-sample")
         if not sample:
             return Gst.FlowReturn.ERROR
@@ -231,7 +228,7 @@ class GStreamerDepthReceiverNode(Node):
             msg.step = width * 2  # bytes per row (2 bytes per pixel)
             msg.data = depth_image.tobytes()
 
-            # Publish image
+            # Publish
             self.image_pub.publish(msg)
 
             # Publish camera info
@@ -304,28 +301,8 @@ def create_depth_receiver_node(
     config_loader: Any,
     intrinsics: Any,
 ) -> GStreamerDepthReceiverNode | None:
-    """Factory function to create depth receiver node.
+    """Factory function to create depth receiver node."""
 
-    Args:
-        port: UDP port to receive on
-        width: Image width
-        height: Image height
-        camera_name: Camera name for ROS2 topics
-        encoding: Codec type (must be 'h264')
-        config_loader: Configuration loader
-        intrinsics: Camera intrinsics
-
-    Returns:
-        GStreamerDepthReceiverNode instance or None if failed
-    """
-
-    # Validate encoding
-    if encoding.lower() != "h264":
-        LOGGER.error(f"Unsupported encoding: {encoding}")
-        LOGGER.error("This module only supports H.264 encoding")
-        return None
-
-    # Check required plugins
     try:
         require_plugins(
             "udpsrc",
@@ -337,7 +314,7 @@ def create_depth_receiver_node(
             "appsink",
         )
     except RuntimeError as e:
-        LOGGER.error("GStreamer plugins not available: %s", e)
+        LOGGER.error("GStreamer not available: %s", e)
         return None
 
     if not check_gstreamer_python_available():
@@ -346,6 +323,7 @@ def create_depth_receiver_node(
         return None
 
     try:
+        # Initialize ROS2 if not already done
         if not rclpy.ok():
             rclpy.init()
 
@@ -354,6 +332,7 @@ def create_depth_receiver_node(
             width=width,
             height=height,
             camera_name=camera_name,
+            encoding=encoding,
             config_loader=config_loader,
             intrinsics=intrinsics,
         )

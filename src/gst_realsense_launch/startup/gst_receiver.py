@@ -586,67 +586,31 @@ class VideoStreamReceiver:
             drop_str = "true" if drop_on_latency else "false"
             output_format = gst_formats.get("depth", "GRAY16_LE")
 
-            if encoding_lower == "jpeg2000":
-                # JPEG2000 for lossless 16-bit depth preservation
-                # Z16 → GRAY16_LE → JPEG2000 → GRAY16_LE → auto-detect as 16UC1
-                payload = payload_types.get("depth_jpeg2000", 112)
+            # H.264 for depth - Optimized for Z16 → GRAY16_LE → H.264 → GRAY16_LE → ROS2 16UC1
+            # This matches the sender pipeline: Z16 → GRAY16_LE → I420 → x264enc → RTP
+            payload = payload_types.get("depth_h264", 96)
 
-                pipeline = (
-                    f"udpsrc port={port} buffer-size={buffer_size} "
-                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=JPEG2000,payload={payload}" '
-                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                    f"! rtpj2kdepay ! openjpegdec "
-                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                    f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
-                    f"! appsink drop=true max-buffers=1"
-                )
-                LOGGER.info(f"  Using JPEG2000 codec for lossless 16-bit depth")
-            elif encoding_lower == "h265":
-                # H.265 for depth
-                payload = payload_types.get("depth_h265", 113)
-
-                # Select decoder
-                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
-                    decoder = "nvh265dec"
-                    LOGGER.info(f"  Using NVIDIA H.265 hardware decoder for {stream_name}")
-                else:
-                    decoder = f"avdec_h265 max-threads={max_threads}"
-
-                pipeline = (
-                    f"udpsrc port={port} buffer-size={buffer_size} "
-                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
-                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                    f"! rtph265depay ! h265parse ! {decoder} "
-                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                    f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
-                    f"! appsink drop=true max-buffers=1"
-                )
+            # Select decoder - prefer software decoder for better compatibility
+            # NVIDIA decoder can be forced by setting environment variable USE_NVDEC=1
+            if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                decoder = "nvh264dec"
+                LOGGER.info(f"  Using NVIDIA H.264 hardware decoder for {stream_name}")
             else:
-                # H.264 for depth (default)
-                payload = payload_types.get("depth_h264", 96)
+                decoder = f"avdec_h264 max-threads={max_threads}"
+                LOGGER.info(f"  Using software H.264 decoder for {stream_name}")
 
-                # Select decoder - prefer software decoder for better compatibility with gscam
-                # NVIDIA decoder can be forced by setting environment variable USE_NVDEC=1
-                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
-                    decoder = "nvh264dec"
-                    LOGGER.info(f"  Using NVIDIA hardware decoder for {stream_name}")
-                else:
-                    decoder = f"avdec_h264 max-threads={max_threads}"
-
-                # Enhanced pipeline with explicit format specs and appsink for gscam
-                # The appsink with explicit caps helps gscam auto-detect the correct encoding
-                pipeline = (
-                    f"udpsrc port={port} buffer-size={buffer_size} "
-                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
-                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
-                    f"! rtph264depay ! h264parse ! {decoder} "
-                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
-                    f"! videoconvert n-threads={n_threads} "
-                    f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
-                    f"! appsink drop=true max-buffers=1"
-                )
+            # Pipeline: UDP → RTP → H.264 decode → GRAY16_LE → 16UC1 for ROS2
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! {decoder} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
+                f"! appsink drop=true max-buffers=1"
+            )
+            LOGGER.info(f"  Depth pipeline: RTP → H.264 decode → GRAY16_LE → 16UC1")
         elif stream_name == "color":
             latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 200)
             drop_on_latency = self.config_loader.get(
