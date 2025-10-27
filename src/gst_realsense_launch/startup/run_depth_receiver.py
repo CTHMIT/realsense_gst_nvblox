@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Optional, TypeAlias, cast
 
 import yaml
 
@@ -219,9 +219,11 @@ class DepthReceiverNode(Node):
         if not self.pipeline:
             raise RuntimeError("Failed to create pipeline")
 
-        self.appsink = self.pipeline.get_by_name("sink")
-        if not self.appsink:
-            raise RuntimeError("Failed to get appsink")
+        sink_el = self.pipeline.get_by_name("sink")
+        if sink_el is None:
+            raise RuntimeError("Failed to get appsink by name 'sink'")
+
+        self.appsink = cast(GstAppSink, sink_el)
 
     def _start_pipeline(self) -> None:
         """Start the GStreamer pipeline."""
@@ -243,10 +245,11 @@ class DepthReceiverNode(Node):
 
         while self.running:
             try:
-                sample = self.appsink.try_pull_sample(Gst.SECOND // 10)  # 100ms timeout
+                if self.appsink is None:
+                    time.sleep(0.01)
+                    continue
 
-                if sample is None:
-                    continue  # Timeout, retry
+                sample = self.appsink.try_pull_sample(Gst.SECOND // 10)
 
                 buffer = sample.get_buffer()
                 if not buffer:
