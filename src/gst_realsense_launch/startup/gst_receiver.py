@@ -265,7 +265,7 @@ class VideoStreamReceiver:
 
         # Special handling for depth streams - use GStreamer Python instead of gscam
         if stream_name == "depth":
-            self._start_depth_stream_python(port, encoding, width, height, intrinsics)
+            self.start_depth_stream(port, width, height, intrinsics)
             if self.show_views:
                 self._start_visualization_in_tmux(port, stream_name, width, height)
             time.sleep(0.5)
@@ -407,36 +407,35 @@ class VideoStreamReceiver:
         if stream_name == "depth":
             self._start_depth_conversion_node(port, image_topic, info_topic)
 
-    def _start_depth_stream_python(
+    def start_depth_stream(
         self,
         port: int,
-        encoding: str,
         width: int,
         height: int,
-        intrinsics: CameraIntrinsics | None,
+        intrinsics: CameraIntrinsics | None = None,
     ):
-        """Start depth stream using GStreamer Python bindings in tmux (bypasses gscam).
+        """Start receiving H.264 depth stream and publishing to ROS2.
 
-        This method is used specifically for 16-bit depth streams because
-        gscam does not support 16UC1 or mono16 encodings.
+        This method uses GStreamer Python bindings to receive 16-bit depth directly,
+        bypassing gscam limitations.
 
-        Instead of running in a thread, the depth receiver now runs in a tmux window
-        for consistency with other streams.
+        Pipeline: UDP → RTP → H.264 decode → GRAY16_LE → ROS2 16UC1
         """
+        LOGGER.info("=" * 50)
+        LOGGER.info("STARTING H.264 DEPTH STREAM RECEIVER")
+        LOGGER.info("=" * 50)
+
         if not GST_PYTHON_AVAILABLE:
             LOGGER.error("❌ Cannot start depth stream: GStreamer Python not available")
             LOGGER.error("   Install with: sudo apt install python3-gi python3-gst-1.0")
-            LOGGER.error("   Falling back to gscam (will fail for 16-bit depth)")
-            # Fallback to gscam (will likely fail, but at least we try)
-            self._start_single_stream_in_tmux(port, "depth", encoding, width, height, intrinsics)
             return
 
-        LOGGER.info(f"[depth] Starting GStreamer Python receiver on port {port}")
-        LOGGER.info(f"  Encoding: {encoding}")
-        LOGGER.info(f"  Resolution: {width}x{height}")
-        LOGGER.info(f"  Topic: /{self.camera_name}/depth/image_rect_raw")
-        LOGGER.info(f"  Format: 16UC1 (16-bit depth)")
-        LOGGER.info(f"  Method: GStreamer Python in tmux (bypassing gscam)")
+        LOGGER.info(f"[depth] Port: {port}")
+        LOGGER.info(f"[depth] Resolution: {width}x{height}")
+        LOGGER.info(f"[depth] Encoding: H.264")
+        LOGGER.info(f"[depth] Topic: /{self.camera_name}/depth/image_rect_raw")
+        LOGGER.info(f"[depth] Format: 16UC1 (16-bit depth)")
+        LOGGER.info(f"[depth] Method: GStreamer Python (direct 16-bit)")
 
         # Get the path to the standalone depth receiver script
         script_dir = Path(__file__).resolve().parent
@@ -457,7 +456,7 @@ class VideoStreamReceiver:
             f"--width {width}",
             f"--height {height}",
             f"--camera-name {self.camera_name}",
-            f"--encoding {encoding}",
+            "--encoding h264",  # Force H.264
         ]
 
         # Add config file path if available
@@ -496,29 +495,23 @@ class VideoStreamReceiver:
         # Wait a moment for the node to initialize
         time.sleep(1.0)
 
-        # Start depth conversion node (if needed)
+        # Start depth conversion node (converts 16UC1 → 32FC1 for navigation)
         depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
         info_topic = f"/{self.camera_name}/depth/camera_info"
         self._start_depth_conversion_node(port, depth_topic, info_topic)
 
         LOGGER.info("✓ Depth stream setup complete")
 
-    def _check_nvdec_available(self) -> bool:
-        """Check if NVIDIA hardware decoder is available."""
-        try:
-            result = subprocess.run(
-                ["gst-inspect-1.0", "nvh264dec"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-            )
-            return result.returncode == 0
-        except:
-            return False
+        # Optional visualization
+        if self.show_views:
+            self._start_depth_visualization(port, width, height)
 
     def _start_depth_conversion_node(self, port: int, depth_topic: str, info_topic: str):
-        """Start depth_image_proc convert_metric node for float32 conversion."""
+        """Start depth_image_proc convert_metric node for float32 conversion.
 
+        Converts: 16UC1 (millimeters) → 32FC1 (meters)
+        This is required for navigation stack compatibility.
+        """
         depth_config = self.config_loader.get("receiver.depth_conversion", {})
 
         if not depth_config.get("enabled", True):
@@ -540,11 +533,63 @@ class VideoStreamReceiver:
         window_name = f"depth_convert_{port}"
 
         LOGGER.info(f"  [CONVERT] Starting depth to float32 conversion")
-        LOGGER.info(f"    Input: {depth_topic} (16UC1 format)")
-        LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
+        LOGGER.info(f"    Input: {depth_topic} (16UC1 millimeters)")
+        LOGGER.info(f"    Output: {output_full_topic} (32FC1 meters)")
 
         time.sleep(1.0)
         self.tmux_manager.create_window(window_name, convert_cmd)
+
+    def _start_depth_visualization(self, port: int, width: int, height: int):
+        """Start visualization for depth stream using GStreamer."""
+        display_width = int(width * self.view_scale)
+        display_height = int(height * self.view_scale)
+
+        # Get configuration
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 10000000),
+            30000000,
+        )
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 200)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.depth.drop_on_latency", False
+        )
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        payload = payload_types.get("depth_h264", 96)
+
+        drop_str = "true" if drop_on_latency else "false"
+
+        # Build visualization pipeline (H.264 only)
+        viz_pipeline = (
+            f"gst-launch-1.0 -e "
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+            f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+            f"! videoconvert "
+            f"! videoscale "
+            f"! video/x-raw,width={display_width},height={display_height} "
+            f"! autovideosink sync=false"
+        )
+
+        window_name = f"view_depth_{port}"
+        LOGGER.info(f"  [VISUALIZATION] Starting depth visualization window")
+        LOGGER.info(f"    Display size: {display_width}x{display_height}")
+
+        self.tmux_manager.create_window(window_name, viz_pipeline)
+
+    def _check_nvdec_available(self) -> bool:
+        """Check if NVIDIA hardware decoder is available."""
+        try:
+            result = subprocess.run(
+                ["gst-inspect-1.0", "nvh264dec"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return result.returncode == 0
+        except:
+            return False
 
     def _build_pipeline(
         self, port: int, stream_name: str, encoding: str, width: int, height: int
