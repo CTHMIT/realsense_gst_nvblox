@@ -94,16 +94,16 @@ streaming:
 
   jitter_buffer:
     depth:
-      latency: 200
+      latency: 50
       drop_on_latency: false
     color:
-      latency: 200
+      latency: 50
       drop_on_latency: false
     infra:
-      latency: 200
+      latency: 50
       drop_on_latency: false
     infra_stereo:
-      latency: 200
+      latency: 50
       drop_on_latency: false
 
   queue:
@@ -112,7 +112,7 @@ streaming:
 
   # Processing Configuration (both sender and receiver)
   processing:
-    max_threads: 4
+    max_threads: 8
     n_threads: 4
 
 imu:
