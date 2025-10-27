@@ -20,13 +20,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-try:
-    from utils.logger import LOGGER
-except ImportError:
-    import logging
-
-    LOGGER = logging.getLogger(__name__)
-    logging.basicConfig(level=logging.INFO)
+from utils.logger import LOGGER
 
 try:
     import rclpy
