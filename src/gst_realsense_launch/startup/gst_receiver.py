@@ -262,7 +262,6 @@ class VideoStreamReceiver:
     ):
         """Start receiving a video stream and publishing to ROS2."""
 
-        # Special handling for depth streams - use GStreamer Python instead of gscam
         if stream_name == "depth":
             self._start_h264_depth_stream(port, encoding, width, height, intrinsics)
             if self.show_views:
@@ -323,7 +322,7 @@ class VideoStreamReceiver:
         is_y8i: bool = False,
         y8i_width: int = None,
     ):
-        """Start a single stream receiver in a tmux window (gscam for ROS2)."""
+        """Start a single stream receiver in a tmux window"""
 
         calib_file = self._get_calibration_file_path(stream_name, width, height)
 
@@ -353,7 +352,7 @@ class VideoStreamReceiver:
             image_topic = f"/{self.camera_name}/depth/image_rect_raw"
             info_topic = f"/{self.camera_name}/depth/camera_info"
             frame_id = f"{self.camera_name}_depth_optical_frame"
-            image_encoding = "16UC1"  # Use 16UC1 (OpenCV format) instead of mono16
+            image_encoding = image_encodings.get("depth", "16UC1")
         elif stream_name == "color":
             image_topic = f"/{self.camera_name}/color/image_raw"
             info_topic = f"/{self.camera_name}/color/camera_info"

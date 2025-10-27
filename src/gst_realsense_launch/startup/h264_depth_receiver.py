@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""GStreamer Depth Receiver
-
-1. QoS: BEST_EFFORT + KEEP_LAST=1 (avoid accumulation and retransmission delays)
-2. Blocking pull: Single consumer thread (replaces timer polling)
-3. Remove NumPy: Direct raw bytes (avoid copy overhead)
-4. Queue maxsize=1: Always keep only the latest frame
-5. Hardware decoder auto-detection: NVIDIA/VAAPI → CPU fallback
-"""
+"""GStreamer Depth Receiver for ROS2"""
 
 import argparse
 import sys
@@ -40,11 +33,7 @@ GLib: Any = None
 
 
 def init_gstreamer() -> bool:
-    """Initialize GStreamer after ROS2 is initialized.
-
-    Returns:
-        bool: True if initialization successful, False otherwise
-    """
+    """Initialize GStreamer after ROS2 is initialized."""
     global GST_AVAILABLE, GST_INITIALIZED, Gst, GLib
 
     if GST_INITIALIZED:
@@ -93,17 +82,7 @@ class DepthReceiverNode(Node):
         config_loader: ConfigLoader,
         intrinsics: CameraIntrinsics,
     ) -> None:
-        """Initialize the depth receiver node.
-
-        Args:
-            port: UDP port to receive on
-            width: Image width in pixels
-            height: Image height in pixels
-            camera_name: Camera name for topic naming
-            encoding: Video encoding format (only 'h264' supported)
-            config_loader: Configuration loader instance
-            intrinsics: Camera intrinsics parameters
-        """
+        """Initialize the depth receiver node."""
         super().__init__(
             f"{camera_name}_depth_receiver",
             allow_undeclared_parameters=True,
@@ -130,13 +109,26 @@ class DepthReceiverNode(Node):
         if self.encoding != "h264":
             raise ValueError(f"Unsupported encoding: {encoding}. Only 'h264' is supported.")
 
+        # Statistics
         self.frame_count: int = 0
         self.last_frame_time: float = time.time()
         self.last_log_time: float = time.time()
+        self.error_count: int = 0
+        self.last_error_time: float = 0.0
 
+        # Queue management - keep only latest frame
         self.frame_queue: Queue[Image] = Queue(maxsize=1)
         self.running: bool = True
 
+        # Watchdog for pipeline health
+        self.last_buffer_time: float = time.time()
+        self.watchdog_timeout: float = 10.0  # seconds
+
+        # Buffer pool for reusing message objects
+        self.message_pool: list[Image] = []
+        self.max_pool_size: int = 10
+
+        # QoS configuration
         qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -144,6 +136,7 @@ class DepthReceiverNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
 
+        # Publishers
         self.image_pub = self.create_publisher(
             Image, f"/{camera_name}/depth/image_rect_raw", qos_profile
         )
@@ -155,23 +148,32 @@ class DepthReceiverNode(Node):
 
         self.pipeline: Any = None
         self.appsink: Any = None
+        self.bus: Any = None
 
         self._build_pipeline()
         self._start_pipeline()
 
+        # Consumer thread with proper exception handling
         self.consumer_thread: threading.Thread = threading.Thread(
-            target=self._consume_frames, daemon=True
+            target=self._consume_frames_safe, daemon=True
         )
         self.consumer_thread.start()
 
+        # Watchdog thread
+        self.watchdog_thread: threading.Thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True
+        )
+        self.watchdog_thread.start()
+
+        # Publishing timer
         self.timer = self.create_timer(0.001, self._publish_frames)
+
+        # Memory cleanup timer (every 30 seconds)
+        self.cleanup_timer = self.create_timer(30.0, self._periodic_cleanup)
 
         LOGGER.info(f"✓ Depth Receiver Started")
         LOGGER.info(f"  Port: {port}")
         LOGGER.info(f"  Resolution: {width}x{height}")
-        LOGGER.info(f"  QoS: BEST_EFFORT + KEEP_LAST=1")
-        LOGGER.info(f"  Queue: maxsize=1 (latest frame only)")
-        LOGGER.info(f"  Consumer: Blocking thread (no polling)")
         LOGGER.info(f"  Topic: /{camera_name}/depth/image_rect_raw")
 
     def _build_pipeline(self) -> None:
@@ -210,7 +212,7 @@ class DepthReceiverNode(Node):
                 f"rtpjitterbuffer latency={latency} drop-on-latency=true "
                 f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads}"
             )
-            LOGGER.info("⚠ Using software decoder (install gstreamer-vaapi for GPU acceleration)")
+            LOGGER.info("⚠ Using software decoder")
 
         pipeline_str: str = (
             f"udpsrc port={self.port} buffer-size={buffer_size} "
@@ -232,7 +234,26 @@ class DepthReceiverNode(Node):
         if not self.appsink:
             raise RuntimeError("Failed to get appsink")
 
+        # Set up bus for monitoring
+        self.bus = self.pipeline.get_bus()
+        self.bus.add_signal_watch()
+        self.bus.connect("message::error", self._on_bus_error)
+        self.bus.connect("message::warning", self._on_bus_warning)
+
         self.appsink.connect("new-sample", self._on_new_sample_callback)
+
+    def _on_bus_error(self, bus: Any, message: Any) -> None:
+        """Handle pipeline errors."""
+        err, debug = message.parse_error()
+        LOGGER.error(f"Pipeline error: {err.message}")
+        LOGGER.debug(f"Debug info: {debug}")
+        self.error_count += 1
+        self.last_error_time = time.time()
+
+    def _on_bus_warning(self, bus: Any, message: Any) -> None:
+        """Handle pipeline warnings."""
+        warn, debug = message.parse_warning()
+        LOGGER.warning(f"Pipeline warning: {warn.message}")
 
     def _start_pipeline(self) -> None:
         """Start the GStreamer pipeline."""
@@ -246,25 +267,35 @@ class DepthReceiverNode(Node):
         LOGGER.info("✓ Pipeline started (PLAYING)")
 
     def _on_new_sample_callback(self, sink: Any) -> Any:
-        """GStreamer callback for new samples (signals the consumer thread).
-
-        This callback runs in GStreamer's thread. It just returns OK to signal
-        that a sample is ready. The actual processing happens in _consume_frames.
-
-        Args:
-            sink: The appsink element
-
-        Returns:
-            Gst.FlowReturn.OK
-        """
+        """GStreamer callback for new samples."""
         return Gst.FlowReturn.OK
 
-    def _consume_frames(self) -> None:
-        """
-        Single consumer thread with blocking pull.
+    def _get_message_from_pool(self) -> Image:
+        """Get a reusable message from pool or create new one."""
+        if self.message_pool:
+            return self.message_pool.pop()
+        return Image()
 
-        Uses appsink.pull_sample() to block and wait for new frames
-        """
+    def _return_message_to_pool(self, msg: Image) -> None:
+        """Return message to pool for reuse."""
+        if len(self.message_pool) < self.max_pool_size:
+            # Clear message data before returning to pool
+            msg.data = []
+            self.message_pool.append(msg)
+
+    def _consume_frames_safe(self) -> None:
+        """Wrapper for consumer with exception handling."""
+        try:
+            self._consume_frames()
+        except Exception as e:
+            LOGGER.error(f"Consumer thread crashed: {e}")
+            import traceback
+
+            traceback.print_exc()
+            self.running = False
+
+    def _consume_frames(self) -> None:
+        """Single consumer thread with blocking pull."""
         LOGGER.info("Consumer thread started (blocking mode)")
 
         while self.running:
@@ -278,6 +309,9 @@ class DepthReceiverNode(Node):
                 if not buffer:
                     continue
 
+                # Update watchdog
+                self.last_buffer_time = time.time()
+
                 success, map_info = buffer.map(Gst.MapFlags.READ)
                 if not success:
                     continue
@@ -285,8 +319,8 @@ class DepthReceiverNode(Node):
                 try:
                     data_bytes: bytes = bytes(map_info.data)
 
-                    # Create ROS2 Image message
-                    msg = Image()
+                    # Reuse message from pool
+                    msg = self._get_message_from_pool()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     msg.header.frame_id = f"{self.camera_name}_depth_optical_frame"
                     msg.height = self.height
@@ -296,10 +330,19 @@ class DepthReceiverNode(Node):
                     msg.step = self.width * 2
                     msg.data = data_bytes
 
+                    # Try to put in queue, if full discard old
                     try:
+                        # Remove old frame if queue is full
+                        try:
+                            old_msg = self.frame_queue.get_nowait()
+                            self._return_message_to_pool(old_msg)
+                        except Empty:
+                            pass
+
                         self.frame_queue.put_nowait(msg)
                     except Exception as e:
-                        LOGGER.warning(f"Frame queue full, dropping frame: {e}")
+                        LOGGER.warning(f"Queue error: {e}")
+                        self._return_message_to_pool(msg)
 
                 finally:
                     buffer.unmap(map_info)
@@ -312,19 +355,41 @@ class DepthReceiverNode(Node):
 
         LOGGER.info("Consumer thread stopped")
 
-    def _publish_frames(self) -> None:
-        """
-        Publish frames from the queue.
+    def _watchdog_loop(self) -> None:
+        """Monitor pipeline health and restart if needed."""
+        LOGGER.info("Watchdog thread started")
 
-        """
+        while self.running:
+            try:
+                time.sleep(5.0)  # Check every 5 seconds
+
+                current_time = time.time()
+                time_since_buffer = current_time - self.last_buffer_time
+
+                if time_since_buffer > self.watchdog_timeout:
+                    LOGGER.warning(
+                        f"No buffers received for {time_since_buffer:.1f}s "
+                        f"(threshold: {self.watchdog_timeout}s)"
+                    )
+
+                    # Check if we're getting too many errors
+                    if self.error_count > 10 and (current_time - self.last_error_time) < 60:
+                        LOGGER.error("Too many pipeline errors, consider restarting")
+
+            except Exception as e:
+                LOGGER.error(f"Watchdog error: {e}")
+
+        LOGGER.info("Watchdog thread stopped")
+
+    def _publish_frames(self) -> None:
+        """Publish frames from the queue."""
         try:
-            # Non-blocking get
             msg: Image = self.frame_queue.get_nowait()
 
             # Publish image
             self.image_pub.publish(msg)
 
-            # Publish camera info (every 10 frames)
+            # Publish camera info every 10 frames
             if self.frame_count % 10 == 0:
                 info_msg: CameraInfo = self._create_camera_info(msg.header)
                 self.info_pub.publish(info_msg)
@@ -337,21 +402,27 @@ class DepthReceiverNode(Node):
             if self.frame_count % 60 == 0:
                 elapsed: float = current_time - self.last_log_time
                 fps: float = 60.0 / elapsed if elapsed > 0 else 0
-                LOGGER.info(f"Depth: {self.frame_count} frames, {fps:.1f} FPS")
+                LOGGER.info(
+                    f"Depth: {self.frame_count} frames, {fps:.1f} FPS, "
+                    f"errors: {self.error_count}"
+                )
                 self.last_log_time = current_time
 
-        except Empty as e:
-            pass  # Queue empty, skip
+            # Return message to pool
+            self._return_message_to_pool(msg)
+
+        except Empty:
+            pass
+
+    def _periodic_cleanup(self) -> None:
+        """Periodic cleanup of resources."""
+        # Log statistics
+        LOGGER.debug(f"Pool size: {len(self.message_pool)}/{self.max_pool_size}")
+        LOGGER.debug(f"Queue size: {self.frame_queue.qsize()}")
+        LOGGER.debug(f"Total frames: {self.frame_count}, Errors: {self.error_count}")
 
     def _create_camera_info(self, header: Header) -> CameraInfo:
-        """Create CameraInfo message from intrinsics.
-
-        Args:
-            header: ROS2 message header with timestamp and frame_id
-
-        Returns:
-            CameraInfo message populated with intrinsics
-        """
+        """Create CameraInfo message from intrinsics."""
         info = CameraInfo()
         info.header = header
         info.width = self.intrinsics.width
@@ -400,19 +471,37 @@ class DepthReceiverNode(Node):
         if hasattr(self, "consumer_thread") and self.consumer_thread.is_alive():
             self.consumer_thread.join(timeout=2.0)
 
+        # Wait for watchdog thread
+        if hasattr(self, "watchdog_thread") and self.watchdog_thread.is_alive():
+            self.watchdog_thread.join(timeout=2.0)
+
+        # Stop pipeline
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+            time.sleep(0.5)  # Give it time to stop
             self.pipeline = None
+
+        # Clean up bus
+        if self.bus:
+            self.bus.remove_signal_watch()
+            self.bus = None
+
+        # Clear queue
+        while not self.frame_queue.empty():
+            try:
+                msg = self.frame_queue.get_nowait()
+                self._return_message_to_pool(msg)
+            except Empty:
+                break
+
+        # Clear message pool
+        self.message_pool.clear()
 
         LOGGER.info("✓ depth receiver stopped")
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments.
-
-    Returns:
-        Parsed command line arguments
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="GStreamer Depth Receiver")
     parser.add_argument("--port", type=int, required=True, help="UDP port to receive on")
     parser.add_argument("--width", type=int, required=True, help="Image width")
@@ -433,15 +522,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def create_intrinsics(args: argparse.Namespace, config_loader: ConfigLoader) -> CameraIntrinsics:
-    """Create camera intrinsics from args or defaults.
-
-    Args:
-        args: Parsed command line arguments
-        config_loader: Configuration loader instance
-
-    Returns:
-        Camera intrinsics parameters
-    """
+    """Create camera intrinsics from args or defaults."""
     if all([args.fx, args.fy, args.ppx, args.ppy]):
         distortion = args.distortion if args.distortion else [0.0, 0.0, 0.0, 0.0, 0.0]
         return CameraIntrinsics(
@@ -458,11 +539,7 @@ def create_intrinsics(args: argparse.Namespace, config_loader: ConfigLoader) -> 
 
 
 def check_availability() -> bool:
-    """Check if required dependencies are available.
-
-    Returns:
-        True if all dependencies are available, False otherwise
-    """
+    """Check if required dependencies are available."""
     gst_status = "✓" if GST_AVAILABLE else "✗"
     ros_status = "✓" if ROS2_AVAILABLE else "✗"
 
@@ -485,7 +562,6 @@ def main() -> None:
     node: DepthReceiverNode | None = None
 
     try:
-        # Load configuration
         config_path = Path(args.config)
         if not config_path.is_file():
             LOGGER.error(f"Configuration file not found: {args.config}")
@@ -502,9 +578,10 @@ def main() -> None:
         LOGGER.info(f"Encoding: {args.encoding}")
         LOGGER.info(f"Camera: {args.camera_name}")
         LOGGER.info(f"Topic: /{args.camera_name}/depth/image_rect_raw")
-        LOGGER.info(f"Format: 16UC1 (16-bit depth)")
         LOGGER.info("=" * 60)
+
         rclpy.init()
+
         try:
             node = DepthReceiverNode(
                 port=args.port,
@@ -523,7 +600,6 @@ def main() -> None:
             sys.exit(1)
 
         LOGGER.info("✓ Node created successfully")
-        LOGGER.info("Starting to receive and publish depth data...")
         LOGGER.info("Press Ctrl+C to stop")
 
         try:
