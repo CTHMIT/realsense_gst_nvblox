@@ -341,7 +341,7 @@ class DepthReceiverNode(Node):
                 self.last_log_time = current_time
 
         except Empty as e:
-            LOGGER.warning(f"No frames in queue to publish: {e}")
+            pass  # Queue empty, skip
 
     def _create_camera_info(self, header: Header) -> CameraInfo:
         """Create CameraInfo message from intrinsics.
