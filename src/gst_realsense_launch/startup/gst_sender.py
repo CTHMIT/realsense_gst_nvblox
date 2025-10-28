@@ -12,16 +12,21 @@ import atexit
 import getpass
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
-import pyrealsense2 as rs
+from utils.logger import LOGGER
+
+try:
+    import pyrealsense2 as rs
+except Exception:
+    rs = None
+    LOGGER.warning("pyrealsense2 not available; RealSense-dependent features disabled.")
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -35,7 +40,6 @@ from gst_realsense_launch.startup.rs_common import (
 )
 from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
 from gst_realsense_launch.startup.rs_detect import RealSenseDetector
-from utils.logger import LOGGER
 
 
 class IMUSender:
