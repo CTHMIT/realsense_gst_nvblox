@@ -10,4 +10,6 @@ __all__ = [
     "network_diagnostics",
     "depth_receiver_module",
     "run_depth_receiver",
+    "separate_and_merge",
+    "rs_detect",
 ]

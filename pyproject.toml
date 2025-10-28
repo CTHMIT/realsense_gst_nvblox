@@ -17,6 +17,7 @@ dependencies = [
     "meson>=1.9.1",
     "ninja>=1.13.0",
     "pycairo>=1.28.0",
+    "pydantic>=2.12.3",
 ]
 
 requires-python = ">=3.10"
