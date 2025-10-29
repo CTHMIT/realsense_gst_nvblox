@@ -352,10 +352,10 @@ class StereoIRSender:
                         )
                     continue
 
-                left_ir = frame_2d[:, 0::2].copy()
-                right_ir = frame_2d[:, 1::2].copy()
+                left_ir = frame_2d[:, : self.config.ir_width].copy()
+                right_ir = frame_2d[:, self.config.ir_width :].copy()
 
-                expected_shape = (self.config.height, self.config.width)
+                expected_shape = (self.config.height, self.config.ir_width)
                 if left_ir.shape != expected_shape or right_ir.shape != expected_shape:
                     if self.frame_count < 5:
                         logger.error(f"Error : left={left_ir.shape}, right={right_ir.shape}")
