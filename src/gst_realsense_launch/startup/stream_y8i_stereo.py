@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RealSense D435i stereo Y8I
-Y8I format = width × height × 2 bytes
+Y8I format = width × height × 2 bytes (pixel-interleaved: L0 R0 L1 R1...)
 """
 import logging
 import signal
@@ -65,7 +65,7 @@ class StreamConfig:
 
 
 class Y8IValidator:
-    """Y8I vilidator"""
+    """Y8I validator"""
 
     SUPPORTED_Y8I_CONFIGS: dict[tuple[int, int], list[int]] = {
         (424, 240): [90, 60, 30, 15, 6],
@@ -342,23 +342,33 @@ class StereoIRSender:
 
                 self.error_count = 0
 
-                # Y8I  = width × height × 2
-                if frame.size == self.config.expected_bytes:
-                    frame_2d = frame.reshape(self.config.height, self.config.width * 2)
-                else:
+                # Y8I format = width × height × 2 bytes
+                # Pixel interleaved: [L0][R0][L1][R1]...[L423][R423] per row
+                # Actual data layout: each row has width*2 bytes
+                if frame.size != self.config.expected_bytes:
                     if self.frame_count < 5:
                         logger.warning(
                             f"stream data error : {frame.size} (need: {self.config.expected_bytes})"
                         )
                     continue
 
-                left_ir = frame_2d[:, : self.config.ir_width].copy()
-                right_ir = frame_2d[:, self.config.ir_width :].copy()
+                # Reshape to (height, width*2), e.g., (480, 1696) for 848x480
+                frame_2d = frame.reshape(self.config.height, self.config.width * 2)
 
-                expected_shape = (self.config.height, self.config.ir_width)
+                # De-interleave left and right images
+                # 0::2 takes even positions (L0, L1, L2, ...)
+                # 1::2 takes odd positions (R0, R1, R2, ...)
+                left_ir = frame_2d[:, 0::2].copy()  # Shape: (480, 848)
+                right_ir = frame_2d[:, 1::2].copy()  # Shape: (480, 848)
+
+                # Verify de-interleaved single IR image shape
+                expected_shape = (self.config.height, self.config.width)
                 if left_ir.shape != expected_shape or right_ir.shape != expected_shape:
                     if self.frame_count < 5:
-                        logger.error(f"Error : left={left_ir.shape}, right={right_ir.shape}")
+                        logger.error(
+                            f"Shape error: left={left_ir.shape}, right={right_ir.shape}, "
+                            f"expected={expected_shape}"
+                        )
                     continue
 
                 try:
@@ -498,9 +508,9 @@ class StereoIRReceiver:
         return subprocess.Popen(pipeline, stderr=subprocess.PIPE)
 
     def start(self) -> bool:
-        logger.info("Strating receiver...")
-        logger.info(f"left IR: UDP port {self.config.left_port}")
-        logger.info(f"right IR: UDP port {self.config.right_port}")
+        logger.info("Starting receiver...")
+        logger.info(f"Left IR: UDP port {self.config.left_port}")
+        logger.info(f"Right IR: UDP port {self.config.right_port}")
         if self.config.display_scale != 1.0:
             logger.info(f"Scale: {self.config.display_scale}x")
         logger.info("Push Ctrl+C to Stop\n")
@@ -516,16 +526,16 @@ class StereoIRReceiver:
                 time.sleep(1)
 
                 if self.gst_left and self.gst_left.poll() is not None:
-                    logger.warning("左紅外線已停止")
+                    logger.warning("Left IR stopped")
                     break
                 if self.gst_right and self.gst_right.poll() is not None:
-                    logger.warning("右紅外線已停止")
+                    logger.warning("Right IR stopped")
                     break
 
         except KeyboardInterrupt:
-            logger.info("\n收到停止信號")
+            logger.info("\nReceived stop signal")
         except Exception as e:
-            logger.error(f"錯誤: {e}")
+            logger.error(f"Error: {e}")
             return False
         finally:
             self.stop()
@@ -556,32 +566,38 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Supported Y8I configurations:
-  424x240   @ 90/60/30/15/6 fps
-  848x480   @ 90/60/30/15/6 fps
-  1280x720  @ 30/15/6 fps
+  424x240   @ 90/60/30/15/6 fps  (single IR: 212x240)
+  848x480   @ 90/60/30/15/6 fps  (single IR: 424x480)
+  1280x720  @ 30/15/6 fps        (single IR: 640x720)
+
+Y8I Format: Pixel-interleaved [L0][R0][L1][R1]...[Ln][Rn]
+  Total data: width × height × 2 bytes
+  Each IR:    (width/2) × height
 
 Examples:
-  python stereo_ir_stream.py send
+  # Sender (on robot)
   python stereo_ir_stream.py send --width 848 --height 480 --fps 60
+
+  # Receiver (on PC)
   python stereo_ir_stream.py receive --scale 0.5
         """,
     )
 
     parser.add_argument("mode", choices=["send", "receive"])
-    parser.add_argument("--width", type=int, default=424)
-    parser.add_argument("--height", type=int, default=240)
+    parser.add_argument("--width", type=int, default=424, help="Y8I width (not single IR width)")
+    parser.add_argument("--height", type=int, default=240, help="Y8I height")
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--bitrate", type=int, default=0)
-    parser.add_argument("--preset", default="ultrafast")
-    parser.add_argument("--host", default="10.28.121.28")
+    parser.add_argument("--bitrate", type=int, default=0, help="kbps per stream (0=auto)")
+    parser.add_argument("--preset", default="ultrafast", help="x264 encoding preset")
+    parser.add_argument("--host", default="10.28.121.28", help="receiver IP")
     parser.add_argument("--left-port", type=int, default=5031)
     parser.add_argument("--right-port", type=int, default=5032)
-    parser.add_argument("--device", default="/dev/video2")
-    parser.add_argument("--mode-display", dest="display_mode", default="window")
-    parser.add_argument("--scale", type=float, default=1.0)
+    parser.add_argument("--device", default="/dev/video2", help="V4L2 device")
     parser.add_argument(
-        "--save-dir", default="", help="Recording save directory (for receive mode)"
+        "--mode-display", dest="display_mode", default="window", choices=["window", "save", "none"]
     )
+    parser.add_argument("--scale", type=float, default=1.0, help="display scale for receiver")
+    parser.add_argument("--save-dir", default="", help="recording save directory (receive mode)")
 
     args = parser.parse_args()
 
