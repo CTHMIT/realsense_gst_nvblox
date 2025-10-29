@@ -31,7 +31,7 @@ network:
       udp: 5050  # IMU uses simple UDP (not RTP)
 
 camera:
-  resolution: "640x480"
+  resolution: "424x480"
   fps: 30
   name: "camera"
   stream_preference: "auto"
