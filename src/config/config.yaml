@@ -1,13 +1,8 @@
-# RealSense Streaming Configuration
-# This file contains all parameters needed by gst_sender.py and gst_receiver.py
-# All parameters should be modified ONLY in this file to ensure sender/receiver consistency
-
 network:
   local_ip: "0.0.0.0"  # IP address for binding (receiver)
   server_ip: "10.28.121.28"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
-  base_port: 5000  # Base port for video streams
+  base_port: 5000
 
-  # Stream port configuration
   stream_ports:
     color:
       rtp: 5010
@@ -15,12 +10,6 @@ network:
     depth:
       rtp: 5020
       rtcp: 5025
-    depth_high:  # High 8-bit of Z16 (for split mode)
-      rtp: 5021
-      rtcp: 5026
-    depth_low:   # Low 8-bit of Z16 (for split mode)
-      rtp: 5022
-      rtcp: 5027
     infra1:
       rtp: 5030
       rtcp: 5035
@@ -35,62 +24,41 @@ camera:
   fps: 30
   name: "camera"
   stream_preference: "auto"
-  color_format: "YUYV"  # Sender: V4L2 format preference
-  depth_format: "Z16"   # Sender: V4L2 format preference
-  infra_format: "Y8I"   # Y8I contains both infra1 and infra2 interleaved
+  color_format: "YUYV"
+  depth_format: "Z16"
+  infra_format: "Y8I"
 
 encoding:
-  encoder: "auto"  # Options: auto, nvh264enc, x264enc, nvh265enc, x265enc
+  encoder: "auto"  # Options: auto, nvh264enc, x264enc
 
   h264:
-    bitrate: 16000  # kbps - used for color and infrared streams
+    bitrate: 16000
     tune: "zerolatency"
     speed_preset: "ultrafast"
     key_int_max: 30
 
-  h265:
-    bitrate: 12000  # kbps - H.265 achieves similar quality at lower bitrate
-    tune: "zerolatency"
-    speed_preset: "ultrafast"
-    key_int_max: 30
-
-  jpeg2000:
-    quality: 100
-    num_threads: 8
-
-  # Depth encoding configuration
   depth:
-    mode: "legacy"  # Options: "legacy" (16-bit H.264/H.265), "split" (two 8-bit streams)
-    codec: "h264"  # Options: "jpeg2000", "h264", "h265" (only for legacy mode)
-    split_bitrate: 8000  # kbps per stream (high/low) in split mode
-    legacy_bitrate: 16000  # kbps for 16-bit stream in legacy mode
+    mode: "legacy"
+    codec: "h264"
+    legacy_bitrate: 16000
 
 streaming:
   sequential_start: false
   startup_delay: 2
 
-  # UDP Configuration (sender and receiver)
   udp:
     sync: false
     async: false
     buffer_size: 60000000 # in bytes (60 MB)
 
-  # RTP Configuration
   rtp:
-    mtu: 12000                    # Maximum Transmission Unit
+    mtu: 12000
     config_interval: 1
     payload_types:
       depth_h264: 96
-      depth_h265: 113
-      depth_high_h264: 114
-      depth_low_h264: 115
-      depth_high_h265: 116
-      depth_low_h265: 117
-      depth_jpeg2000: 112
       color_h264: 98
-      color_h265: 118
-      ir_h264: 97
-      infra_stereo_h264: 99
+      infra1: 97
+      infra2: 99
 
   jitter_buffer:
     depth:
@@ -110,101 +78,63 @@ streaming:
     max_size_buffers: 4
     leaky: "downstream"
 
-  # Processing Configuration (both sender and receiver)
   processing:
     max_threads: 8
     n_threads: 4
 
 imu:
   enabled: true
-  publish_rate: 200.0  # Hz - ROS2 publish rate
+  publish_rate: 200.0
 
 receiver:
-  show_views: false      # Display video streams in separate windows
-  view_scale: 1.0        # Scale factor for visualization windows (0.0-1.0)
-  publish_odom: true     # Publish odometry for navigation stack
+  show_views: false
+  view_scale: 1.0
+  publish_odom: true
   odom_frame: "odom"
   base_link_frame: "base_link"
 
   depth_conversion:
-    enabled: true           # enable for transfer to float32
-    scale: 0.001           # depth (mm -> m)，RealSense is mm
+    enabled: true
+    scale: 0.001
     output_topic: "depth/image"
 
-  # ROS2 Image Encoding - CRITICAL: Must match GStreamer output format
   image_encoding:
-    depth: "16UC1"       # 16-bit unsigned, 1 channel
-    color: "rgb8"        # 8-bit RGB (changed from bgr8 to rgb8)
-    infra: "mono8"       # 8-bit monochrome
+    depth: "16UC1"
+    color: "rgb8"
+    infra: "mono8"
 
-  # GStreamer Format Conversion - CRITICAL: Must match image_encoding
   gstreamer_format:
-    depth: "GRAY16_LE"   # GStreamer format for depth
-    color: "RGB"         # GStreamer format for color (changed from BGR to RGB)
-    infra: "GRAY8"       # GStreamer format for infrared
+    depth: "GRAY16_LE"
+    color: "RGB"
+    infra: "GRAY8"
 
-# ============================================================================
-# CAMERA PRESETS
-# ============================================================================
 presets:
   d435i:
     streams:
-      - name: "depth"
-        encoding: "h264" # jpeg2000 | h264 | h265
-        port_offset: 20
       - name: "color"
+        format: "YUYV"
         encoding: "h264"
-        port_offset: 10
-      - name: "infra_stereo"  # Y8I stream (contains both infra1 and infra2)
-        encoding: "h264"
-        port_offset: 30
-    imu_enabled: true
+        port: 5010
+        image_encoding: "rgb8"
+        gstreamer_format: "RGB"
 
-  d455:
-    streams:
       - name: "depth"
+        format: "Z16"
         encoding: "h264"
-        port_offset: 2
-      - name: "color"
-        encoding: "h264"
-        port_offset: 0
-      - name: "infra1"
-        encoding: "h264"
-        port_offset: 4
-      - name: "infra2"
-        encoding: "h264"
-        port_offset: 6
-    imu_enabled: true
+        port: 5020
+        image_encoding: "16UC1"
+        gstreamer_format: "GRAY16_LE"
 
-  d415:
-    streams:
-      - name: "depth"
+      - name: "infra_stereo"  # Y8I
+        format: "Y8I"
         encoding: "h264"
-        port_offset: 2
-      - name: "color"
-        encoding: "h264"
-        port_offset: 0
-      - name: "infra1"
-        encoding: "h264"
-        port_offset: 4
-      - name: "infra2"
-        encoding: "h264"
-        port_offset: 6
-    imu_enabled: false
+        port: [5030, 5040]
+        image_encoding: "mono8"
+        gstreamer_format: "GRAY8"
+    imu:
+      - enabled: true
+        udp: 5050
 
-  l515:
-    streams:
-      - name: "depth"
-        encoding: "h264"
-        port_offset: 2
-      - name: "color"
-        encoding: "h264"
-        port_offset: 0
-    imu_enabled: true
-
-# ============================================================================
-# CALIBRATION CONFIGURATION
-# ============================================================================
 calibration:
   default_intrinsics:
     fx_ratio: 0.6

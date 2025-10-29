@@ -420,7 +420,7 @@ class StereoIRSender:
                     f"width={actual_ir_width}",
                     f"height={self.config.height}",
                     f"framerate={self.config.fps}/1",
-                    "format=gray8",  # Explicit GRAY8 format
+                    "format=gray8",
                     "!",
                     "videoconvert",
                     "!",

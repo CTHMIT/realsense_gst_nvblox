@@ -40,6 +40,7 @@ from gst_realsense_launch.startup.rs_common import (
 )
 from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
 from gst_realsense_launch.startup.rs_detect import RealSenseDetector
+from gst_realsense_launch.startup.rs_tmux import TmuxSessionManager
 
 
 class IMUSender:
@@ -138,127 +139,6 @@ class IMUSender:
             pass
 
 
-class TmuxSessionManager:
-    """Manages tmux session for multiple GStreamer pipelines."""
-
-    def __init__(self, session_name: str = "realsense_streams"):
-        self.session_name = session_name
-        self.window_count = 0
-        self._check_tmux()
-        self._create_session()
-
-    def _check_tmux(self):
-        """Check if tmux is available."""
-        try:
-            subprocess.run(["tmux", "-V"], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            raise RuntimeError("tmux is not installed. Please install tmux: sudo apt install tmux")
-
-    def _create_session(self):
-        """Create tmux session, cleaning up any existing session first."""
-        # Check if session already exists
-        result = subprocess.run(
-            ["tmux", "has-session", "-t", self.session_name], capture_output=True
-        )
-
-        if result.returncode == 0:
-            # Session exists, kill it first
-            LOGGER.warning(f"Found existing tmux session '{self.session_name}', cleaning up...")
-            kill_result = subprocess.run(
-                ["tmux", "kill-session", "-t", self.session_name], capture_output=True
-            )
-            if kill_result.returncode == 0:
-                LOGGER.info(f"✓ Cleaned up existing tmux session '{self.session_name}'")
-                time.sleep(0.5)  # Give tmux time to fully cleanup
-            else:
-                LOGGER.warning(f"Could not kill existing session (it may have already closed)")
-
-        # Create new session
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", self.session_name, "-n", "control"], check=True
-        )
-        LOGGER.info(f"✓ Created tmux session '{self.session_name}'")
-
-    def create_window(self, window_name: str, command: str):
-        """Create a new tmux window and run command in it."""
-        self.window_count += 1
-
-        subprocess.run(
-            [
-                "tmux",
-                "new-window",
-                "-t",
-                f"{self.session_name}:{self.window_count}",
-                "-n",
-                window_name,
-            ],
-            check=True,
-        )
-
-        subprocess.run(
-            [
-                "tmux",
-                "send-keys",
-                "-t",
-                f"{self.session_name}:{window_name}",
-                command,
-                "C-m",
-            ],
-            check=True,
-        )
-
-        LOGGER.info(f"  ✓ Created window '{window_name}' in tmux")
-
-    def attach(self):
-        """Display instructions for attaching to the tmux session."""
-        LOGGER.info(f"{'='*40}")
-        LOGGER.info("To view the streams, attach to tmux session:")
-        LOGGER.info(f"  tmux attach -t {self.session_name}")
-        LOGGER.info("Tmux navigation:")
-        LOGGER.info("  Ctrl+b n : next window")
-        LOGGER.info("  Ctrl+b p : previous window")
-        LOGGER.info("  Ctrl+b [0-9] : select window by number")
-        LOGGER.info("  Ctrl+b d : detach from session")
-        LOGGER.info("  Ctrl+b & : kill current window")
-        LOGGER.info(f"{'='*40}\n")
-
-    def kill_session(self):
-        """Kill the entire tmux session and all its processes."""
-        try:
-            # First, try to send Ctrl+C to all windows to gracefully stop pipelines
-            result = subprocess.run(
-                ["tmux", "list-windows", "-t", self.session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
-
-            if result.returncode == 0:
-                windows = result.stdout.strip().split("\n")
-                for window in windows:
-                    if window and window != "control":  # Don't send to control window
-                        # Send Ctrl+C to each pipeline window
-                        subprocess.run(
-                            ["tmux", "send-keys", "-t", f"{self.session_name}:{window}", "C-c"],
-                            capture_output=True,
-                        )
-
-                # Give processes time to cleanup gracefully
-                time.sleep(1)
-        except Exception as e:
-            LOGGER.debug(f"Could not send termination signals to tmux windows: {e}")
-
-        result = subprocess.run(
-            ["tmux", "kill-session", "-t", self.session_name],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode == 0:
-            LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
-        else:
-            LOGGER.debug(f"Tmux session '{self.session_name}' was already gone")
-
-
 class StreamManager:
     """Manages multiple concurrent GStreamer video streams using tmux."""
 
@@ -287,10 +167,9 @@ class StreamManager:
         if self.tmux_manager is None:
             self.tmux_manager = TmuxSessionManager()
 
-        use_h264_for_depth = stream_config.encoding.lower() == "h264"
-
         encoder = EncoderFactory.create_encoder(
-            encoder_preference, stream_type, use_h264_for_depth=use_h264_for_depth
+            encoder_preference,
+            stream_type,
         )
 
         strategy = StreamStrategyFactory.create_strategy(stream_type, self.config_loader)
@@ -308,124 +187,6 @@ class StreamManager:
         )
 
         self._run_pipeline_in_tmux(stream_config, pipeline, stream_type)
-
-    def add_depth_split_stream(
-        self,
-        stream_config: StreamConfig,
-        encoder_preference: str,
-        bitrate: int,
-        codec: str = "h264",
-    ):
-        """Add depth stream in split mode (high + low 8-bit streams)."""
-
-        if self.tmux_manager is None:
-            self.tmux_manager = TmuxSessionManager()
-
-        use_h265 = codec.lower() == "h265"
-
-        actual_encoder_preference = encoder_preference
-        if use_h265:
-            if encoder_preference == "nvh264enc":
-                actual_encoder_preference = "nvh265enc"
-            elif encoder_preference == "x264enc":
-                actual_encoder_preference = "x265enc"
-            elif encoder_preference == "auto":
-                actual_encoder_preference = "auto"
-
-        try:
-            encoder = EncoderFactory.create_encoder(
-                actual_encoder_preference, "depth", use_h264_for_depth=True, use_h265=use_h265
-            )
-        except RuntimeError as e:
-            LOGGER.error(f"Failed to create encoder: {e}")
-            if use_h265:
-                LOGGER.warning("Falling back to H.264 encoder")
-                encoder = EncoderFactory.create_encoder(
-                    encoder_preference, "depth", use_h264_for_depth=True, use_h265=False
-                )
-                codec = "h264"
-                use_h265 = False
-            else:
-                raise
-
-        # 使用 DepthSplitStreamStrategy
-        strategy = StreamStrategyFactory.create_strategy(
-            "depth", self.config_loader, split_mode=True
-        )
-
-        # 獲取 port
-        high_port = self.config_loader.get_port_for_stream("depth_high", stream_config.port + 1)
-        low_port = self.config_loader.get_port_for_stream("depth_low", stream_config.port + 2)
-
-        # 構建高位元組 pipeline
-        pipeline_high = strategy.build_sender_pipeline(
-            device=stream_config.device,
-            width=stream_config.width,
-            height=stream_config.height,
-            fps=stream_config.fps,
-            fourcc=stream_config.fourcc,
-            encoder=encoder,
-            host=self.config_loader.get("network.server_ip"),
-            port=high_port,
-            bitrate=bitrate,
-            is_high_byte=True,
-        )
-
-        # 構建低位元組 pipeline
-        pipeline_low = strategy.build_sender_pipeline(
-            device=stream_config.device,
-            width=stream_config.width,
-            height=stream_config.height,
-            fps=stream_config.fps,
-            fourcc=stream_config.fourcc,
-            encoder=encoder,
-            host=self.config_loader.get("network.server_ip"),
-            port=low_port,
-            bitrate=bitrate,
-            is_high_byte=False,
-        )
-
-        # 記錄資訊
-        LOGGER.info(
-            f"[{stream_config.device}] Starting DEPTH (SPLIT MODE) on ports {high_port}, {low_port}"
-        )
-        LOGGER.info(f"  Format: {stream_config.fourcc}")
-        LOGGER.info(
-            f"  Resolution: {stream_config.width}x{stream_config.height}@{stream_config.fps}fps"
-        )
-        LOGGER.info(f"  Encoding: {codec.upper()} (split mode)")
-        LOGGER.info(f"  Bitrate: {bitrate}kbps per stream")
-
-        # 使用 dataclasses.replace 替代 _replace
-        # 或者直接創建新的 StreamConfig
-        high_config = StreamConfig(
-            name="depth_high",
-            port=high_port,
-            encoding=stream_config.encoding,
-            width=stream_config.width,
-            height=stream_config.height,
-            fps=stream_config.fps,
-            device=stream_config.device,
-            fourcc=stream_config.fourcc,
-            verbose=stream_config.verbose,
-        )
-
-        low_config = StreamConfig(
-            name="depth_low",
-            port=low_port,
-            encoding=stream_config.encoding,
-            width=stream_config.width,
-            height=stream_config.height,
-            fps=stream_config.fps,
-            device=stream_config.device,
-            fourcc=stream_config.fourcc,
-            verbose=stream_config.verbose,
-        )
-
-        # 在 tmux 中運行兩個 pipeline
-        self._run_pipeline_in_tmux(high_config, pipeline_high, "depth_high")
-        time.sleep(0.3)
-        self._run_pipeline_in_tmux(low_config, pipeline_low, "depth_low")
 
     def _run_pipeline_in_tmux(self, config: StreamConfig, pipeline_str: str, stream_type: str):
         """Run GStreamer pipeline in a tmux window."""
@@ -455,7 +216,7 @@ class StreamManager:
         try:
             if self.tmux_manager:
                 if self.verbose:
-                    self.tmux_manager.attach()
+                    self.tmux_manager.attach_info()
                 else:
                     LOGGER.info(
                         f"Streams are running in {self.tmux_manager.session_name} tmux session."
@@ -562,12 +323,7 @@ class StreamManager:
 
 def check_encoder_availability():
     """Check and report available encoders."""
-    encoders = {
-        "nvh264enc": "NVIDIA H.264 (hardware)",
-        "x264enc": "x264 H.264 (software)",
-        "nvh265enc": "NVIDIA H.265 (hardware)",
-        "x265enc": "x265 H.265 (software)",
-    }
+    encoders = {"nvh264enc": "NVIDIA H.264 (hardware)", "x264enc": "x264 H.264 (software)"}
 
     available = []
     missing = []
@@ -638,7 +394,7 @@ def main():
     parser.add_argument("--fps", type=int, help="Override target FPS")
     parser.add_argument(
         "--encoder",
-        choices=["auto", "nvh264enc", "x264enc", "nvh265enc", "x265enc"],
+        choices=["auto", "nvh264enc", "x264enc"],
         help="Override encoder preference",
     )
     parser.add_argument("--bitrate", type=int, help="Override H.264 bitrate (kbps)")
@@ -647,7 +403,7 @@ def main():
     parser.add_argument("--device", help="Stream only specific device")
     parser.add_argument(
         "--preset",
-        choices=["d435i", "d455", "d415", "l515"],
+        choices=["d435i"],
         help="Use camera preset",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
@@ -705,15 +461,6 @@ def main():
         if "435i" in detected_model or "d435i" in detected_model:
             args.preset = "d435i"
             LOGGER.info(f"✓ Auto-detected D435i camera, using d435i preset")
-        elif "455" in detected_model or "d455" in detected_model:
-            args.preset = "d455"
-            LOGGER.info(f"✓ Auto-detected D455 camera, using d455 preset")
-        elif "415" in detected_model or "d415" in detected_model:
-            args.preset = "d415"
-            LOGGER.info(f"✓ Auto-detected D415 camera, using d415 preset")
-        elif "l515" in detected_model:
-            args.preset = "l515"
-            LOGGER.info(f"✓ Auto-detected L515 camera, using l515 preset")
 
     if args.list_only:
         sys.exit(0)
@@ -735,19 +482,12 @@ def main():
 
     actual_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
 
-    depth_mode = config_loader.get("encoding.depth.mode", "legacy")
-    depth_codec = config_loader.get("encoding.depth.codec", "h264")
-    depth_split_bitrate = config_loader.get("encoding.depth.split_bitrate", 8000)
-    depth_legacy_bitrate = config_loader.get("encoding.depth.legacy_bitrate", 16000)
-
     if args.preset:
         preset = config_loader.get_preset(args.preset)
 
         if preset:
             if args.verbose:
                 LOGGER.info(f"Using {args.preset.upper()} preset configuration:")
-                LOGGER.info(f"  Depth mode: {depth_mode}")
-                LOGGER.info(f"  Depth codec: {depth_codec}")
 
             camera_by_type = {}
             for cam in cameras:
@@ -757,7 +497,7 @@ def main():
             for stream_def in preset["streams"]:
                 stream_name = stream_def["name"]
                 encoding = stream_def["encoding"]
-                port_offset = stream_def["port_offset"]
+                port = stream_def["port"]
 
                 cam = None
                 if stream_name == "depth":
@@ -806,7 +546,6 @@ def main():
                     continue
 
                 fps = realsense_detector.get_best_fps(mode, camera_cfg["fps"])
-                port = network_cfg["base_port"] + port_offset
 
                 stream_cfg = StreamConfig(
                     name=stream_name,
@@ -820,27 +559,9 @@ def main():
                     verbose=args.verbose,
                 )
 
-                if stream_name == "depth":
-                    if depth_mode == "split":
-                        LOGGER.info(f"Using DEPTH SPLIT mode with {depth_codec.upper()}")
-                        manager.add_depth_split_stream(
-                            stream_cfg,
-                            encoding_cfg["encoder"],
-                            depth_split_bitrate,
-                            depth_codec,
-                        )
-                    else:
-                        LOGGER.info(f"Using DEPTH LEGACY mode with {encoding.upper()}")
-                        manager.add_stream(
-                            stream_cfg,
-                            actual_stream_type,
-                            encoding_cfg["encoder"],
-                            depth_legacy_bitrate,
-                        )
-                else:
-                    manager.add_stream(
-                        stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
-                    )
+                manager.add_stream(
+                    stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
+                )
 
         else:
             LOGGER.error(f"Preset '{args.preset}' not found in configuration")
