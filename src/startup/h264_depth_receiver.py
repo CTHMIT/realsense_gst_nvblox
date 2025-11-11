@@ -24,7 +24,7 @@ try:
 except ImportError:
     ROS2_AVAILABLE = False
 
-from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
+from startup.rs_common import CameraIntrinsics, ConfigLoader
 
 GST_AVAILABLE: bool = False
 GST_INITIALIZED: bool = False

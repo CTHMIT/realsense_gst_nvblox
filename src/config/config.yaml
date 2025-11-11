@@ -1,153 +1,407 @@
+# ==============================================================================
+# RealSense D435i Streaming Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Hardware Platform
+# ------------------------------------------------------------------------------
+platform:
+  type: "jetson"  # Options: "jetson", "x86_64", "auto"
+  device: "agx_orin"  # Options: "agx_orin", "orin_nano", "xavier", "desktop"
+  cuda_available: true
+  nvenc_available: true
+
+# ------------------------------------------------------------------------------
+# Network Configuration
+# ------------------------------------------------------------------------------
 network:
-  local_ip: "0.0.0.0"  # IP address for binding (receiver)
-  server_ip: "10.28.121.28"  # IP address of the receiver (sender target) # L40 - "10.28.132.201" | wsi - "10.28.132.110" | omen - "10.28.121.28" | rog - "10.28.131.195"
-  base_port: 5000
+  local_ip: "0.0.0.0"
+  server_ip: "10.28.121.28"  # Target receiver IP
+  
+  # Transport settings
+  transport:
+    protocol: "udp"  # Options: "udp", "tcp"
+    mtu: 1500  # Network MTU (1500 for Ethernet, 9000 for Jumbo frames)
+    
+  # QoS settings
+  qos:
+    dscp: 46  # Differentiated Services Code Point (46 = Expedited Forwarding)
+    tos: 184  # Type of Service (0xB8)
 
-  stream_ports:
-    color:
-      rtp: 5010
-      rtcp: 5015
-    depth:
-      rtp: 5020
-      rtcp: 5025
-    infra1:
-      rtp: 5030
-      rtcp: 5035
-    infra2:
-      rtp: 5040
-      rtcp: 5045
-    imu:
-      udp: 5050  # IMU uses simple UDP (not RTP)
-
+# ------------------------------------------------------------------------------
+# RealSense D435i Camera Configuration
+# ------------------------------------------------------------------------------
 camera:
-  resolution: "424x480"
-  fps: 30
-  name: "camera"
-  stream_preference: "auto"
-  color_format: "YUYV"
-  depth_format: "Z16"
-  infra_format: "Y8I"
-
-encoding:
-  encoder: "auto"  # Options: auto, nvh264enc, x264enc
-
-  h264:
-    bitrate: 16000
-    tune: "zerolatency"
-    speed_preset: "ultrafast"
-    key_int_max: 30
-
+  model: "D435i"
+  serial: ""  # Empty = auto-detect, or specify serial number
+  
+  # Stream enablement
+  streams:
+    color: true
+    depth: true
+    infrared: true
+    infrared_stereo: true
+  
+  # Resolution and framerate
+  color_profile:
+    width: 848
+    height: 480
+    fps: 30
+    format: "RGB8"  # Options: "RGB8", "BGR8", "RGBA8", "BGRA8", "YUYV"
+  
+  depth_profile:
+    width: 848
+    height: 480
+    fps: 30
+    format: "Z16"
+  
+  infrared_profile:
+    width: 848
+    height: 480
+    fps: 30
+    format: "Y8"  # Single infrared
+  
+  infrared_stereo_profile:
+    width: 848
+    height: 480
+    fps: 30
+    format: "Y8I"  # Stereo infrared interleaved
+  
+  # Camera settings
+  controls:
+    auto_exposure: true
+    exposure: 8500  # microseconds (used if auto_exposure is false)
+    gain: 64  # 16-248
+    white_balance: 4600  # Kelvin (0 = auto)
+    backlight_compensation: false
+    brightness: 0  # -64 to 64
+    contrast: 50  # 0-100
+    gamma: 300  # 100-500
+    hue: 0  # -180 to 180
+    saturation: 64  # 0-100
+    sharpness: 50  # 0-100
+  
+  # Depth settings
   depth:
-    mode: "legacy"
-    codec: "h264"
-    legacy_bitrate: 16000
+    visual_preset: "High Accuracy"  # Options: "Default", "Hand", "High Accuracy", "High Density", "Medium Density"
+    
+    # Post-processing filters
+    filters:
+      decimation:
+        enabled: false
+        magnitude: 2  # 2, 4, 8
+      
+      spatial:
+        enabled: true
+        magnitude: 2  # 0-5
+        smooth_alpha: 0.5  # 0.25-1.0
+        smooth_delta: 20  # 1-50
+        hole_fill: 0  # 0-5
+      
+      temporal:
+        enabled: true
+        smooth_alpha: 0.4  # 0-1
+        smooth_delta: 20  # 1-100
+        persistence: 3  # 0-8
+      
+      hole_filling:
+        enabled: true
+        mode: 1  # 0=disabled, 1=2-pixel, 2=4-pixel, 3=8-pixel, 4=16-pixel, 5=unlimited
+      
+      disparity:
+        enabled: false  # Transform to disparity before filtering
+    
+    # Alignment
+    align_to: "color"  # Options: "color", "depth", "none"
+    
+    # Depth range
+    min_distance: 0.3  # meters
+    max_distance: 10.0  # meters
 
-streaming:
-  sequential_start: false
-  startup_delay: 2
-
-  udp:
-    sync: false
-    async: false
-    buffer_size: 60000000 # in bytes (60 MB)
-
-  rtp:
-    mtu: 12000
-    config_interval: 1
-    payload_types:
-      depth_h264: 96
-      color_h264: 98
-      infra1: 97
-      infra2: 99
-
-  jitter_buffer:
-    depth:
-      latency: 50
-      drop_on_latency: false
-    color:
-      latency: 50
-      drop_on_latency: false
-    infra:
-      latency: 50
-      drop_on_latency: false
-    infra_stereo:
-      latency: 50
-      drop_on_latency: false
-
-  queue:
-    max_size_buffers: 4
-    leaky: "downstream"
-
-  processing:
-    max_threads: 8
-    n_threads: 4
-
+# ------------------------------------------------------------------------------
+# IMU Configuration
+# ------------------------------------------------------------------------------
 imu:
   enabled: true
-  publish_rate: 200.0
-
-receiver:
-  show_views: false
-  view_scale: 1.0
-  publish_odom: true
-  odom_frame: "odom"
-  base_link_frame: "base_link"
-
-  depth_conversion:
+  
+  # IMU streams
+  accel:
     enabled: true
-    scale: 0.001
-    output_topic: "depth/image"
+    fps: 250  # Options: 63, 250
+  
+  gyro:
+    enabled: true
+    fps: 200  # Options: 200, 400
+  
+  # Publishing
+  publish_rate: 200.0  # Hz
+  frame_id: "camera_imu_optical_frame"
+  
+  # Transport
+  transport:
+    protocol: "udp"
+    port: 5050
 
-  image_encoding:
-    depth: "16UC1"
-    color: "rgb8"
-    infra: "mono8"
+# ------------------------------------------------------------------------------
+# GStreamer Pipeline Configuration
+# ------------------------------------------------------------------------------
+gstreamer:
+  # Pipeline control
+  pipeline:
+    async_handling: true
+    message_forward: true
+    
+  # Common elements
+  elements:
+    # Encoder settings (per stream type)
+    encoder:
+      # Hardware encoder (NVENC on Jetson)
+      nvh264enc:
+        preset: "low-latency-hq"  # Options: "default", "slow", "medium", "fast", "hp", "hq", "bd", "low-latency", "low-latency-hq", "lossless"
+        rc_mode: "cbr-ld-hq"  # Rate control: "cbr", "vbr", "cbr-ld-hq"
+        gop_size: 30  # GOP size in frames (-1 = infinite, fps = 1 second)
+        bframes: 0  # B-frames (0 for low latency)
+        aud: true  # Insert AUD (Access Unit Delimiter)
+        insert_sps_pps: true
+        insert_vui: true
+        qp_min: 20
+        qp_max: 40
+        qp_const: -1  # Constant QP (-1 = use bitrate)
+        spatial_aq: true  # Spatial AQ
+        temporal_aq: false  # Temporal AQ
+        
+      # Software encoder fallback
+      x264enc:
+        tune: "zerolatency"
+        speed_preset: "ultrafast"  # Options: "ultrafast", "superfast", "veryfast", "faster", "fast", "medium"
+        pass: "cbr"  # Options: "cbr", "pass1", "pass2", "pass3", "qual", "quant"
+        key_int_max: 30  # Maximum keyframe interval
+        bframes: 0
+        aud: true
+        byte_stream: true
+        sliced_threads: true
+        threads: 4
+        option_string: "sliced-threads=true:sync-lookahead=0"
+    
+    # RTP Payloader
+    rtph264pay:
+      mtu: 1400  # Payload MTU (< network MTU)
+      config_interval: 1  # Send SPS/PPS every N seconds (-1 = only on start)
+      aggregate_mode: "zero-latency"  # Options: "none", "zero-latency", "max"
+      pt: 96  # Payload type (set per stream)
+      
+    # Depayloader
+    rtph264depay:
+      wait_for_keyframe: true
+      request_keyframe: true
+    
+    # Jitter buffer
+    rtpjitterbuffer:
+      latency: 50  # ms (affects latency/stability tradeoff)
+      drop_on_latency: false
+      do_lost: true
+      do_retransmission: false
+      max_dropout_time: 3000  # ms
+      max_misorder_time: 100  # ms
+      rtx_delay: 20  # ms
+      mode: 1  # 0=none, 1=slave, 2=buffer, 4=synced
+    
+    # Queue
+    queue:
+      max_size_buffers: 3  # Maximum buffers in queue
+      max_size_bytes: 0  # 0 = unlimited
+      max_size_time: 0  # 0 = unlimited
+      leaky: "downstream"  # Options: "no", "upstream", "downstream"
+      silent: true
+    
+    # Video convert
+    videoconvert:
+      n_threads: 4
+      dither: "none"  # Options: "none", "verterr", "floyd-steinberg", "sierra-lite", "bayer"
+    
+    # Video scale
+    videoscale:
+      method: "bilinear"  # Options: "nearest", "bilinear", "bicubic", "lanczos"
+      add_borders: false
+      
+    # App sink/source
+    appsink:
+      emit_signals: true
+      sync: false
+      max_buffers: 3
+      drop: true
+      
+    appsrc:
+      format: "time"
+      is_live: true
+      do_timestamp: true
+      min_latency: 0
+      max_latency: 100000000  # 100ms in nanoseconds
+      block: false
+      max_bytes: 0  # unlimited
 
-  gstreamer_format:
-    depth: "GRAY16_LE"
-    color: "RGB"
-    infra: "GRAY8"
-
+# ------------------------------------------------------------------------------
+# Stream Presets
+# ------------------------------------------------------------------------------
 presets:
-  d435i:
-    streams:
-      - name: "color"
-        format: "YUYV"
-        encoding: "h264"
-        port: 5010
-        image_encoding: "rgb8"
-        gstreamer_format: "RGB"
+  # High quality preset
+  high_quality:
+    description: "High quality, higher latency"
+    
+    color:
+      enabled: true
+      port: 5010
+      encoding: "h264"
+      bitrate: 12000  # kbps
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=RGB,width=848,height=480,framerate=30/1"
+      rtp_payload_type: 96
+      
+    depth:
+      enabled: true
+      port: 5020
+      encoding: "h264"
+      bitrate: 10000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY16_LE,width=848,height=480,framerate=30/1"
+      rtp_payload_type: 97
+      
+    infrared_stereo:
+      enabled: true
+      port: [5030, 5040]
+      encoding: "h264"
+      bitrate: 6000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY8,width=848,height=480,framerate=30/1"
+      rtp_payload_type: [98, 99]
+  
+  # Low latency preset
+  low_latency:
+    description: "Minimal latency, lower quality"
+    
+    color:
+      enabled: true
+      port: 5010
+      encoding: "h264"
+      bitrate: 6000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=RGB,width=640,height=480,framerate=30/1"
+      rtp_payload_type: 96
+      
+    depth:
+      enabled: true
+      port: 5020
+      encoding: "h264"
+      bitrate: 5000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY16_LE,width=640,height=480,framerate=30/1"
+      rtp_payload_type: 97
+      
+    infrared_stereo:
+      enabled: false
+      port: [5030, 5040]
+      encoding: "h264"
+      bitrate: 5000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY8,width=640,height=480,framerate=30/1"
+      rtp_payload_type: [98, 99]
+  
+  # Balanced preset (default)
+  balanced:
+    description: "Balanced quality and latency"
+    
+    color:
+      enabled: true
+      port: 5010
+      encoding: "h264"
+      bitrate: 8000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=RGB,width=848,height=480,framerate=30/1"
+      rtp_payload_type: 96
+      
+    depth:
+      enabled: true
+      port: 5020
+      encoding: "h264"
+      bitrate: 7000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY16_LE,width=848,height=480,framerate=30/1"
+      rtp_payload_type: 97
+      
+    infrared_stereo:
+      enabled: true
+      port: [5030, 5040]
+      encoding: "h264"
+      bitrate: 5000
+      encoder: "nvh264enc"
+      caps: "video/x-raw,format=GRAY8,width=848,height=480,framerate=30/1"
+      rtp_payload_type: [98, 99]
 
-      - name: "depth"
-        format: "Z16"
-        encoding: "h264"
-        port: 5020
-        image_encoding: "16UC1"
-        gstreamer_format: "GRAY16_LE"
+# ------------------------------------------------------------------------------
+# System Configuration
+# ------------------------------------------------------------------------------
+system:
+  # Threading
+  threads:
+    gstreamer_workers: 4
+    encoding_threads: 4
+    camera_callbacks: 2
+  
+  # Timing
+  timing:
+    pipeline_startup_delay: 2.0  # seconds
+    stream_sync_timeout: 5.0  # seconds
+    shutdown_timeout: 10.0  # seconds
+  
+  # Buffer management
+  buffers:
+    udp_send_buffer: 30000000  # 30MB
+    udp_recv_buffer: 30000000  # 30MB
+    camera_queue_size: 4
+  
+  # Logging
+  logging:
+    level: "INFO"  # Options: "DEBUG", "INFO", "WARNING", "ERROR"
+    gstreamer_debug: "2"  # 0-9
+    log_to_file: false
+    log_file: "/tmp/realsense_stream.log"
+  
+  # Error handling
+  error_handling:
+    max_consecutive_errors: 5
+    error_cooldown: 10.0  # seconds
+    auto_restart: true
+    restart_delay: 5.0  # seconds
 
-      - name: "infra_stereo"  # Y8I
-        format: "Y8I"
-        encoding: "h264"
-        port: [5030, 5040]
-        image_encoding: "mono8"
-        gstreamer_format: "GRAY8"
-    imu:
-      - enabled: true
-        udp: 5050
-
-calibration:
-  default_intrinsics:
-    fx_ratio: 0.6
-    fy_ratio: 0.6
-    ppx_ratio: 0.5
-    ppy_ratio: 0.5
-    distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
-
-  default_extrinsics:
-    depth_to_color:
-      translation: [0.015, 0.0, 0.0]
-      rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-
-    infra1_to_infra2:
-      translation: [0.050, 0.0, 0.0]
-      rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+# ------------------------------------------------------------------------------
+# ROS2 Integration (Optional)
+# ------------------------------------------------------------------------------
+ros2:
+  enabled: true
+  node_name: "realsense_streamer"
+  namespace: "camera"
+  
+  # QoS profiles
+  qos:
+    reliability: "reliable"  # Options: "reliable", "best_effort"
+    durability: "volatile"  # Options: "volatile", "transient_local"
+    history: "keep_last"  # Options: "keep_last", "keep_all"
+    depth: 10
+  
+  # Topic names
+  topics:
+    color_image: "color/image_raw"
+    color_info: "color/camera_info"
+    depth_image: "depth/image_rect_raw"
+    depth_info: "depth/camera_info"
+    infrared_image: "infra/image_raw"
+    infrared_info: "infra/camera_info"
+    imu: "imu/data"
+  
+  # Frame IDs
+  frames:
+    camera_link: "camera_link"
+    color_optical: "camera_color_optical_frame"
+    depth_optical: "camera_depth_optical_frame"
+    infra_optical: "camera_infra_optical_frame"
+    imu_optical: "camera_imu_optical_frame"
