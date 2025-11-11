@@ -25,7 +25,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
+from startup.rs_common import CameraIntrinsics, ConfigLoader
 
 try:
     from utils.logger import LOGGER
@@ -36,10 +36,10 @@ except ImportError:
     logging.basicConfig(level=logging.INFO)
 
 if TYPE_CHECKING:
-    from gst_realsense_launch.startup.h264_depth_receiver import DepthReceiverNode
+    from startup.h264_depth_receiver import DepthReceiverNode
 
 try:
-    from gst_realsense_launch.startup.h264_depth_receiver import (
+    from startup.h264_depth_receiver import (
         DepthReceiverNode,
     )
 

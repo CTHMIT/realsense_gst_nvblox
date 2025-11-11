@@ -23,15 +23,15 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from gst_realsense_launch.startup.rs_common import (
+from startup.rs_common import (
     ConfigLoader,
     StreamConfig,
     get_stream_type_from_fourcc,
     parse_resolution,
     validate_network_config,
 )
-from gst_realsense_launch.startup.rs_detect import RealSenseDetector
-from gst_realsense_launch.startup.rs_tmux import StreamManager
+from startup.rs_detect import RealSenseDetector
+from startup.rs_tmux import StreamManager
 
 
 class IMUSender:
