@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 """RealSense Tmux Session Manager
 
-This module provides unified tmux session management for both sender and receiver.
+Unified tmux session management for both sender and receiver applications.
+Provides consistent interface for creating windows and running commands.
 """
 
+import atexit
 import subprocess
+import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from utils.logger import LOGGER
+
+try:
+    from gst_realsense_launch.startup.rs_common import ConfigLoader, StreamConfig, format_stream_label
+    from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
+except ImportError:
+    LOGGER.warning("Some imports not available - limited functionality")
 
 
 class TmuxSessionManager:
     """Unified tmux session manager for RealSense streaming.
 
-    This class manages tmux sessions for both sender and receiver applications,
+    Manages tmux sessions for both sender and receiver applications,
     providing a consistent interface for creating windows and running commands.
     """
 
@@ -158,11 +168,7 @@ class TmuxSessionManager:
         LOGGER.info("=" * 60)
 
     def list_windows(self) -> list[str]:
-        """List all windows in the session.
-
-        Returns:
-            List of window names
-        """
+        """List all windows in the session."""
         try:
             result = subprocess.run(
                 ["tmux", "list-windows", "-t", self.session_name, "-F", "#{window_name}"],
@@ -176,11 +182,7 @@ class TmuxSessionManager:
             return []
 
     def get_window_pids(self) -> list[str]:
-        """Get all process IDs in the session.
-
-        Returns:
-            List of PIDs
-        """
+        """Get all process IDs in the session."""
         try:
             result = subprocess.run(
                 ["tmux", "list-panes", "-t", self.session_name, "-a", "-F", "#{pane_pid}"],
@@ -274,14 +276,7 @@ class TmuxSessionManager:
             LOGGER.error(f"Error during tmux cleanup: {e}")
 
     def kill_window(self, window_name: str) -> bool:
-        """Kill a specific window.
-
-        Args:
-            window_name: Name of window to kill
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Kill a specific window."""
         try:
             subprocess.run(
                 ["tmux", "kill-window", "-t", f"{self.session_name}:{window_name}"],
@@ -296,14 +291,7 @@ class TmuxSessionManager:
             return False
 
     def is_window_running(self, window_name: str) -> bool:
-        """Check if a specific window is running.
-
-        Args:
-            window_name: Window name to check
-
-        Returns:
-            True if window exists, False otherwise
-        """
+        """Check if a specific window is running."""
         windows = self.list_windows()
         return window_name in windows
 
@@ -314,3 +302,129 @@ class TmuxSessionManager:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit - cleanup session."""
         self.kill_session(force=True)
+
+
+class StreamManager:
+    """Manages multiple concurrent GStreamer video streams using tmux.
+
+    This class handles stream creation, IMU streaming, and lifecycle management
+    for RealSense camera streams.
+    """
+
+    _atexit_registered = False
+
+    def __init__(self, config_loader: ConfigLoader, verbose: bool = False):
+        """Initialize stream manager.
+
+        Args:
+            config_loader: Configuration loader instance
+            verbose: Enable verbose logging
+        """
+        self.config_loader = config_loader
+        self.imu_senders: list = []
+        self.tmux_manager: TmuxSessionManager | None = None
+        self._shutdown = threading.Event()
+        self._stopped = False
+        self._cleanup_lock = threading.Lock()
+        self.verbose = verbose
+
+        # Register atexit handler once per instance
+        if not StreamManager._atexit_registered:
+            atexit.register(lambda: self.stop_all() if not self._stopped else None)
+            StreamManager._atexit_registered = True
+            LOGGER.debug("Registered atexit cleanup handler")
+
+    def add_stream(
+        self, stream_config: StreamConfig, stream_type: str, encoder_preference: str, bitrate: int
+    ):
+        """Add a video stream to manager."""
+        # Initialize tmux manager on first stream
+        if self.tmux_manager is None:
+            self.tmux_manager = TmuxSessionManager(mode="sender")
+
+        encoder = EncoderFactory.create_encoder(encoder_preference, stream_type)
+        strategy = StreamStrategyFactory.create_strategy(stream_type, self.config_loader)
+
+        pipeline = strategy.build_sender_pipeline(
+            device=stream_config.device,
+            width=stream_config.width,
+            height=stream_config.height,
+            fps=stream_config.fps,
+            fourcc=stream_config.fourcc,
+            encoder=encoder,
+            host=self.config_loader.get("network.server_ip"),
+            port=stream_config.port,
+            bitrate=bitrate,
+        )
+
+        self._run_pipeline_in_tmux(stream_config, pipeline, stream_type)
+
+    def _run_pipeline_in_tmux(self, config: StreamConfig, pipeline_str: str, stream_type: str):
+        """Run GStreamer pipeline in a tmux window."""
+        label = format_stream_label(stream_type, None)
+        window_name = f"{stream_type}_{config.port}"
+
+        LOGGER.info(f"[{config.device}] Starting {label} stream on port {config.port}")
+        if config.verbose:
+            LOGGER.info(f"  Pipeline: {pipeline_str}")
+        LOGGER.info(f"  Format: {config.fourcc}")
+        LOGGER.info(f"  Resolution: {config.width}x{config.height}@{config.fps}fps")
+        LOGGER.info(f"  Encoding: {config.encoding}")
+
+        self.tmux_manager.create_window(window_name, pipeline_str)
+
+    def add_imu_sender(self, serial: str, host: str, port: int):
+        """Add IMU sender for camera."""
+        try:
+            # Import here to avoid circular dependencies
+            from gst_realsense_launch.startup.gst_sender import IMUSender
+
+            imu_sender = IMUSender(serial, host, port)
+            imu_sender.start()
+            self.imu_senders.append(imu_sender)
+        except Exception as e:
+            LOGGER.warning(f"Failed to start IMU for {serial}: {e}")
+
+    def wait(self):
+        """Block until shutdown is requested (Ctrl+C or signal)."""
+        try:
+            if self.tmux_manager:
+                if self.verbose:
+                    self.tmux_manager.attach_info()
+                else:
+                    LOGGER.info(f"Streams running in {self.tmux_manager.session_name} tmux session.")
+
+            LOGGER.info("All streams running. Press Ctrl+C to stop.")
+            self._shutdown.wait()
+
+        except KeyboardInterrupt:
+            LOGGER.info("Received interrupt signal")
+        finally:
+            self.stop_all()
+
+    def stop_all(self):
+        """Stop all streams and cleanup resources."""
+        with self._cleanup_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+
+        LOGGER.info("Stopping all streams...")
+
+        # Stop IMU senders
+        for imu_sender in self.imu_senders:
+            try:
+                imu_sender.stop()
+            except Exception as e:
+                LOGGER.warning(f"Error stopping IMU sender: {e}")
+
+        self.imu_senders.clear()
+
+        # Kill tmux session
+        if self.tmux_manager:
+            try:
+                self.tmux_manager.kill_session(force=True)
+            except Exception as e:
+                LOGGER.error(f"Error killing tmux session: {e}")
+
+        LOGGER.info("✓ All streams stopped")

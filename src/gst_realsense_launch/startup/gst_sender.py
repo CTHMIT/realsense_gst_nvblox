@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
-"""
-RealSense Multi-Stream Sender with tmux Integration
+"""RealSense Multi-Stream Sender with tmux Integration
 
-Modified to run each GStreamer pipeline in a separate tmux window for better
-visibility and debugging capabilities.
+Streams RealSense camera data using GStreamer pipelines managed via tmux.
 """
-
 
 import argparse
-import atexit
-import getpass
 import json
 import os
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -27,20 +21,17 @@ except Exception:
     rs = None
     LOGGER.warning("pyrealsense2 not available; RealSense-dependent features disabled.")
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from gst_realsense_launch.startup.rs_common import (
     ConfigLoader,
     StreamConfig,
-    format_stream_label,
     get_stream_type_from_fourcc,
     parse_resolution,
     validate_network_config,
 )
-from gst_realsense_launch.startup.rs_core import EncoderFactory, StreamStrategyFactory
 from gst_realsense_launch.startup.rs_detect import RealSenseDetector
-from gst_realsense_launch.startup.rs_tmux import TmuxSessionManager
+from gst_realsense_launch.startup.rs_tmux import StreamManager
 
 
 class IMUSender:
@@ -139,220 +130,30 @@ class IMUSender:
             pass
 
 
-class StreamManager:
-    """Manages multiple concurrent GStreamer video streams using tmux."""
-
-    _atexit_registered = False
-
-    def __init__(self, config_loader: ConfigLoader, verbose: bool = False):
-        self.config_loader = config_loader
-        self.imu_senders: list[IMUSender] = []
-        self.tmux_manager: TmuxSessionManager | None = None
-        self._shutdown = threading.Event()
-        self._stopped = False
-        self._cleanup_lock = threading.Lock()
-        self.verbose = verbose
-
-        # Register atexit handler once per instance
-        if not StreamManager._atexit_registered:
-            atexit.register(lambda: self.stop_all() if not self._stopped else None)
-            StreamManager._atexit_registered = True
-            LOGGER.debug("Registered atexit cleanup handler")
-
-    def add_stream(
-        self, stream_config: StreamConfig, stream_type: str, encoder_preference: str, bitrate: int
-    ):
-        """Add a video stream to manager."""
-        # Initialize tmux manager on first stream
-        if self.tmux_manager is None:
-            self.tmux_manager = TmuxSessionManager()
-
-        encoder = EncoderFactory.create_encoder(
-            encoder_preference,
-            stream_type,
-        )
-
-        strategy = StreamStrategyFactory.create_strategy(stream_type, self.config_loader)
-
-        pipeline = strategy.build_sender_pipeline(
-            device=stream_config.device,
-            width=stream_config.width,
-            height=stream_config.height,
-            fps=stream_config.fps,
-            fourcc=stream_config.fourcc,
-            encoder=encoder,
-            host=self.config_loader.get("network.server_ip"),
-            port=stream_config.port,
-            bitrate=bitrate,
-        )
-
-        self._run_pipeline_in_tmux(stream_config, pipeline, stream_type)
-
-    def _run_pipeline_in_tmux(self, config: StreamConfig, pipeline_str: str, stream_type: str):
-        """Run GStreamer pipeline in a tmux window."""
-        label = format_stream_label(stream_type, None)
-        window_name = f"{stream_type}_{config.port}"
-
-        LOGGER.info(f"[{config.device}] Starting {label} stream on port {config.port}")
-        if config.verbose:
-            LOGGER.info(f"  Pipeline: {pipeline_str}")
-        LOGGER.info(f"  Format: {config.fourcc}")
-        LOGGER.info(f"  Resolution: {config.width}x{config.height}@{config.fps}fps")
-        LOGGER.info(f"  Encoding: {config.encoding}")
-
-        self.tmux_manager.create_window(window_name, pipeline_str)
-
-    def add_imu_sender(self, serial: str, host: str, port: int):
-        """Add IMU sender for camera."""
-        try:
-            imu_sender = IMUSender(serial, host, port)
-            imu_sender.start()
-            self.imu_senders.append(imu_sender)
-        except Exception as e:
-            LOGGER.warning(f"Failed to start IMU for {serial}: {e}")
-
-    def wait(self):
-        """Block until shutdown is requested (Ctrl+C or signal)."""
-        try:
-            if self.tmux_manager:
-                if self.verbose:
-                    self.tmux_manager.attach_info()
-                else:
-                    LOGGER.info(
-                        f"Streams are running in {self.tmux_manager.session_name} tmux session."
-                    )
-            LOGGER.info("All streams running. Press Ctrl+C to stop.")
-
-            while not self._shutdown.is_set():
-                self._shutdown.wait(timeout=0.5)
-
-        except KeyboardInterrupt:
-            LOGGER.info("Received KeyboardInterrupt. Shutting down...")
-        finally:
-            self.kill_gst_launch()
-            self.stop_all()
-
-    def kill_gst_launch(
-        self, timeout: float = 2.0, include_root: bool = False
-    ) -> tuple[list[int], list[int]]:
-        """
-        Kill all running gst-launch-1.0 processes.
-        """
-        user = getpass.getuser()
-
-        def list_targets() -> list[int]:
-            out = subprocess.check_output(["ps", "-eo", "pid,user,comm"], text=True)
-            pids: list[int] = []
-            for i, line in enumerate(out.splitlines()):
-                if i == 0 or not line.strip():
-                    continue
-                parts = line.split(None, 2)
-                if len(parts) < 3:
-                    continue
-                pid_str, owner, comm = parts
-                if comm == "gst-launch-1.0" and (include_root or owner == user):
-                    try:
-                        pids.append(int(pid_str))
-                    except ValueError:
-                        pass
-            return pids
-
-        initial = list_targets()
-        if not initial:
-            return ([], [])
-
-        for pid in initial:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                pass
-
-        time.sleep(timeout)
-
-        remaining = set(list_targets()).intersection(initial)
-        for pid in list(remaining):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                remaining.discard(pid)
-            except PermissionError:
-                # 沒權限時保留在 remaining
-                pass
-
-        killed = [pid for pid in initial if pid not in remaining]
-        return (killed, sorted(list(remaining)))
-
-    def stop_all(self):
-        """Stop all running streams, IMU senders, and tmux session (idempotent)."""
-        with self._cleanup_lock:
-            if self._stopped:
-                LOGGER.debug("Cleanup already performed, skipping")
-                return
-
-            self._stopped = True
-            self._shutdown.set()
-
-            LOGGER.info("=" * 40)
-            LOGGER.info("SHUTTING DOWN - Stopping all streams...")
-            LOGGER.info("=" * 40)
-
-            # Stop IMU senders first
-            if self.imu_senders:
-                LOGGER.info("Stopping IMU senders...")
-                for imu in self.imu_senders:
-                    try:
-                        imu.stop()
-                        LOGGER.debug(f"  ✓ Stopped IMU for {imu.serial}")
-                    except Exception as e:
-                        LOGGER.warning(f"  Error stopping IMU for {imu.serial}: {e}")
-
-            # Kill tmux session and all pipelines
-            if self.tmux_manager:
-                try:
-                    LOGGER.info("Stopping GStreamer pipelines...")
-                    self.tmux_manager.kill_session()
-                except Exception as e:
-                    LOGGER.warning(f"Error during tmux cleanup: {e}")
-
-            LOGGER.info("=" * 70)
-            LOGGER.info("✓ All streams stopped. Clean exit.")
-            LOGGER.info("=" * 70)
-
-
 def check_encoder_availability():
-    """Check and report available encoders."""
-    encoders = {"nvh264enc": "NVIDIA H.264 (hardware)", "x264enc": "x264 H.264 (software)"}
+    """Check and log available video encoders."""
+    import shutil
+    import subprocess
 
-    available = []
-    missing = []
+    if not shutil.which("gst-inspect-1.0"):
+        LOGGER.warning("gst-inspect-1.0 not found")
+        return
 
-    for encoder, description in encoders.items():
+    encoders = {
+        "nvh264enc": "NVIDIA H.264 Hardware",
+        "x264enc": "Software H.264",
+    }
+
+    LOGGER.info("Available encoders:")
+    for encoder, name in encoders.items():
         result = subprocess.run(
             ["gst-inspect-1.0", encoder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        if result.returncode == 0:
-            available.append(f"  ✓ {encoder}: {description}")
-        else:
-            missing.append(f"  ✗ {encoder}: {description}")
-
-    if available:
-        LOGGER.info("Available encoders:")
-        for enc in available:
-            LOGGER.info(enc)
-
-    if missing:
-        LOGGER.warning("Missing encoders:")
-        for enc in missing:
-            LOGGER.warning(enc)
-        LOGGER.warning("To install missing encoders:")
-        LOGGER.warning("  sudo apt install gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly")
-
-    return len(available) > 0
+        status = "✓" if result.returncode == 0 else "✗"
+        LOGGER.info(f"  {status} {name} ({encoder})")
 
 
-def install_signal_handlers(manager: "StreamManager"):
+def install_signal_handlers(manager: StreamManager):
     """Install signal handlers for graceful shutdown."""
     signal_count = {"count": 0, "last_time": 0.0}
 
@@ -360,12 +161,11 @@ def install_signal_handlers(manager: "StreamManager"):
         sig_name = signal.Signals(signum).name
         current_time = time.time()
 
-        # Check for double Ctrl+C (within 2 seconds)
-        if current_time - signal_count["last_time"] < 2:
+        if current_time - signal_count["last_time"] < 2.0:
             signal_count["count"] += 1
             if signal_count["count"] >= 2:
                 LOGGER.warning("Force quit detected! Terminating immediately...")
-                os._exit(1)  # Force immediate exit
+                os._exit(1)
         else:
             signal_count["count"] = 1
 
@@ -375,10 +175,9 @@ def install_signal_handlers(manager: "StreamManager"):
         LOGGER.info("(Press Ctrl+C again within 2 seconds to force quit)")
         manager._shutdown.set()
 
-    # Install handlers for common termination signals
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            old_handler = signal.signal(sig, _handle_signal)
+            signal.signal(sig, _handle_signal)
             LOGGER.debug(f"Installed signal handler for {signal.Signals(sig).name}")
         except (OSError, RuntimeError, ValueError) as e:
             LOGGER.warning(f"Could not install handler for signal {sig}: {e}")
@@ -401,40 +200,31 @@ def main():
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
     parser.add_argument("--list-only", action="store_true", help="List cameras and exit")
     parser.add_argument("--device", help="Stream only specific device")
-    parser.add_argument(
-        "--preset",
-        choices=["d435i"],
-        help="Use camera preset",
-    )
+    parser.add_argument("--preset", choices=["d435i"], help="Use camera preset")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
     check_encoder_availability()
 
-    # Load configuration
     config_loader = ConfigLoader(args.config)
 
-    # Get configurations with overrides
     network_cfg = config_loader.get_network_config(args)
     camera_cfg = config_loader.get_camera_config(args)
     encoding_cfg = config_loader.get_encoding_config(args)
     imu_cfg = config_loader.get_imu_config(args)
 
-    # Validate network config
     try:
         validate_network_config(network_cfg)
     except ValueError as e:
         LOGGER.error(f"Configuration error: {e}")
         sys.exit(1)
 
-    # Parse resolution
     try:
         target_size = parse_resolution(camera_cfg["resolution"])
     except ValueError as e:
         LOGGER.error(f"Resolution error: {e}")
         sys.exit(1)
 
-    # Detect cameras
     LOGGER.info("Detecting RealSense cameras...")
     realsense_detector = RealSenseDetector()
     cameras = RealSenseDetector.detect_all_cameras()
@@ -474,11 +264,7 @@ def main():
         if imu_cfg["enabled"] and serial != "unknown":
             if args.verbose:
                 LOGGER.info(f"Starting IMU for camera {serial}")
-            manager.add_imu_sender(
-                serial,
-                network_cfg["server_ip"],
-                network_cfg["imu_port"],
-            )
+            manager.add_imu_sender(serial, network_cfg["server_ip"], network_cfg["imu_port"])
 
     actual_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
 
@@ -533,9 +319,7 @@ def main():
                 else:
                     target_format = None
                     mode_target_size = target_size
-                    actual_stream_type = (
-                        stream_name.replace("infra", "infra").replace("1", "").replace("2", "")
-                    )
+                    actual_stream_type = stream_name.replace("infra", "infra").replace("1", "").replace("2", "")
 
                 mode = realsense_detector.find_best_mode(
                     cam, mode_target_size, actual_stream_type, target_format
@@ -559,9 +343,7 @@ def main():
                     verbose=args.verbose,
                 )
 
-                manager.add_stream(
-                    stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate
-                )
+                manager.add_stream(stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate)
 
         else:
             LOGGER.error(f"Preset '{args.preset}' not found in configuration")
