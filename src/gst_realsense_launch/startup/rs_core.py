@@ -14,13 +14,24 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Optional
+from typing import Any, TYPE_CHECKING, TypeAlias
 
 from utils.logger import LOGGER
 
 GST_INITIALIZED: bool = False
 Gst: Any = None
 GLib: Any = None
+
+if TYPE_CHECKING:
+    from gi.repository import Gst as GstType
+
+    GstPipeline: TypeAlias = GstType.Pipeline
+    GstElement: TypeAlias = GstType.Element
+    GstFlowReturn: TypeAlias = GstType.FlowReturn
+else:
+    GstPipeline = Any
+    GstElement = Any
+    GstFlowReturn = int
 
 
 def init_gstreamer() -> bool:
@@ -783,7 +794,7 @@ class DepthReceiverNode(Node):
             raise RuntimeError("Failed to start pipeline")
         LOGGER.info("✓ Pipeline started")
 
-    def _on_new_sample_callback(self, appsink: Any) -> Gst.FlowReturn:
+    def _on_new_sample_callback(self, appsink: Any) -> GstFlowReturn:
         """Callback when new sample arrives from GStreamer."""
         try:
             sample = appsink.emit("pull-sample")
