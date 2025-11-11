@@ -18,10 +18,6 @@ from typing import Any, Optional
 
 from utils.logger import LOGGER
 
-# ============================================================================
-# GStreamer Initialization
-# ============================================================================
-GST_AVAILABLE: bool = False
 GST_INITIALIZED: bool = False
 Gst: Any = None
 GLib: Any = None
@@ -29,7 +25,7 @@ GLib: Any = None
 
 def init_gstreamer() -> bool:
     """Initialize GStreamer after ROS2 is initialized."""
-    global GST_AVAILABLE, GST_INITIALIZED, Gst, GLib
+    global GST_INITIALIZED, Gst, GLib
 
     if GST_INITIALIZED:
         return True
@@ -55,13 +51,7 @@ def init_gstreamer() -> bool:
         return False
 
 
-try:
-    import gi
 
-    gi.require_version("Gst", "1.0")
-    GST_AVAILABLE = True
-except Exception:
-    GST_AVAILABLE = False
 
 
 # ============================================================================
