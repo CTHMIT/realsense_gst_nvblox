@@ -1,379 +1,1490 @@
 #!/usr/bin/env python3
-"""
-RealSense D435i Receiver - x86 Server
-Receives and decodes color, depth, and infrared streams
+"""RealSense GStreamer Receiver
+
+Receives video streams via GStreamer and manages them using tmux.
+
+Features:
+- Video stream reception (depth, color, IR1, IR2)
+- Tmux-based stream management
+- Optional live visualization
 """
 
 import argparse
+import getpass
+import os
 import signal
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional
-from threading import Thread, Lock
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import ConfigManager
+from gst_realsense_launch.startup.rs_common import CameraIntrinsics, ConfigLoader
 
+try:
+    from utils.logger import LOGGER
+except ImportError:
+    import logging
 
-class GStreamerReceiver:
-    """GStreamer receiver pipeline."""
-    
-    def __init__(self, pipeline_str: str, name: str, callback):
-        self.name = name
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        self.appsink = self.pipeline.get_by_name("sink")
-        self.callback = callback
-        self.running = False
-        self.frame_count = 0
-        self.last_fps_time = time.time()
-        self.fps = 0.0
-        
-        # Setup callbacks
-        self.appsink.set_property("emit-signals", True)
-        self.appsink.connect("new-sample", self._on_new_sample)
-        
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_message)
-    
-    def start(self):
-        """Start pipeline."""
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError(f"Failed to start {self.name} pipeline")
-        self.running = True
-        self.last_fps_time = time.time()
-        print(f"✓ {self.name} receiver started")
-    
-    def stop(self):
-        """Stop pipeline."""
-        if self.running:
-            self.pipeline.set_state(Gst.State.NULL)
-            self.running = False
-            print(f"✓ {self.name} receiver stopped")
-    
-    def _on_new_sample(self, appsink):
-        """Handle new sample."""
-        sample = appsink.emit("pull-sample")
-        if sample:
-            buffer = sample.get_buffer()
-            caps = sample.get_caps()
-            
-            # Extract frame info
-            structure = caps.get_structure(0)
-            width = structure.get_value("width")
-            height = structure.get_value("height")
-            format_str = structure.get_value("format")
-            
-            # Map buffer
-            success, map_info = buffer.map(Gst.MapFlags.READ)
-            if not success:
-                return Gst.FlowReturn.ERROR
-            
-            # Convert to numpy
-            if format_str == "RGB":
-                frame = np.frombuffer(map_info.data, dtype=np.uint8)
-                frame = frame.reshape((height, width, 3))
-            elif format_str == "GRAY16_LE":
-                frame = np.frombuffer(map_info.data, dtype=np.uint16)
-                frame = frame.reshape((height, width))
-            elif format_str == "GRAY8":
-                frame = np.frombuffer(map_info.data, dtype=np.uint8)
-                frame = frame.reshape((height, width))
-            else:
-                print(f"⚠ Unknown format: {format_str}")
-                buffer.unmap(map_info)
-                return Gst.FlowReturn.OK
-            
-            buffer.unmap(map_info)
-            
-            # Callback
-            self.callback(self.name, frame.copy())
-            
-            # FPS calculation
-            self.frame_count += 1
-            current_time = time.time()
-            elapsed = current_time - self.last_fps_time
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.last_fps_time = current_time
-            
-            return Gst.FlowReturn.OK
-        
-        return Gst.FlowReturn.ERROR
-    
-    def _on_message(self, bus, message):
-        """Handle bus messages."""
-        t = message.type
-        if t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print(f"✗ {self.name} Error: {err}")
-            if "Could not bind to port" in str(err):
-                print(f"  Hint: Port may already be in use")
-        elif t == Gst.MessageType.WARNING:
-            warn, debug = message.parse_warning()
-            print(f"⚠ {self.name} Warning: {warn}")
-        elif t == Gst.MessageType.EOS:
-            print(f"✓ {self.name} End-of-stream")
-        elif t == Gst.MessageType.STATE_CHANGED:
-            if message.src == self.pipeline:
-                old, new, pending = message.parse_state_changed()
-                if new == Gst.State.PLAYING:
-                    print(f"  {self.name} → PLAYING")
+    LOGGER = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO)
+
+if TYPE_CHECKING:
+    from gst_realsense_launch.startup.h264_depth_receiver import DepthReceiverNode
+
+try:
+    from gst_realsense_launch.startup.h264_depth_receiver import (
+        DepthReceiverNode,
+    )
+
+    GST_PYTHON_AVAILABLE = True
+except ImportError:
+    GST_PYTHON_AVAILABLE = False
+    LOGGER.warning("GStreamer Python bindings not available - depth streaming will be limited")
+
+from gst_realsense_launch.startup.separate_and_merge import DepthMergeProcessor
 
 
-class RealSenseReceiver:
-    """RealSense D435i receiver."""
-    
-    def __init__(self, config_path: str = "config.yaml", preset: str = "balanced", display: bool = True):
-        # Load configuration
-        self.config = ConfigManager(config_path)
-        self.preset = preset
-        self.display = display
-        
-        # Initialize GStreamer
-        Gst.init(None)
-        
-        # GStreamer receivers
-        self.receivers: Dict[str, GStreamerReceiver] = {}
-        
-        # Frame storage
-        self.frames = {}
-        self.frame_lock = Lock()
-        
-        # State
-        self.running = False
-        self.main_loop = None
-        
-        # Stats
-        self.start_time = None
-        self.total_frames = 0
-    
-    def setup_receivers(self):
-        """Setup GStreamer receiver pipelines."""
-        preset_cfg = self.config.get_preset(self.preset)
-        if not preset_cfg:
-            raise ValueError(f"Preset '{self.preset}' not found")
-        
-        # Color receiver
-        if preset_cfg.color.enabled:
-            pipeline_str = self.config.build_receiver_pipeline("color", self.preset)
-            self.receivers["Color"] = GStreamerReceiver(
-                pipeline_str, "Color", self._on_frame
-            )
-        
-        # Depth receiver
-        if preset_cfg.depth.enabled:
-            pipeline_str = self.config.build_receiver_pipeline("depth", self.preset)
-            self.receivers["Depth"] = GStreamerReceiver(
-                pipeline_str, "Depth", self._on_frame
-            )
-        
-        # Infrared receivers
-        if preset_cfg.infrared_stereo and preset_cfg.infrared_stereo.enabled:
-            ports = preset_cfg.infrared_stereo.port
-            if isinstance(ports, list):
-                # Left infrared
-                pipeline_left = (
-                    f"udpsrc port={ports[0]} buffer-size=30000000 ! "
-                    f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={preset_cfg.infrared_stereo.rtp_payload_type[0]} ! "
-                    f"rtpjitterbuffer latency=50 drop-on-latency=false do-lost=true do-retransmission=false ! "
-                    f"rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-                    f"queue max-size-buffers=3 leaky=downstream ! "
-                    f"appsink name=sink emit-signals=true sync=false max-buffers=3 drop=true"
-                )
-                self.receivers["Infrared-L"] = GStreamerReceiver(
-                    pipeline_left, "Infrared-L", self._on_frame
-                )
-                
-                # Right infrared
-                if len(ports) > 1:
-                    pipeline_right = (
-                        f"udpsrc port={ports[1]} buffer-size=30000000 ! "
-                        f"application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={preset_cfg.infrared_stereo.rtp_payload_type[1]} ! "
-                        f"rtpjitterbuffer latency=50 drop-on-latency=false do-lost=true do-retransmission=false ! "
-                        f"rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-                        f"queue max-size-buffers=3 leaky=downstream ! "
-                        f"appsink name=sink emit-signals=true sync=false max-buffers=3 drop=true"
-                    )
-                    self.receivers["Infrared-R"] = GStreamerReceiver(
-                        pipeline_right, "Infrared-R", self._on_frame
-                    )
-        
-        print(f"✓ Receivers created: {list(self.receivers.keys())}")
-    
-    def _on_frame(self, name: str, frame: np.ndarray):
-        """Handle received frame."""
-        with self.frame_lock:
-            self.frames[name] = frame
-            self.total_frames += 1
-    
-    def start(self):
-        """Start receiving."""
-        print("\n" + "="*80)
-        print("RealSense Receiver - x86 Server")
-        print("="*80)
-        
-        # Setup
-        self.setup_receivers()
-        
-        # Start receivers
-        time.sleep(1.0)
-        for receiver in self.receivers.values():
-            receiver.start()
-        
-        # Start main loop
-        self.running = True
-        self.start_time = time.time()
-        
-        print("\n✓ Receiving started")
-        print(f"  Preset: {self.preset}")
-        print(f"  Streams: {list(self.receivers.keys())}")
-        
-        if self.display:
-            print("\nPress 'q' to quit\n")
-            self._display_loop()
-        else:
-            print("\nPress Ctrl+C to stop\n")
-            # Run GLib main loop
-            self.main_loop = GLib.MainLoop()
-            try:
-                self.main_loop.run()
-            except KeyboardInterrupt:
-                print("\n\n⚠ Interrupted by user")
-            finally:
-                self.stop()
-    
-    def _display_loop(self):
-        """Display frames in OpenCV windows."""
-        print("Display mode active")
-        
+class TmuxSessionManager:
+    """Manages tmux session for multiple GStreamer receiver pipelines."""
+
+    def __init__(self, session_name: str = "realsense_receiver"):
+        self.session_name = session_name
+        self.window_count = 0
+        self._check_tmux()
+        self._cleanup_old_session()
+        self._create_session()
+
+    def _check_tmux(self):
+        """Check if tmux is available."""
         try:
-            last_stats_time = time.time()
-            
-            while self.running:
-                with self.frame_lock:
-                    frames_to_show = self.frames.copy()
-                
-                # Display frames
-                for name, frame in frames_to_show.items():
-                    if frame is None:
-                        continue
-                    
-                    # Prepare frame for display
-                    if name == "Depth":
-                        # Normalize depth for visualization
-                        depth_normalized = cv2.normalize(
-                            frame, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U
-                        )
-                        depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-                        display_frame = depth_colored
-                    elif name == "Color":
-                        # Convert RGB to BGR for OpenCV
-                        display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    else:
-                        # Infrared
-                        display_frame = frame
-                    
-                    # Add FPS overlay
-                    receiver = self.receivers.get(name)
-                    if receiver:
-                        fps_text = f"{name}: {receiver.fps:.1f} FPS"
-                        cv2.putText(
-                            display_frame, fps_text, (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2
-                        )
-                    
-                    # Show frame
-                    cv2.imshow(name, display_frame)
-                
-                # Print stats every 5 seconds
-                current_time = time.time()
-                if current_time - last_stats_time >= 5.0:
-                    elapsed = current_time - self.start_time
-                    avg_fps = self.total_frames / elapsed if elapsed > 0 else 0
-                    
-                    print(f"Stats: {self.total_frames} frames total, {avg_fps:.1f} avg FPS")
-                    for name, receiver in self.receivers.items():
-                        print(f"  {name}: {receiver.fps:.1f} FPS")
-                    
-                    last_stats_time = current_time
-                
-                # Check for quit
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("\n⚠ Quit requested")
-                    break
-        
+            subprocess.run(["tmux", "-V"], capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise RuntimeError("tmux is not installed. Please install tmux: sudo apt install tmux")
+
+    def _cleanup_old_session(self):
+        """Kill old session if it exists."""
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name], capture_output=True
+        )
+        if result.returncode == 0:
+            subprocess.run(["tmux", "kill-session", "-t", self.session_name], capture_output=True)
+            LOGGER.info(f"✓ Cleaned up old tmux session '{self.session_name}'")
+            time.sleep(0.5)
+
+    def _create_session(self):
+        """Create tmux session if it doesn't exist."""
+        try:
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", self.session_name],
+                check=True,
+                capture_output=True,
+            )
+            LOGGER.info(f"✓ Created tmux session '{self.session_name}'")
+        except subprocess.CalledProcessError as e:
+            LOGGER.info(f"Warning: Could not create tmux session: {e}")
+            raise
+
+    def create_window(self, window_name: str, command: str):
+        """Create a new tmux window and run command in it."""
+        try:
+            subprocess.run(
+                ["tmux", "new-window", "-t", self.session_name, "-n", window_name],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            subprocess.run(
+                ["tmux", "send-keys", "-t", f"{self.session_name}:{window_name}", command, "C-m"],
+                check=True,
+                capture_output=True,
+            )
+
+            self.window_count += 1
+            LOGGER.info(f"  ✓ Created window '{window_name}' in tmux")
+
+        except subprocess.CalledProcessError as e:
+            LOGGER.info(f"  ✗ Failed to create window '{window_name}': {e}")
+            if e.stderr:
+                LOGGER.info(f"     Error output: {e.stderr}")
+            raise
+
+    def attach_info(self):
+        """Display instructions for attaching to the tmux session."""
+        LOGGER.info(f"To view the streams, attach to tmux session:")
+        LOGGER.info(f"  tmux attach -t {self.session_name}")
+        LOGGER.info(f"Tmux navigation:")
+        LOGGER.info(f"  Ctrl+b n : next window")
+        LOGGER.info(f"  Ctrl+b p : previous window")
+        LOGGER.info(f"  Ctrl+b [0-9] : select window by number")
+        LOGGER.info(f"  Ctrl+b d : detach from session")
+
+    def kill_session(self):
+        """Kill the entire tmux session and ensure all processes are terminated."""
+        if not self._session_exists():
+            LOGGER.info(f"Tmux session '{self.session_name}' already terminated")
+            return
+
+        try:
+            result = subprocess.run(
+                ["tmux", "list-panes", "-t", self.session_name, "-F", "#{pane_pid}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            if result.returncode == 0:
+                pids = result.stdout.strip().split("\n")
+                LOGGER.info(f"Found {len(pids)} processes in tmux session")
+
+                for pid in pids:
+                    if pid and pid.isdigit():
+                        try:
+                            subprocess.run(["kill", "-TERM", pid], timeout=2, check=False)
+                            LOGGER.debug(f"  Sent SIGTERM to PID {pid}")
+                        except Exception as e:
+                            LOGGER.debug(f"  Could not terminate PID {pid}: {e}")
+
+                time.sleep(2)
+
+                for pid in pids:
+                    if pid and pid.isdigit():
+                        try:
+                            check = subprocess.run(
+                                ["ps", "-p", pid], capture_output=True, timeout=1, check=False
+                            )
+                            if check.returncode == 0:
+                                subprocess.run(["kill", "-KILL", pid], timeout=1, check=False)
+                                LOGGER.debug(f"  Force killed PID {pid}")
+                        except Exception as e:
+                            LOGGER.debug(f"  Could not check/kill PID {pid}: {e}")
+
+            result = subprocess.run(
+                ["tmux", "kill-session", "-t", self.session_name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            if result.returncode == 0:
+                LOGGER.info(f"✓ Killed tmux session '{self.session_name}'")
+
+            time.sleep(0.5)
+            if not self._session_exists():
+                LOGGER.info("✓ Tmux session cleanup verified")
+
+        except Exception as e:
+            LOGGER.error(f"Error during tmux cleanup: {e}")
+
+    def _session_exists(self) -> bool:
+        """Check if the tmux session exists."""
+        result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name], capture_output=True
+        )
+        return result.returncode == 0
+
+
+class VideoStreamReceiver:
+    """Manages video stream reception using tmux and GStreamer."""
+
+    def __init__(
+        self,
+        camera_name: str,
+        config_loader: ConfigLoader,
+        show_views: bool = False,
+        view_scale: float = 0.5,
+    ):
+        """Initialize the video stream receiver."""
+        self.camera_name = camera_name
+        self.config_loader = config_loader
+        self.show_views = show_views
+        self.view_scale = view_scale
+
+        self.tmux_manager = TmuxSessionManager()
+        self._shutdown_event = threading.Event()
+        self.depth_merge_processor: DepthMergeProcessor | None = None
+        self.depth_receiver_node: Optional["DepthReceiverNode"] = (
+            None  # For GStreamer Python-based depth receiver
+        )
+        self.depth_receiver_thread: threading.Thread | None = None
+
+    def start_stream(
+        self,
+        port: int,
+        stream_name: str,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None = None,
+    ):
+        """Start receiving a video stream and publishing to ROS2."""
+
+        if stream_name == "depth":
+            self._start_h264_depth_stream(port, encoding, width, height, intrinsics)
+            if self.show_views:
+                self._start_visualization_in_tmux(port, stream_name, width, height)
+            time.sleep(0.5)
+            return
+
+        if stream_name == "infra_stereo":
+            single_width = width // 2
+
+            self._start_single_stream_in_tmux(
+                port,
+                "infra1",
+                encoding,
+                single_width,
+                height,
+                intrinsics,
+                is_y8i=True,
+                y8i_width=width,
+            )
+            if self.show_views:
+                self._start_visualization_in_tmux(
+                    port, "infra1", single_width, height, is_y8i=True, y8i_width=width
+                )
+            time.sleep(0.5)
+
+            self._start_single_stream_in_tmux(
+                port,
+                "infra2",
+                encoding,
+                single_width,
+                height,
+                intrinsics,
+                is_y8i=True,
+                y8i_width=width,
+            )
+            if self.show_views:
+                self._start_visualization_in_tmux(
+                    port, "infra2", single_width, height, is_y8i=True, y8i_width=width
+                )
+            time.sleep(0.5)
+        else:
+            self._start_single_stream_in_tmux(
+                port, stream_name, encoding, width, height, intrinsics
+            )
+            if self.show_views:
+                self._start_visualization_in_tmux(port, stream_name, width, height)
+            time.sleep(0.5)
+
+    def _start_single_stream_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+        is_y8i: bool = False,
+        y8i_width: int = None,
+    ):
+        """Start a single stream receiver in a tmux window"""
+
+        calib_file = self._get_calibration_file_path(stream_name, width, height)
+
+        if calib_file:
+            info_file_url = f"file://{calib_file}"
+            tmp_file_path = None
+        else:
+            LOGGER.info(
+                f"No calibration file found for {stream_name} {width}x{height}, using defaults"
+            )
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
+            self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
+            info_file_url = f"file://{tmp_file.name}"
+            tmp_file_path = tmp_file.name
+            tmp_file.close()
+
+        if is_y8i:
+            gst_config = self._build_y8i_pipeline(port, stream_name, y8i_width, height)
+        else:
+            gst_config = self._build_pipeline(port, stream_name, encoding, width, height)
+
+        image_encodings = self.config_loader.get("receiver.image_encoding", {})
+
+        if stream_name == "depth":
+            image_topic = f"/{self.camera_name}/depth/image_rect_raw"
+            info_topic = f"/{self.camera_name}/depth/camera_info"
+            frame_id = f"{self.camera_name}_depth_optical_frame"
+            image_encoding = image_encodings.get("depth", "16UC1")
+        elif stream_name == "color":
+            image_topic = f"/{self.camera_name}/color/image_raw"
+            info_topic = f"/{self.camera_name}/color/camera_info"
+            frame_id = f"{self.camera_name}_color_optical_frame"
+            image_encoding = image_encodings.get("color", "rgb8")
+        elif stream_name.startswith("infra"):
+            image_topic = f"/{self.camera_name}/{stream_name}/image_rect_raw"
+            info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
+            frame_id = f"{self.camera_name}_{stream_name}_optical_frame"
+            image_encoding = image_encodings.get("infra", "mono8")
+        else:
+            return
+
+        gscam_cmd_parts = [
+            "ros2 run gscam gscam_node",
+            "--ros-args",
+            f"-p gscam_config:='{gst_config}'",
+            f"-p camera_name:={self.camera_name}_{stream_name}",
+            f"-p camera_info_url:={info_file_url}",
+            f"-p frame_id:={frame_id}",
+            "-p sync_sink:=false",
+        ]
+
+        if image_encoding:
+            gscam_cmd_parts.append(f"-p image_encoding:={image_encoding}")
+
+        gscam_cmd_parts.extend(
+            [
+                f"-r camera/image_raw:={image_topic}",
+                f"-r camera/camera_info:={info_topic}",
+            ]
+        )
+
+        gscam_cmd = " ".join(gscam_cmd_parts)
+
+        if tmp_file_path:
+            gscam_cmd = f"trap 'rm -f {tmp_file_path}' EXIT; {gscam_cmd}"
+
+        window_name = f"{stream_name}_{port}"
+
+        LOGGER.info(f"[{stream_name}] Starting on port {port}")
+        LOGGER.info(f"  Topic: {image_topic}")
+        if stream_name == "depth":
+            LOGGER.info(f"  Encoding: {image_encoding} (OpenCV format for 16-bit depth)")
+        else:
+            LOGGER.info(f"  Encoding: {image_encoding if image_encoding else 'auto-detect'}")
+
+        self.tmux_manager.create_window(window_name, gscam_cmd)
+
+        if stream_name == "depth":
+            self._start_depth_conversion_node(port, image_topic, info_topic)
+
+    def _start_h264_depth_stream(
+        self,
+        port: int,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """Start depth stream using GStreamer Python bindings in tmux (bypasses gscam).
+
+        This method is used specifically for 16-bit depth streams because
+        gscam does not support 16UC1 or mono16 encodings.
+
+        Instead of running in a thread, the depth receiver now runs in a tmux window
+        for consistency with other streams.
+        """
+        if not GST_PYTHON_AVAILABLE:
+            LOGGER.error("❌ Cannot start depth stream: GStreamer Python not available")
+            LOGGER.error("   Install with: sudo apt install python3-gi python3-gst-1.0")
+            LOGGER.error("   Falling back to gscam (will fail for 16-bit depth)")
+            # Fallback to gscam (will likely fail, but at least we try)
+            self._start_single_stream_in_tmux(port, "depth", encoding, width, height, intrinsics)
+            return
+
+        LOGGER.info(f"[depth] Starting GStreamer Python receiver on port {port}")
+        LOGGER.info(f"  Encoding: {encoding}")
+        LOGGER.info(f"  Resolution: {width}x{height}")
+        LOGGER.info(f"  Topic: /{self.camera_name}/depth/image_rect_raw")
+        LOGGER.info(f"  Format: 16UC1 (16-bit depth)")
+        LOGGER.info(f"  Method: GStreamer Python in tmux (bypassing gscam)")
+
+        # Get the path to the standalone depth receiver script
+        script_dir = Path(__file__).resolve().parent
+        depth_receiver_script = script_dir / "h264_depth_receiver.py"
+
+        # Check if script exists
+        if not depth_receiver_script.exists():
+            LOGGER.error(f"❌ Depth receiver script not found: {depth_receiver_script}")
+            LOGGER.error(
+                "   Make sure h264_depth_receiver.py is in the same directory as gst_receiver.py"
+            )
+            return
+
+        # Build command with all necessary arguments
+        cmd_parts = [
+            f"python3 {depth_receiver_script}",
+            f"--port {port}",
+            f"--width {width}",
+            f"--height {height}",
+            f"--camera-name {self.camera_name}",
+            f"--encoding {encoding}",
+        ]
+
+        # Add config file path if available
+        if hasattr(self.config_loader, "config_file"):
+            cmd_parts.append(f"--config {self.config_loader.config_file}")
+
+        # Add intrinsics if provided
+        if intrinsics:
+            cmd_parts.extend(
+                [
+                    f"--fx {intrinsics.fx}",
+                    f"--fy {intrinsics.fy}",
+                    f"--ppx {intrinsics.ppx}",
+                    f"--ppy {intrinsics.ppy}",
+                ]
+            )
+            if intrinsics.distortion:
+                distortion_str = " ".join(str(d) for d in intrinsics.distortion)
+                cmd_parts.append(f"--distortion {distortion_str}")
+
+        # Build final command
+        depth_cmd = " ".join(cmd_parts)
+        window_name = f"depth_{port}"
+
+        LOGGER.info(f"  Creating tmux window: {window_name}")
+        LOGGER.debug(f"  Command: {depth_cmd}")
+
+        # Create tmux window and run the depth receiver
+        try:
+            self.tmux_manager.create_window(window_name, depth_cmd)
+            LOGGER.info("✓ Depth receiver started in tmux")
+        except Exception as e:
+            LOGGER.error(f"❌ Failed to start depth receiver in tmux: {e}")
+            return
+
+        # Wait a moment for the node to initialize
+        time.sleep(1.0)
+
+        # Start depth conversion node (if needed)
+        depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
+        info_topic = f"/{self.camera_name}/depth/camera_info"
+        self._start_depth_conversion_node(port, depth_topic, info_topic)
+
+        LOGGER.info("✓ Depth stream setup complete")
+
+    def _check_nvdec_available(self) -> bool:
+        """Check if NVIDIA hardware decoder is available."""
+        try:
+            result = subprocess.run(
+                ["gst-inspect-1.0", "nvh264dec"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return result.returncode == 0
+        except:
+            return False
+
+    def _start_depth_conversion_node(self, port: int, depth_topic: str, info_topic: str):
+        """Start depth_image_proc convert_metric node for float32 conversion."""
+
+        depth_config = self.config_loader.get("receiver.depth_conversion", {})
+
+        if not depth_config.get("enabled", True):
+            LOGGER.info("  Depth conversion disabled in config")
+            return
+
+        output_topic = depth_config.get("output_topic", "depth/image")
+        output_full_topic = f"/{self.camera_name}/{output_topic}"
+
+        convert_cmd_parts = [
+            "ros2 run depth_image_proc convert_metric_node",
+            "--ros-args",
+            f"-r image_raw:={depth_topic}",
+            f"-r camera_info:={info_topic}",
+            f"-r image:={output_full_topic}",
+        ]
+
+        convert_cmd = " ".join(convert_cmd_parts)
+        window_name = f"depth_convert_{port}"
+
+        LOGGER.info(f"  [CONVERT] Starting depth to float32 conversion")
+        LOGGER.info(f"    Input: {depth_topic} (16UC1 format)")
+        LOGGER.info(f"    Output: {output_full_topic} (32FC1)")
+
+        time.sleep(1.0)
+        self.tmux_manager.create_window(window_name, convert_cmd)
+
+    def _build_pipeline(
+        self, port: int, stream_name: str, encoding: str, width: int, height: int
+    ) -> str:
+        """Build GStreamer pipeline for receiving video streams.
+
+        Optimized for NVIDIA hardware encoder compatibility with improved
+        format conversion and buffering for gscam.
+
+        Args:
+            port: UDP port number
+            stream_name: Stream type (depth, color, infra)
+            encoding: Codec type (h264, h265, jpeg2000)
+            width: Image width
+            height: Image height
+        """
+
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000),
+            30000000,  # 30MB - safe for gint
+        )
+
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        gst_formats = self.config_loader.get("receiver.gstreamer_format", {})
+
+        use_nvdec = self._check_nvdec_available()
+
+        encoding_lower = encoding.lower()
+
+        if stream_name == "depth":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth.drop_on_latency", False
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            output_format = gst_formats.get("depth", "GRAY16_LE")
+
+            # H.264 for depth - Optimized for Z16 → GRAY16_LE → H.264 → GRAY16_LE → ROS2 16UC1
+            # This matches the sender pipeline: Z16 → GRAY16_LE → I420 → x264enc → RTP
+            payload = payload_types.get("depth_h264", 96)
+
+            # Select decoder - prefer software decoder for better compatibility
+            # NVIDIA decoder can be forced by setting environment variable USE_NVDEC=1
+            if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                decoder = "nvh264dec"
+                LOGGER.info(f"  Using NVIDIA H.264 hardware decoder for {stream_name}")
+            else:
+                decoder = f"avdec_h264 max-threads={max_threads}"
+                LOGGER.info(f"  Using software H.264 decoder for {stream_name}")
+
+            # Pipeline: UDP → RTP → H.264 decode → GRAY16_LE → 16UC1 for ROS2
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! {decoder} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format={output_format},width={width},height={height},framerate=30/1 "
+                f"! appsink drop=true max-buffers=1"
+            )
+            LOGGER.info(f"  Depth pipeline: RTP → H.264 decode → GRAY16_LE → 16UC1")
+        elif stream_name == "color":
+            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.color.drop_on_latency", False
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            output_format = gst_formats.get("color", "RGB")
+
+            if encoding_lower == "h265":
+                payload = payload_types.get("color_h265", 118)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh265dec"
+                else:
+                    decoder = f"avdec_h265 max-threads={max_threads}"
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph265depay ! h265parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                )
+            else:
+                # H.264 for color
+                payload = payload_types.get("color_h264", 98)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh264dec"
+                    LOGGER.info(f"  Using NVIDIA hardware decoder for {stream_name}")
+                else:
+                    decoder = f"avdec_h264 max-threads={max_threads}"
+
+                # Enhanced pipeline with explicit format specs and better buffering
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph264depay ! h264parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                )
+        elif stream_name.startswith("infra"):
+            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.infra.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            output_format = gst_formats.get("infra", "GRAY8")
+
+            if encoding_lower == "h265":
+                payload = payload_types.get("ir_h265", 119)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh265dec"
+                else:
+                    decoder = f"avdec_h265 max-threads={max_threads}"
+
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph265depay ! h265parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                )
+            else:
+                # H.264 for infrared
+                payload = payload_types.get("ir_h264", 97)
+
+                if use_nvdec and os.environ.get("USE_NVDEC", "0") == "1":
+                    decoder = "nvh264dec"
+                else:
+                    decoder = f"avdec_h264 max-threads={max_threads}"
+
+                # Enhanced pipeline with explicit format specs and better buffering
+                pipeline = (
+                    f"udpsrc port={port} buffer-size={buffer_size} "
+                    f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                    f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                    f"! rtph264depay ! h264parse ! {decoder} "
+                    f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                    f"! videoconvert n-threads={n_threads} "
+                    f"! video/x-raw,format={output_format},width={width},height={height} "
+                )
+        else:
+            return ""
+
+        return pipeline
+
+    def _build_y8i_pipeline(self, port: int, stream_name: str, y8i_width: int, height: int) -> str:
+        """Build GStreamer pipeline for Y8I streams."""
+        single_width = y8i_width // 2
+
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
+        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 50)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
+        )
+        drop_str = "true" if drop_on_latency else "false"
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        payload = payload_types.get("infra_stereo_h264", 99)
+
+        pipeline = (
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+            f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+            f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+            f"! videoconvert n-threads={n_threads} ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
+        )
+
+        if stream_name == "infra1":
+            pipeline += f" ! videocrop right={single_width}"
+        else:
+            pipeline += f" ! videocrop left={single_width}"
+
+        return pipeline
+
+    def _start_visualization_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        width: int,
+        height: int,
+        is_y8i: bool = False,
+        y8i_width: int = None,
+    ):
+        """Start a separate visualization window for a stream."""
+        display_width = int(width * self.view_scale)
+        display_height = int(height * self.view_scale)
+
+        if is_y8i:
+            viz_pipeline = self._build_visualization_pipeline_y8i(
+                port, stream_name, y8i_width, height, display_width, display_height
+            )
+        else:
+            viz_pipeline = self._build_visualization_pipeline(
+                port, stream_name, width, height, display_width, display_height
+            )
+
+        window_name = f"viz_{stream_name}_{port}"
+        gst_cmd = f"gst-launch-1.0 -v {viz_pipeline}"
+
+        LOGGER.info(f"  [VIZ] Starting visualization for {stream_name}")
+        self.tmux_manager.create_window(window_name, gst_cmd)
+
+    def _build_visualization_pipeline(
+        self,
+        port: int,
+        stream_name: str,
+        width: int,
+        height: int,
+        display_width: int,
+        display_height: int,
+    ) -> str:
+        """Build independent visualization pipeline."""
+
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+
+        if stream_name == "depth":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("depth_h264", 96)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        elif stream_name == "color":
+            latency = self.config_loader.get("streaming.jitter_buffer.color.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.color.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("color_h264", 98)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        elif stream_name.startswith("infra"):
+            latency = self.config_loader.get("streaming.jitter_buffer.infra.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.infra.drop_on_latency", True
+            )
+            drop_str = "true" if drop_on_latency else "false"
+            payload = payload_types.get("ir_h264", 97)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoscale ! video/x-raw,width={display_width},height={display_height} "
+                f"! videoconvert "
+                f"! autovideosink sync=false"
+            )
+        else:
+            return ""
+
+        return pipeline
+
+    def _build_visualization_pipeline_y8i(
+        self,
+        port: int,
+        stream_name: str,
+        y8i_width: int,
+        height: int,
+        display_width: int,
+        display_height: int,
+    ) -> str:
+        """Build visualization pipeline for Y8I streams."""
+        single_width = y8i_width // 2
+
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
+        latency = self.config_loader.get("streaming.jitter_buffer.infra_stereo.latency", 50)
+        drop_on_latency = self.config_loader.get(
+            "streaming.jitter_buffer.infra_stereo.drop_on_latency", True
+        )
+        drop_str = "true" if drop_on_latency else "false"
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+        payload = payload_types.get("infra_stereo_h264", 99)
+
+        pipeline = (
+            f"udpsrc port={port} buffer-size={buffer_size} "
+            f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={payload}" '
+            f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+            f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+            f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+            f"! videoconvert ! video/x-raw,format=GRAY8,width={y8i_width},height={height}"
+        )
+
+        if stream_name == "infra1":
+            pipeline += f" ! videocrop right={single_width}"
+        else:
+            pipeline += f" ! videocrop left={single_width}"
+
+        pipeline += (
+            f" ! videoscale ! video/x-raw,width={display_width},height={display_height} "
+            f"! videoconvert "
+            f"! autovideosink sync=false"
+        )
+
+        return pipeline
+
+    def _get_calibration_file_path(self, stream_name: str, width: int, height: int) -> str | None:
+        """Get the path to the calibration file for the given stream and resolution."""
+        stream_mapping = {
+            "depth": "depth",
+            "depth_high": "depth_high",
+            "depth_low": "depth_low",
+            "color": "color",
+            "infra1": "infrared",
+            "infra2": "infrared",
+        }
+
+        stream_prefix = stream_mapping.get(stream_name, stream_name)
+        resolution = f"{width}x{height}"
+
+        config_paths = [
+            Path("src/config"),
+            Path(__file__).parent.parent / "config",
+            Path(__file__).parent / "config",
+            Path("config"),
+            Path.home() / ".config" / "realsense",
+        ]
+
+        filename = f"{self.camera_name}_{stream_prefix}_{resolution}.yaml"
+
+        for config_dir in config_paths:
+            filepath = config_dir / filename
+            if filepath.exists():
+                LOGGER.info(f"  ✓ Found calibration file: {filepath}")
+                return str(filepath.absolute())
+
+        return None
+
+    def _create_camera_info_file(
+        self,
+        filepath: str,
+        stream_name: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """Create camera_info YAML file."""
+        if intrinsics:
+            fx, fy = intrinsics.fx, intrinsics.fy
+            ppx, ppy = intrinsics.ppx, intrinsics.ppy
+            coeffs = intrinsics.distortion
+        else:
+            intrinsics = self.config_loader.create_default_intrinsics(width, height)
+            fx, fy = intrinsics.fx, intrinsics.fy
+            ppx, ppy = intrinsics.ppx, intrinsics.ppy
+            coeffs = intrinsics.distortion
+
+        content = f"""image_width: {width}
+image_height: {height}
+camera_name: {self.camera_name}_{stream_name}
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [{fx}, 0.0, {ppx}, 0.0, {fy}, {ppy}, 0.0, 0.0, 1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [{coeffs[0]}, {coeffs[1]}, {coeffs[2]}, {coeffs[3]}, {coeffs[4]}]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [{fx}, 0.0, {ppx}, 0.0, 0.0, {fy}, {ppy}, 0.0, 0.0, 0.0, 1.0, 0.0]
+"""
+        with open(filepath, "w") as f:
+            f.write(content)
+
+    def wait(self):
+        """Wait until shutdown is requested."""
+        try:
+            self.tmux_manager.attach_info()
+            LOGGER.info("All receivers running. Press Ctrl+C to stop.")
+            self._shutdown_event.wait()
         except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted by user")
-        finally:
-            cv2.destroyAllWindows()
-            self.stop()
-    
-    def stop(self):
-        """Stop receiving."""
-        print("\n" + "="*80)
-        print("Stopping...")
-        print("="*80)
-        
-        self.running = False
-        
-        # Stop receivers
-        for receiver in self.receivers.values():
-            receiver.stop()
-        
-        # Stop main loop
-        if self.main_loop and self.main_loop.is_running():
-            self.main_loop.quit()
-        
-        # Stats
-        if self.start_time:
-            elapsed = time.time() - self.start_time
-            avg_fps = self.total_frames / elapsed if elapsed > 0 else 0
-            
-            print(f"\nFinal Stats:")
-            print(f"  Total frames: {self.total_frames}")
-            print(f"  Duration: {elapsed:.1f}s")
-            print(f"  Average FPS: {avg_fps:.1f}")
-            
-            for name, receiver in self.receivers.items():
-                print(f"  {name}: {receiver.fps:.1f} FPS")
-        
-        print("\n✓ Receiver stopped")
+            pass
+
+    def kill_gst_launch(
+        self, timeout: float = 2.0, include_root: bool = False
+    ) -> tuple[list[int], list[int]]:
+        """
+        Kill all running gst-launch-1.0 processes.
+        """
+        user = getpass.getuser()
+
+        def list_targets() -> list[int]:
+            out = subprocess.check_output(["ps", "-eo", "pid,user,comm"], text=True)
+            pids: list[int] = []
+            for i, line in enumerate(out.splitlines()):
+                if i == 0 or not line.strip():
+                    continue
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid_str, owner, comm = parts
+                if comm == "gst-launch-1.0" and (include_root or owner == user):
+                    try:
+                        pids.append(int(pid_str))
+                    except ValueError:
+                        pass
+            return pids
+
+        initial = list_targets()
+        if not initial:
+            return ([], [])
+
+        for pid in initial:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+
+        time.sleep(timeout)
+
+        remaining = set(list_targets()).intersection(initial)
+        for pid in list(remaining):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except PermissionError:
+                pass
+
+        killed = [pid for pid in initial if pid not in remaining]
+        return (killed, sorted(list(remaining)))
+
+    def stop_all(self):
+        """Stop all video receivers and tmux session."""
+        self._shutdown_event.set()
+        LOGGER.info("=" * 40)
+        LOGGER.info("INITIATING SHUTDOWN - Stopping all receivers")
+        LOGGER.info("=" * 40)
+
+        try:
+            # Stop GStreamer Python depth receiver if running
+            if self.depth_receiver_node:
+                LOGGER.info("[0/3] Stopping GStreamer Python depth receiver...")
+                try:
+                    self.depth_receiver_node.stop()
+                    self.depth_receiver_node.destroy_node()
+                    if self.depth_receiver_thread and self.depth_receiver_thread.is_alive():
+                        self.depth_receiver_thread.join(timeout=2)
+                    LOGGER.info("  ✓ Depth receiver stopped")
+                except Exception as e:
+                    LOGGER.error(f"  ✗ Error stopping depth receiver: {e}")
+
+            self.kill_gst_launch()
+            if self.tmux_manager:
+                LOGGER.info("[1/3] Stopping GStreamer pipelines...")
+                self.tmux_manager.kill_session()
+                time.sleep(1)
+
+            LOGGER.info("[2/3] Checking for orphaned processes...")
+            self._cleanup_orphaned_processes()
+
+            LOGGER.info("[3/3] Final cleanup...")
+            time.sleep(0.5)
+
+            LOGGER.info("=" * 40)
+            LOGGER.info("✓ SHUTDOWN COMPLETE")
+            LOGGER.info("=" * 40)
+
+        except Exception as e:
+            LOGGER.error(f"Error during shutdown: {e}")
+
+    def _cleanup_orphaned_processes(self):
+        """Clean up any orphaned ROS2/gscam processes."""
+        patterns = [
+            f"gscam.*{self.camera_name}",
+            "depth_image_proc",
+            "convert_metric_node",
+            "depth_merger_node",
+        ]
+
+        for pattern in patterns:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+
+                if result.returncode == 0:
+                    pids = result.stdout.strip().split("\n")
+                    LOGGER.info(f"  Found {len(pids)} orphaned processes matching '{pattern}'")
+
+                    for pid in pids:
+                        if pid and pid.isdigit():
+                            try:
+                                subprocess.run(["kill", "-TERM", pid], timeout=2, check=False)
+                                LOGGER.info(f"    ✓ Terminated PID {pid}")
+                            except Exception as e:
+                                LOGGER.debug(f"    Could not terminate PID {pid}: {e}")
+
+            except Exception as e:
+                LOGGER.debug(f"  Error checking for pattern '{pattern}': {e}")
+
+        time.sleep(1)
+
+    def start_depth_split_streams(
+        self,
+        high_port: int,
+        low_port: int,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics,
+    ):
+        """Start depth split mode reception (8-bit high + 8-bit low = 16-bit depth)."""
+        LOGGER.info(f"[depth] Starting SPLIT MODE reception")
+        LOGGER.info(f"  High byte port: {high_port}")
+        LOGGER.info(f"  Low byte port: {low_port}")
+        LOGGER.info(f"  Encoding: {encoding.upper()}")
+
+        # Init merge processor
+        self.depth_merge_processor = DepthMergeProcessor(width, height)
+
+        self._start_depth_byte_stream_in_tmux(
+            high_port, "depth_high", encoding, width, height, intrinsics
+        )
+
+        time.sleep(0.5)
+
+        self._start_depth_byte_stream_in_tmux(
+            low_port, "depth_low", encoding, width, height, intrinsics
+        )
+
+        time.sleep(0.5)
+
+        #  merger node two 8-bit to 16-bit
+        self._start_depth_merger_node(width, height, intrinsics)
+
+    def _start_depth_byte_stream_in_tmux(
+        self,
+        port: int,
+        stream_name: str,
+        encoding: str,
+        width: int,
+        height: int,
+        intrinsics: CameraIntrinsics | None,
+    ):
+        """啟動單個 8-bit depth stream 接收器 (不發布到 ROS2)."""
+
+        temp_topic = f"/{self.camera_name}/{stream_name}/image_raw"
+        temp_info_topic = f"/{self.camera_name}/{stream_name}/camera_info"
+
+        calib_file = self._get_calibration_file_path(stream_name, width, height)
+
+        if calib_file:
+            info_file_url = f"file://{calib_file}"
+            tmp_file_path = None
+        else:
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w", delete=False, suffix=".yaml", prefix=f"{self.camera_name}_{stream_name}_"
+            )
+            self._create_camera_info_file(tmp_file.name, stream_name, width, height, intrinsics)
+            info_file_url = f"file://{tmp_file.name}"
+            tmp_file_path = tmp_file.name
+            tmp_file.close()
+
+        gst_config = self._build_depth_split_pipeline(port, stream_name, encoding, width, height)
+
+        frame_id = f"{self.camera_name}_depth_optical_frame"
+
+        gscam_cmd_parts = [
+            "ros2 run gscam gscam_node",
+            "--ros-args",
+            f"-p gscam_config:='{gst_config}'",
+            f"-p camera_name:={self.camera_name}_{stream_name}",
+            f"-p camera_info_url:={info_file_url}",
+            f"-p frame_id:={frame_id}",
+            "-p sync_sink:=false",
+            "-p image_encoding:=mono8",
+            f"-r camera/image_raw:={temp_topic}",
+            f"-r camera/camera_info:={temp_info_topic}",
+        ]
+
+        gscam_cmd = " ".join(gscam_cmd_parts)
+
+        if tmp_file_path:
+            gscam_cmd = f"trap 'rm -f {tmp_file_path}' EXIT; {gscam_cmd}"
+
+        window_name = f"{stream_name}_{port}"
+
+        LOGGER.info(f"[{stream_name}] Starting on port {port}")
+        LOGGER.info(f"  Temp topic: {temp_topic}")
+
+        self.tmux_manager.create_window(window_name, gscam_cmd)
+
+    def _build_depth_split_pipeline(
+        self, port: int, stream_name: str, encoding: str, width: int, height: int
+    ) -> str:
+        """depth split pipeline (GRAY8)."""
+
+        buffer_size = min(
+            self.config_loader.get("streaming.udp.buffer_size", 30000000), 30000000  # 30MB
+        )
+
+        if stream_name == "depth_high":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_high.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth_high.drop_on_latency", False
+            )
+        elif stream_name == "depth_low":
+            latency = self.config_loader.get("streaming.jitter_buffer.depth_low.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth_low.drop_on_latency", False
+            )
+        else:
+            latency = self.config_loader.get("streaming.jitter_buffer.depth.latency", 50)
+            drop_on_latency = self.config_loader.get(
+                "streaming.jitter_buffer.depth.drop_on_latency", False
+            )
+
+        drop_str = "true" if drop_on_latency else "false"
+        max_threads = self.config_loader.get("streaming.processing.max_threads", 4)
+        n_threads = self.config_loader.get("streaming.processing.n_threads", 4)
+        max_size_buffers = self.config_loader.get("streaming.queue.max_size_buffers", 4)
+        leaky = self.config_loader.get("streaming.queue.leaky", "downstream")
+
+        payload_types = self.config_loader.get("streaming.rtp.payload_types", {})
+
+        if encoding.lower() == "h264":
+            pt_key = f"{stream_name}_h264"
+            pt = payload_types.get(pt_key, 114)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload={pt}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph264depay ! h264parse ! avdec_h264 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format=GRAY8,width={width},height={height} "
+            )
+        elif encoding.lower() == "h265":
+            pt_key = f"{stream_name}_h265"
+            pt = payload_types.get(pt_key, 116)
+
+            pipeline = (
+                f"udpsrc port={port} buffer-size={buffer_size} "
+                f'caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload={pt}" '
+                f"! rtpjitterbuffer latency={latency} drop-on-latency={drop_str} "
+                f"! rtph265depay ! h265parse ! avdec_h265 max-threads={max_threads} "
+                f"! queue max-size-buffers={max_size_buffers} leaky={leaky} "
+                f"! videoconvert n-threads={n_threads} "
+                f"! video/x-raw,format=GRAY8,width={width},height={height} "
+            )
+        else:
+            pipeline = ""
+
+        return pipeline
+
+    def _start_depth_merger_node(
+        self, width: int, height: int, intrinsics: CameraIntrinsics | None
+    ):
+        """啟動 depth merger node 8-bit to 16-bit ."""
+
+        script_paths = [
+            Path(__file__).parent / "depth_merger_node.py",
+            Path(__file__).parent.parent / "node" / "depth_merger_node.py",
+            Path("src/gst_realsense_launch/node/depth_merger_node.py"),
+            Path("depth_merger_node.py"),
+        ]
+
+        script_path = None
+        for path in script_paths:
+            if path.exists():
+                script_path = path
+                break
+
+        if not script_path:
+            LOGGER.error("  ✗ Could not find depth_merger_node.py")
+            LOGGER.error(
+                "  Please ensure depth_merger_node.py is in the same directory as gst_receiver.py"
+            )
+            return
+
+        merger_cmd_parts = [
+            "python3",
+            str(script_path.absolute()),
+            "--ros-args",
+            f"-p camera_name:={self.camera_name}",
+            f"-p width:={width}",
+            f"-p height:={height}",
+        ]
+
+        merger_cmd = " ".join(merger_cmd_parts)
+        window_name = "depth_merger"
+
+        LOGGER.info(f"  [MERGER] Starting depth merger node")
+        LOGGER.info(
+            f"    Input: /{self.camera_name}/depth_high/image_raw, /{self.camera_name}/depth_low/image_raw"
+        )
+        LOGGER.info(f"    Output: /{self.camera_name}/depth/image_rect_raw (mono16)")
+
+        self.tmux_manager.create_window(window_name, merger_cmd)
+
+        time.sleep(1.0)
+        depth_topic = f"/{self.camera_name}/depth/image_rect_raw"
+        info_topic = f"/{self.camera_name}/depth/camera_info"
+        self._start_depth_conversion_node(0, depth_topic, info_topic)
+
+
+def check_and_cleanup_existing_resources(camera_name: str):
+    """Check for and clean up any existing resources before starting."""
+    LOGGER.info("Checking for existing resources...")
+
+    issues_found = False
+
+    result = subprocess.run(
+        ["tmux", "has-session", "-t", "realsense_receiver"], capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        LOGGER.warning("Found existing tmux session 'realsense_receiver'")
+        issues_found = True
+        subprocess.run(["tmux", "kill-session", "-t", "realsense_receiver"])
+        LOGGER.info("    ✓ Cleaned up existing session")
+        time.sleep(1)
+
+    patterns = [
+        f"gscam.*{camera_name}",
+        "depth_image_proc",
+        "convert_metric_node",
+        "depth_merger_node",
+    ]
+
+    for pattern in patterns:
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            pids = result.stdout.strip().split("\n")
+            LOGGER.warning(f"Found {len(pids)} orphaned processes matching '{pattern}'")
+            issues_found = True
+
+            for pid in pids:
+                if pid and pid.isdigit():
+                    try:
+                        subprocess.run(["kill", "-TERM", pid], timeout=1)
+                        LOGGER.info(f"    ✓ Terminated PID {pid}")
+                    except:
+                        pass
+
+    if issues_found:
+        LOGGER.info("  Waiting for cleanup to complete...")
+        time.sleep(2)
+        LOGGER.info("✓ Cleanup complete")
+    else:
+        LOGGER.info("✓ No existing resources found")
+
+    return True
+
+
+def signal_handler(signum, frame):
+    LOGGER.warning(f"Received signal {signum}")
+    sys.exit(0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RealSense D435i Receiver")
-    parser.add_argument("--config", default="config.yaml", help="Config file path")
-    parser.add_argument("--preset", default="balanced",
-                       choices=["high_quality", "balanced", "low_latency"],
-                       help="Stream preset")
-    parser.add_argument("--no-display", action="store_true", help="Disable display")
+    """Run the RealSense GStreamer receiver."""
+    parser = argparse.ArgumentParser(description="RealSense GStreamer Stream Receiver")
+    parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
+    parser.add_argument(
+        "--preset",
+        choices=["d435i", "d455", "d415", "l515"],
+        help="Use camera preset",
+    )
+    parser.add_argument("--base-port", type=int, help="Override base port")
+    parser.add_argument("--camera-name", help="Override camera name")
+    parser.add_argument("--show-views", action="store_true", help="Display received video streams")
+    parser.add_argument("--view-scale", type=float, help="Display window scale factor")
+    parser.add_argument("--width", type=int, help="Image width")
+    parser.add_argument("--height", type=int, help="Image height")
+
     args = parser.parse_args()
-    
-    # Create receiver
-    receiver = RealSenseReceiver(args.config, args.preset, display=not args.no_display)
-    
-    # Signal handler
-    def signal_handler(sig, frame):
-        receiver.stop()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Start
-    receiver.start()
+
+    try:
+        config_loader = ConfigLoader(args.config)
+
+        network_cfg = config_loader.get_network_config(args)
+        camera_cfg = config_loader.get_camera_config(args)
+        receiver_cfg = config_loader.get_receiver_config(args)
+
+        check_and_cleanup_existing_resources(camera_cfg["camera_name"])
+
+        width = args.width or 640
+        height = args.height or 480
+
+        depth_mode = config_loader.get("encoding.depth.mode", "legacy")
+        depth_codec = config_loader.get("encoding.depth.codec", "h264")
+
+        video_receiver = VideoStreamReceiver(
+            camera_name=camera_cfg["camera_name"],
+            config_loader=config_loader,
+            show_views=receiver_cfg.get("show_views", False),
+            view_scale=receiver_cfg.get("view_scale", 0.5),
+        )
+
+        if args.preset:
+            preset = config_loader.get_preset(args.preset)
+            if preset:
+                streams = preset["streams"]
+                ports = []
+                stream_names = []
+                encodings = []
+                widths = []
+                heights = []
+                depth_already_started = False  # Track if depth was already started
+
+                for s in streams:
+                    port = network_cfg["base_port"] + s["port_offset"]
+                    ports.append(port)
+                    stream_names.append(s["name"])
+                    encodings.append(s["encoding"])
+
+                    if s["name"] == "depth":
+                        if depth_mode == "split":
+                            LOGGER.info(f"Using DEPTH SPLIT mode")
+                            high_port = config_loader.get_port_for_stream("depth_high", port + 1)
+                            low_port = config_loader.get_port_for_stream("depth_low", port + 2)
+
+                            intrinsics = config_loader.create_default_intrinsics(width, height)
+                            video_receiver.start_depth_split_streams(
+                                high_port,
+                                low_port,
+                                depth_codec,
+                                width,
+                                height,
+                                intrinsics,
+                            )
+                            depth_already_started = True
+                        else:
+                            LOGGER.info(f"Using DEPTH LEGACY mode")
+                            intrinsics = config_loader.create_default_intrinsics(width, height)
+                            video_receiver.start_stream(
+                                port, "depth", s["encoding"], width, height, intrinsics
+                            )
+                            depth_already_started = True
+
+                        # Add width/height for depth stream
+                        widths.append(width)
+                        heights.append(height)
+                    else:
+                        if s["name"] == "infra_stereo":
+                            widths.append(width * 2)
+                        else:
+                            widths.append(width)
+                        heights.append(height)
+
+                LOGGER.info(f"Using {args.preset.upper()} preset")
+            else:
+                LOGGER.info(f"Error: Preset {args.preset} not found")
+                sys.exit(1)
+        else:
+            LOGGER.info("Error: --preset required (d435i, d455, d415, l515)")
+            sys.exit(1)
+
+        LOGGER.info(f"{'='*40}")
+        LOGGER.info("REALSENSE GSTREAMER RECEIVER")
+        LOGGER.info(f"{'='*40}")
+        LOGGER.info(f"Camera Name: {camera_cfg['camera_name']}")
+        LOGGER.info("Video Streams:")
+        for port, stream, enc in zip(ports, stream_names, encodings, strict=False):
+            LOGGER.info(f"  {stream:10s} - Port {port} ({enc.upper()})")
+        LOGGER.info(f"{'='*40}")
+
+        for port, stream, encoding, stream_width, stream_height in zip(
+            ports, stream_names, encodings, widths, heights, strict=False
+        ):
+            # Skip depth stream if it was already started
+            if stream == "depth" and depth_already_started:
+                continue
+
+            intrinsics = config_loader.create_default_intrinsics(
+                stream_width if stream != "infra_stereo" else stream_width // 2, stream_height
+            )
+            video_receiver.start_stream(
+                port, stream, encoding, stream_width, stream_height, intrinsics
+            )
+
+        time.sleep(1)
+        LOGGER.info(f"{'='*40}")
+        LOGGER.info("ALL RECEIVERS STARTED")
+        LOGGER.info(f"{'='*40}")
+
+        video_receiver.wait()
+
+    except Exception as e:
+        LOGGER.error(f"✗ Fatal error: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    finally:
+        LOGGER.info("Starting cleanup sequence...")
+        if "video_receiver" in locals():
+            try:
+                video_receiver.stop_all()
+            except Exception as e:
+                LOGGER.error(f"Error stopping video receiver: {e}")
+
+        LOGGER.info("=" * 40)
+        LOGGER.info("✓ ALL CLEANUP COMPLETE")
+        LOGGER.info("=" * 40 + "")
 
 
 if __name__ == "__main__":
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     main()

@@ -1,340 +1,368 @@
 #!/usr/bin/env python3
-"""
-RealSense D435i Sender - AGX Orin
-Streams color, depth, and infrared to remote receiver
+"""RealSense Multi-Stream Sender with tmux Integration
+
+Streams RealSense camera data using GStreamer pipelines managed via tmux.
 """
 
 import argparse
+import json
+import os
 import signal
 import sys
+import threading
 import time
-from typing import Dict
+from pathlib import Path
 
-import numpy as np
-import pyrealsense2 as rs
+from utils.logger import LOGGER
 
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+try:
+    import pyrealsense2 as rs
+except Exception:
+    rs = None
+    LOGGER.warning("pyrealsense2 not available; RealSense-dependent features disabled.")
 
-from config import ConfigManager
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from gst_realsense_launch.startup.rs_common import (
+    ConfigLoader,
+    StreamConfig,
+    get_stream_type_from_fourcc,
+    parse_resolution,
+    validate_network_config,
+)
+from gst_realsense_launch.startup.rs_detect import RealSenseDetector
+from gst_realsense_launch.startup.rs_tmux import StreamManager
 
 
-class GStreamerPipeline:
-    """GStreamer pipeline wrapper."""
-    
-    def __init__(self, pipeline_str: str, name: str):
-        self.name = name
-        self.pipeline = Gst.parse_launch(pipeline_str)
-        self.appsrc = self.pipeline.get_by_name("src")
-        self.running = False
-        
-        # Setup callbacks
-        bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_message)
-    
+class IMUSender:
+    """Sends IMU data from RealSense camera over UDP."""
+
+    def __init__(self, serial: str, host: str, port: int):
+        if not rs:
+            raise RuntimeError("pyrealsense2 not available")
+
+        self.serial = serial
+        self.host = host
+        self.port = port
+        self.running: bool = False
+        self.thread: threading.Thread | None = None
+
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        self.config.enable_device(serial)
+        self.config.enable_stream(rs.stream.accel)
+        self.config.enable_stream(rs.stream.gyro)
+
+        import socket
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
     def start(self):
-        """Start pipeline."""
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
-        if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError(f"Failed to start {self.name} pipeline")
         self.running = True
-        print(f"✓ {self.name} pipeline started")
-    
-    def stop(self):
-        """Stop pipeline."""
-        if self.running:
-            self.appsrc.emit("end-of-stream")
-            self.pipeline.set_state(Gst.State.NULL)
-            self.running = False
-            print(f"✓ {self.name} pipeline stopped")
-    
-    def push_frame(self, frame: np.ndarray, timestamp: int):
-        """Push frame to pipeline."""
-        if not self.running:
-            return
-        
-        # Create GstBuffer
-        buffer = Gst.Buffer.new_wrapped(frame.tobytes())
-        buffer.pts = timestamp
-        buffer.dts = timestamp
-        buffer.duration = Gst.CLOCK_TIME_NONE
-        
-        # Push buffer
-        ret = self.appsrc.emit("push-buffer", buffer)
-        if ret != Gst.FlowReturn.OK:
-            print(f"⚠ {self.name}: push failed: {ret}")
-    
-    def _on_message(self, bus, message):
-        """Handle bus messages."""
-        t = message.type
-        if t == Gst.MessageType.ERROR:
-            err, debug = message.parse_error()
-            print(f"✗ {self.name} Error: {err}, {debug}")
-        elif t == Gst.MessageType.WARNING:
-            warn, debug = message.parse_warning()
-            print(f"⚠ {self.name} Warning: {warn}")
-        elif t == Gst.MessageType.EOS:
-            print(f"✓ {self.name} End-of-stream")
+        self.thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self.thread.start()
+        LOGGER.info(f"✓ IMU streaming started for {self.serial}")
 
-
-class RealSenseSender:
-    """RealSense D435i sender."""
-    
-    def __init__(self, config_path: str = "config.yaml", preset: str = "balanced"):
-        # Load configuration
-        self.config = ConfigManager(config_path)
-        self.preset = preset
-        
-        # Initialize GStreamer
-        Gst.init(None)
-        
-        # RealSense pipeline
-        self.rs_pipeline = rs.pipeline()
-        self.rs_config = rs.config()
-        
-        # GStreamer pipelines
-        self.gst_pipelines: Dict[str, GStreamerPipeline] = {}
-        
-        # State
-        self.running = False
-        self.frame_count = 0
-        self.start_time = None
-    
-    def setup_camera(self):
-        """Configure RealSense camera."""
-        cam_cfg = self.config.camera
-        
-        # Enable streams
-        if cam_cfg.streams.color:
-            self.rs_config.enable_stream(
-                rs.stream.color,
-                cam_cfg.color_profile.width,
-                cam_cfg.color_profile.height,
-                rs.format.rgb8,
-                cam_cfg.color_profile.fps
-            )
-            print(f"✓ Color: {cam_cfg.color_profile.width}x{cam_cfg.color_profile.height} @ {cam_cfg.color_profile.fps}fps")
-        
-        if cam_cfg.streams.depth:
-            self.rs_config.enable_stream(
-                rs.stream.depth,
-                cam_cfg.depth_profile.width,
-                cam_cfg.depth_profile.height,
-                rs.format.z16,
-                cam_cfg.depth_profile.fps
-            )
-            print(f"✓ Depth: {cam_cfg.depth_profile.width}x{cam_cfg.depth_profile.height} @ {cam_cfg.depth_profile.fps}fps")
-        
-        if cam_cfg.streams.infrared_stereo:
-            self.rs_config.enable_stream(
-                rs.stream.infrared, 1,
-                cam_cfg.infrared_stereo_profile.width,
-                cam_cfg.infrared_stereo_profile.height,
-                rs.format.y8,
-                cam_cfg.infrared_stereo_profile.fps
-            )
-            self.rs_config.enable_stream(
-                rs.stream.infrared, 2,
-                cam_cfg.infrared_stereo_profile.width,
-                cam_cfg.infrared_stereo_profile.height,
-                rs.format.y8,
-                cam_cfg.infrared_stereo_profile.fps
-            )
-            print(f"✓ Infrared: {cam_cfg.infrared_stereo_profile.width}x{cam_cfg.infrared_stereo_profile.height} @ {cam_cfg.infrared_stereo_profile.fps}fps")
-        
-        # Start pipeline
-        profile = self.rs_pipeline.start(self.rs_config)
-        
-        # Apply depth filters if enabled
-        if cam_cfg.streams.depth and cam_cfg.depth.filters.spatial.enabled:
-            print("✓ Depth filters enabled")
-        
-        print(f"✓ Camera initialized: {cam_cfg.model}")
-    
-    def setup_gstreamer(self):
-        """Setup GStreamer pipelines."""
-        preset_cfg = self.config.get_preset(self.preset)
-        if not preset_cfg:
-            raise ValueError(f"Preset '{self.preset}' not found")
-        
-        # Color stream
-        if preset_cfg.color.enabled and self.config.camera.streams.color:
-            pipeline_str = self.config.build_sender_pipeline("color", self.preset)
-            self.gst_pipelines["color"] = GStreamerPipeline(pipeline_str, "Color")
-        
-        # Depth stream
-        if preset_cfg.depth.enabled and self.config.camera.streams.depth:
-            pipeline_str = self.config.build_sender_pipeline("depth", self.preset)
-            self.gst_pipelines["depth"] = GStreamerPipeline(pipeline_str, "Depth")
-        
-        # Infrared stream (left)
-        if preset_cfg.infrared_stereo and preset_cfg.infrared_stereo.enabled and self.config.camera.streams.infrared_stereo:
-            # Left infrared
-            ports = preset_cfg.infrared_stereo.port
-            port_left = ports[0] if isinstance(ports, list) else ports
-            
-            # Build custom pipeline for infrared
-            encoder_params = self.config.config.get_encoder_params()
-            encoder_str = " ".join(f"{k}={v}" for k, v in encoder_params.items())
-            
-            pipeline_left = (
-                f"appsrc name=src format=time is-live=true do-timestamp=true ! "
-                f"video/x-raw,format=GRAY8,width={self.config.camera.infrared_stereo_profile.width},"
-                f"height={self.config.camera.infrared_stereo_profile.height},"
-                f"framerate={self.config.camera.infrared_stereo_profile.fps}/1 ! "
-                f"videoconvert n-threads=4 ! "
-                f"{encoder_str} bitrate={preset_cfg.infrared_stereo.bitrate} ! "
-                f"h264parse ! "
-                f"rtph264pay mtu=1400 config-interval=1 aggregate-mode=zero-latency pt={preset_cfg.infrared_stereo.rtp_payload_type[0]} ! "
-                f"udpsink host={self.config.network.server_ip} port={port_left} buffer-size=30000000"
-            )
-            self.gst_pipelines["infra_left"] = GStreamerPipeline(pipeline_left, "Infrared-L")
-            
-            # Right infrared
-            if len(ports) > 1:
-                port_right = ports[1]
-                pipeline_right = (
-                    f"appsrc name=src format=time is-live=true do-timestamp=true ! "
-                    f"video/x-raw,format=GRAY8,width={self.config.camera.infrared_stereo_profile.width},"
-                    f"height={self.config.camera.infrared_stereo_profile.height},"
-                    f"framerate={self.config.camera.infrared_stereo_profile.fps}/1 ! "
-                    f"videoconvert n-threads=4 ! "
-                    f"{encoder_str} bitrate={preset_cfg.infrared_stereo.bitrate} ! "
-                    f"h264parse ! "
-                    f"rtph264pay mtu=1400 config-interval=1 aggregate-mode=zero-latency pt={preset_cfg.infrared_stereo.rtp_payload_type[1]} ! "
-                    f"udpsink host={self.config.network.server_ip} port={port_right} buffer-size=30000000"
-                )
-                self.gst_pipelines["infra_right"] = GStreamerPipeline(pipeline_right, "Infrared-R")
-        
-        print(f"✓ GStreamer pipelines created: {list(self.gst_pipelines.keys())}")
-    
-    def start(self):
-        """Start streaming."""
-        print("\n" + "="*80)
-        print("RealSense Sender - AGX Orin")
-        print("="*80)
-        
-        # Setup
-        self.setup_camera()
-        self.setup_gstreamer()
-        
-        # Start GStreamer pipelines
-        time.sleep(self.config.system.timing.pipeline_startup_delay)
-        for pipeline in self.gst_pipelines.values():
-            pipeline.start()
-        
-        # Start streaming
-        self.running = True
-        self.start_time = time.time()
-        print("\n✓ Streaming started")
-        print(f"  Target: {self.config.network.server_ip}")
-        print(f"  Preset: {self.preset}")
-        print(f"  Streams: {list(self.gst_pipelines.keys())}")
-        print("\nPress Ctrl+C to stop\n")
-        
-        try:
-            self._stream_loop()
-        except KeyboardInterrupt:
-            print("\n\n⚠ Interrupted by user")
-        finally:
-            self.stop()
-    
     def _stream_loop(self):
-        """Main streaming loop."""
-        while self.running:
-            # Wait for frames
-            frames = self.rs_pipeline.wait_for_frames()
-            
-            # Get timestamp
-            timestamp = int(time.time() * 1e9)  # nanoseconds
-            
-            # Color frame
-            if "color" in self.gst_pipelines:
-                color_frame = frames.get_color_frame()
-                if color_frame:
-                    color_image = np.asanyarray(color_frame.get_data())
-                    self.gst_pipelines["color"].push_frame(color_image, timestamp)
-            
-            # Depth frame
-            if "depth" in self.gst_pipelines:
-                depth_frame = frames.get_depth_frame()
-                if depth_frame:
-                    # Convert to GRAY16_LE for streaming
-                    depth_image = np.asanyarray(depth_frame.get_data())
-                    self.gst_pipelines["depth"].push_frame(depth_image, timestamp)
-            
-            # Infrared frames
-            if "infra_left" in self.gst_pipelines:
-                infra_left = frames.get_infrared_frame(1)
-                if infra_left:
-                    infra_left_image = np.asanyarray(infra_left.get_data())
-                    self.gst_pipelines["infra_left"].push_frame(infra_left_image, timestamp)
-            
-            if "infra_right" in self.gst_pipelines:
-                infra_right = frames.get_infrared_frame(2)
-                if infra_right:
-                    infra_right_image = np.asanyarray(infra_right.get_data())
-                    self.gst_pipelines["infra_right"].push_frame(infra_right_image, timestamp)
-            
-            # Stats
-            self.frame_count += 1
-            if self.frame_count % 300 == 0:  # Every 10 seconds at 30fps
-                elapsed = time.time() - self.start_time
-                fps = self.frame_count / elapsed
-                print(f"Stats: {self.frame_count} frames, {fps:.1f} fps, {elapsed:.1f}s")
-    
+        pipeline_started = False
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+
+            device_found = False
+            for dev in devices:
+                if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                    device_found = True
+                    LOGGER.info(f"  Found IMU device: {dev.get_info(rs.camera_info.name)}")
+                    break
+
+            if not device_found:
+                raise RuntimeError(f"Device {self.serial} not connected")
+
+            self.pipeline.start(self.config)
+            pipeline_started = True
+
+            while self.running:
+                try:
+                    frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+
+                    accel_frame = frames.first_or_default(rs.stream.accel)
+                    gyro_frame = frames.first_or_default(rs.stream.gyro)
+
+                    if accel_frame and gyro_frame:
+                        accel = accel_frame.as_motion_frame().get_motion_data()
+                        gyro = gyro_frame.as_motion_frame().get_motion_data()
+
+                        imu_data = {
+                            "type": "imu",
+                            "timestamp": time.time(),
+                            "serial": self.serial,
+                            "accel": {"x": accel.x, "y": accel.y, "z": accel.z},
+                            "gyro": {"x": gyro.x, "y": gyro.y, "z": gyro.z},
+                        }
+
+                        data = json.dumps(imu_data).encode("utf-8")
+                        self.sock.sendto(data, (self.host, self.port))
+
+                except RuntimeError as e:
+                    if "didn't arrive" in str(e):
+                        continue
+                    LOGGER.warning(f"IMU runtime error: {e}")
+                    raise
+
+        except Exception as e:
+            LOGGER.exception(f"IMU error for {self.serial}: {e}")
+        finally:
+            if pipeline_started:
+                try:
+                    self.pipeline.stop()
+                except Exception as e:
+                    LOGGER.warning(f"Error stopping IMU pipeline: {e}")
+            self.sock.close()
+
     def stop(self):
-        """Stop streaming."""
-        print("\n" + "="*80)
-        print("Stopping...")
-        print("="*80)
-        
         self.running = False
-        
-        # Stop RealSense
-        if self.rs_pipeline:
-            self.rs_pipeline.stop()
-            print("✓ Camera stopped")
-        
-        # Stop GStreamer
-        for pipeline in self.gst_pipelines.values():
-            pipeline.stop()
-        
-        # Stats
-        if self.start_time:
-            elapsed = time.time() - self.start_time
-            fps = self.frame_count / elapsed if elapsed > 0 else 0
-            print(f"\nFinal Stats:")
-            print(f"  Total frames: {self.frame_count}")
-            print(f"  Duration: {elapsed:.1f}s")
-            print(f"  Average FPS: {fps:.1f}")
-        
-        print("\n✓ Sender stopped")
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def check_encoder_availability():
+    """Check and log available video encoders."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("gst-inspect-1.0"):
+        LOGGER.warning("gst-inspect-1.0 not found")
+        return
+
+    encoders = {
+        "nvh264enc": "NVIDIA H.264 Hardware",
+        "x264enc": "Software H.264",
+    }
+
+    LOGGER.info("Available encoders:")
+    for encoder, name in encoders.items():
+        result = subprocess.run(
+            ["gst-inspect-1.0", encoder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        status = "✓" if result.returncode == 0 else "✗"
+        LOGGER.info(f"  {status} {name} ({encoder})")
+
+
+def install_signal_handlers(manager: StreamManager):
+    """Install signal handlers for graceful shutdown."""
+    signal_count = {"count": 0, "last_time": 0.0}
+
+    def _handle_signal(signum, frame):
+        sig_name = signal.Signals(signum).name
+        current_time = time.time()
+
+        if current_time - signal_count["last_time"] < 2.0:
+            signal_count["count"] += 1
+            if signal_count["count"] >= 2:
+                LOGGER.warning("Force quit detected! Terminating immediately...")
+                os._exit(1)
+        else:
+            signal_count["count"] = 1
+
+        signal_count["last_time"] = current_time
+
+        LOGGER.info(f"Received {sig_name} signal. Initiating shutdown...")
+        LOGGER.info("(Press Ctrl+C again within 2 seconds to force quit)")
+        manager._shutdown.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+            LOGGER.debug(f"Installed signal handler for {signal.Signals(sig).name}")
+        except (OSError, RuntimeError, ValueError) as e:
+            LOGGER.warning(f"Could not install handler for signal {sig}: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RealSense D435i Sender")
-    parser.add_argument("--config", default="config.yaml", help="Config file path")
-    parser.add_argument("--preset", default="balanced", 
-                       choices=["high_quality", "balanced", "low_latency"],
-                       help="Stream preset")
+    parser = argparse.ArgumentParser(
+        description="RealSense Multi-Stream Sender with tmux Integration"
+    )
+    parser.add_argument("--config", default="src/config/config.yaml", help="Configuration file")
+    parser.add_argument("--host", help="Override server IP from config")
+    parser.add_argument("--resolution", help="Override resolution (WIDTHxHEIGHT)")
+    parser.add_argument("--fps", type=int, help="Override target FPS")
+    parser.add_argument(
+        "--encoder",
+        choices=["auto", "nvh264enc", "x264enc"],
+        help="Override encoder preference",
+    )
+    parser.add_argument("--bitrate", type=int, help="Override H.264 bitrate (kbps)")
+    parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
+    parser.add_argument("--list-only", action="store_true", help="List cameras and exit")
+    parser.add_argument("--device", help="Stream only specific device")
+    parser.add_argument("--preset", choices=["d435i"], help="Use camera preset")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
-    
-    # Create sender
-    sender = RealSenseSender(args.config, args.preset)
-    
-    # Signal handler
-    def signal_handler(sig, frame):
-        sender.stop()
+
+    check_encoder_availability()
+
+    config_loader = ConfigLoader(args.config)
+
+    network_cfg = config_loader.get_network_config(args)
+    camera_cfg = config_loader.get_camera_config(args)
+    encoding_cfg = config_loader.get_encoding_config(args)
+    imu_cfg = config_loader.get_imu_config(args)
+
+    try:
+        validate_network_config(network_cfg)
+    except ValueError as e:
+        LOGGER.error(f"Configuration error: {e}")
+        sys.exit(1)
+
+    try:
+        target_size = parse_resolution(camera_cfg["resolution"])
+    except ValueError as e:
+        LOGGER.error(f"Resolution error: {e}")
+        sys.exit(1)
+
+    LOGGER.info("Detecting RealSense cameras...")
+    realsense_detector = RealSenseDetector()
+    cameras = RealSenseDetector.detect_all_cameras()
+
+    if not cameras:
+        LOGGER.error("✗ No RealSense cameras detected!")
+        sys.exit(1)
+
+    if args.device:
+        cameras = [c for c in cameras if c.dev == args.device]
+        if not cameras:
+            LOGGER.error(f"✗ Device {args.device} not found!")
+            sys.exit(1)
+
+    LOGGER.info(f"✓ Found {len(cameras)} RealSense camera(s)")
+
+    for i, cam in enumerate(cameras, 1):
+        LOGGER.info(f"Camera {i}: {cam.model} ({cam.dev})")
+        if cam.serial:
+            LOGGER.info(f"  Serial: {cam.serial}")
+
+    if not args.preset and cameras:
+        detected_model = cameras[0].model.lower()
+        if "435i" in detected_model or "d435i" in detected_model:
+            args.preset = "d435i"
+            LOGGER.info(f"✓ Auto-detected D435i camera, using d435i preset")
+
+    if args.list_only:
         sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Start
-    sender.start()
+
+    manager = StreamManager(config_loader, verbose=args.verbose)
+    install_signal_handlers(manager)
+
+    camera_groups = RealSenseDetector.group_by_serial(cameras)
+
+    for serial, serial_cameras in camera_groups.items():
+        if imu_cfg["enabled"] and serial != "unknown":
+            if args.verbose:
+                LOGGER.info(f"Starting IMU for camera {serial}")
+            manager.add_imu_sender(serial, network_cfg["server_ip"], network_cfg["imu_port"])
+
+    actual_bitrate = encoding_cfg.get("h264", {}).get("bitrate", 4000)
+
+    if args.preset:
+        preset = config_loader.get_preset(args.preset)
+
+        if preset:
+            if args.verbose:
+                LOGGER.info(f"Using {args.preset.upper()} preset configuration:")
+
+            camera_by_type = {}
+            for cam in cameras:
+                stream_type = get_stream_type_from_fourcc(cam.modes[0].fourcc)
+                camera_by_type[stream_type] = cam
+
+            for stream_def in preset["streams"]:
+                stream_name = stream_def["name"]
+                encoding = stream_def["encoding"]
+                port = stream_def["port"]
+
+                cam = None
+                if stream_name == "depth":
+                    cam = camera_by_type.get("depth")
+                elif stream_name == "color":
+                    cam = camera_by_type.get("color")
+                elif stream_name == "infra_stereo":
+                    for c in cameras:
+                        if c.modes and c.modes[0].fourcc.strip().upper() == "Y8I":
+                            cam = c
+                            break
+                    if not cam:
+                        cam = camera_by_type.get("infra")
+                elif stream_name == "infra1":
+                    cam = camera_by_type.get("infra")
+
+                if not cam:
+                    LOGGER.info(f"  No camera found for {stream_name}, skipping")
+                    continue
+
+                if stream_name == "infra_stereo":
+                    target_format = camera_cfg.get("infra_format", "Y8I")
+                    mode_target_size = (target_size[0] * 2, target_size[1])
+                    actual_stream_type = "infra_stereo"
+                elif stream_name == "depth":
+                    target_format = camera_cfg.get("depth_format")
+                    mode_target_size = target_size
+                    actual_stream_type = "depth"
+                elif stream_name == "color":
+                    target_format = camera_cfg.get("color_format")
+                    mode_target_size = target_size
+                    actual_stream_type = "color"
+                else:
+                    target_format = None
+                    mode_target_size = target_size
+                    actual_stream_type = stream_name.replace("infra", "infra").replace("1", "").replace("2", "")
+
+                mode = realsense_detector.find_best_mode(
+                    cam, mode_target_size, actual_stream_type, target_format
+                )
+
+                if not mode:
+                    LOGGER.info(f"  No suitable mode for {stream_name} on {cam.dev}")
+                    continue
+
+                fps = realsense_detector.get_best_fps(mode, camera_cfg["fps"])
+
+                stream_cfg = StreamConfig(
+                    name=stream_name,
+                    port=port,
+                    encoding=encoding,
+                    width=mode.size[0],
+                    height=mode.size[1],
+                    fps=fps,
+                    device=cam.dev,
+                    fourcc=mode.fourcc,
+                    verbose=args.verbose,
+                )
+
+                manager.add_stream(stream_cfg, actual_stream_type, encoding_cfg["encoder"], actual_bitrate)
+
+        else:
+            LOGGER.error(f"Preset '{args.preset}' not found in configuration")
+            sys.exit(1)
+    else:
+        LOGGER.error("No preset specified. Use --preset option")
+        sys.exit(1)
+
+    time.sleep(1)
+    LOGGER.info(f"{'='*40}")
+    LOGGER.info("ALL STREAMS STARTED")
+    LOGGER.info(f"{'='*40}")
+    LOGGER.info("Press Ctrl+C to stop all streams")
+
+    try:
+        manager.wait()
+    except Exception as e:
+        LOGGER.error(f"Unexpected error in main loop: {e}")
+        manager.stop_all()
 
 
 if __name__ == "__main__":
