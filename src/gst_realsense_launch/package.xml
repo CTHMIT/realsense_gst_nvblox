@@ -4,7 +4,7 @@
   <version>0.1.0</version>
   <description>A ROS 2 package for high-performance Intel RealSense camera streaming using GStreamer. It supports multiple camera streams with hardware-accelerated encoding, network transmission, and direct integration with ROS 2 topics.</description>
   <maintainer email="chuntsehsu@gmail.com">cthsu</maintainer>
-  <license>MIT</license>
+  <license>Wistron Public View-Only License (WPVOL) v1.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 

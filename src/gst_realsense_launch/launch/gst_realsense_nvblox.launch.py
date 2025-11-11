@@ -89,9 +89,6 @@ def generate_launch_description():
     depth_optical_frame = [camera_name, TextSubstitution(text="_depth_optical_frame")]
     color_optical_frame = [camera_name, TextSubstitution(text="_color_optical_frame")]
 
-    # ============================================================================
-    # Visual SLAM Node (Optional - for odometry estimation)
-    # ============================================================================
     visual_slam_node = Node(
         package="isaac_ros_visual_slam",
         executable="isaac_ros_visual_slam",
@@ -100,7 +97,7 @@ def generate_launch_description():
             {
                 "num_cameras": 1,
                 "min_num_images": 2,
-                "enable_imu_fusion": False,  # Set True if you have IMU
+                "enable_imu_fusion": True,
                 "enable_rectified_pose": True,
                 "rectified_images": True,
                 "enable_observations_view": False,
